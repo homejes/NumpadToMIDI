@@ -2,10 +2,10 @@
 # Build NumpadToMIDI-macOS-v<version>.dmg from dist/NumpadToMIDI.app using only
 # built-in macOS tools (codesign + hdiutil), so it runs unchanged on CI runners.
 #
-# usage: installer/make_dmg.sh [version]        e.g. installer/make_dmg.sh 1.3.2
+# usage: installer/make_dmg.sh [version]        e.g. installer/make_dmg.sh 1.4.0
 set -euo pipefail
 
-VERSION="${1:-1.3.2}"
+VERSION="${1:-1.4.0}"
 APP_NAME="NumpadToMIDI"
 APP_PATH="dist/${APP_NAME}.app"
 DMG_PATH="dist/${APP_NAME}-macOS-v${VERSION}.dmg"

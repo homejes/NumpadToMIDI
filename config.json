@@ -7,6 +7,7 @@
   "target_device": "",
   "suppress_keys": true,
   "exclusive_mode": true,
+  "exclusive_pad_mode": false,
   "triple_zero_detection": true,
   "burst_window_ms": 50
 }

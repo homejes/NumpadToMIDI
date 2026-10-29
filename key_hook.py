@@ -89,7 +89,7 @@ KEY_SPAN: dict[str, tuple[int, int]] = {
 KEY_DISPLAY: dict[str, str] = {
     "Home": "\u2302 Home",
     "Backspace": "Backspace \u2190",
-    ".": ". (Del)",
+    ".": "[ Mode: Choke (.) ]",
 }
 KEY_NAMES: list[str] = [k[0] for k in KEY_LAYOUT]
 KEY_INDEX: dict[str, int] = {name: i for i, name in enumerate(KEY_NAMES)}
@@ -97,8 +97,20 @@ KEY_INDEX: dict[str, int] = {name: i for i, name in enumerate(KEY_NAMES)}
 # --- Windows virtual-key codes ------------------------------------------------
 VK_BACK = 0x08            # 8   - Backspace
 VK_TAB = 0x09             # 9   - Tab
+VK_CLEAR = 0x0C           # 12  - Clear (Numpad 5 when NumLock is OFF)
 VK_RETURN = 0x0D          # 13  - Enter (extended = numpad Enter)
-VK_HOME = 0x24            # 36  - Home (extended = dedicated/numpad Home)
+VK_PRIOR = 0x21           # 33  - Page Up (Numpad 9 when NumLock is OFF)
+VK_NEXT = 0x22            # 34  - Page Down (Numpad 3 when NumLock is OFF)
+VK_END = 0x23             # 35  - End (Numpad 1 when NumLock is OFF)
+VK_HOME = 0x24            # 36  - Home (extended = dedicated/numpad Home; non-extended = Numpad 7)
+VK_LEFT = 0x25            # 37  - Left (Numpad 4 when NumLock is OFF)
+VK_UP = 0x26              # 38  - Up (Numpad 8 when NumLock is OFF)
+VK_RIGHT = 0x27           # 39  - Right (Numpad 6 when NumLock is OFF)
+VK_DOWN = 0x28            # 40  - Down (Numpad 2 when NumLock is OFF)
+VK_INSERT = 0x2D          # 45  - Insert (Numpad 0 / '000' burst when NumLock is OFF)
+VK_DELETE = 0x2E          # 46  - Delete (Numpad '.' when NumLock is OFF)
+VK_NUMPAD0 = 0x60         # 96  - Numpad 0 (when NumLock is ON)
+VK_DECIMAL = 0x6E         # 110 - Numpad '.' (when NumLock is ON)
 VK_NUMLOCK = 0x90         # 144 - NumLock
 VK_BROWSER_SEARCH = 0xAA  # 170 - Browser Search multimedia key
 VK_BROWSER_HOME = 0xAC    # 172 - Browser Home multimedia key (scancode 0xE032)
@@ -108,7 +120,7 @@ VK_LAUNCH_APP2 = 0xB7     # 183 - Launch App2 (Calculator multimedia key)
 
 WIN_VK: dict[int, str] = {
     **{96 + i: str(i) for i in range(10)},  # VK_NUMPAD0..9 (0x60..0x69)
-    110: ".",                  # VK_DECIMAL (0x6E)
+    VK_DECIMAL: ".",           # 110 (0x6E)
     107: "+",                  # VK_ADD (0x6B)
     109: "-",                  # VK_SUBTRACT (0x6D)
     106: "*",                  # VK_MULTIPLY (0x6A)
@@ -130,7 +142,21 @@ _WIN_NUMPAD_SCANCODES: dict[int, str] = {
     0x4C: "5", 0x4D: "6", 0x47: "7", 0x48: "8", 0x49: "9",
     0x53: ".",
 }
-_WIN_NUMLOCK_OFF_VKS = frozenset({12, 33, 34, 35, 36, 37, 38, 39, 40, 45, 46})
+_WIN_NUMLOCK_OFF_VK_MAP: dict[int, str] = {
+    VK_INSERT: "0",
+    VK_END: "1",
+    VK_DOWN: "2",
+    VK_NEXT: "3",
+    VK_LEFT: "4",
+    VK_CLEAR: "5",
+    VK_RIGHT: "6",
+    VK_HOME: "7",
+    VK_UP: "8",
+    VK_PRIOR: "9",
+    VK_DELETE: ".",
+}
+_WIN_NUMLOCK_OFF_VKS = frozenset(_WIN_NUMLOCK_OFF_VK_MAP.keys())
+_MAPVK_VSC_TO_VK = 1
 _WIN_SCAN_BROWSER_HOME = 0x32
 _WIN_SCAN_LAUNCH_MAIL = 0x6C
 _WIN_SCAN_LAUNCH_CALC = 0x21
@@ -155,6 +181,13 @@ MAC_VK: dict[int, str] = {
 
 def win_key_name(vk: int, scan: int, extended: bool) -> Optional[str]:
     """Map a Windows low-level keyboard event to a logical numpad key name."""
+    if IS_WIN and vk in (0, 0xFF) and scan and not extended:
+        try:
+            mapped = int(_user32.MapVirtualKeyW(scan, _MAPVK_VSC_TO_VK))
+            if mapped:
+                vk = mapped
+        except Exception:
+            pass
     if vk == VK_RETURN:  # only the *extended* Enter is the numpad one
         return "Enter" if extended else None
     if vk in (VK_BROWSER_HOME, VK_BROWSER_SEARCH) or (scan == _WIN_SCAN_BROWSER_HOME and extended):
@@ -163,10 +196,19 @@ def win_key_name(vk: int, scan: int, extended: bool) -> Optional[str]:
         return "Email"
     if vk in (VK_LAUNCH_APP1, VK_LAUNCH_APP2) or (scan == _WIN_SCAN_LAUNCH_CALC and extended):
         return "Calc"
+    # NumLock-independent '0' / '000' and '.' (Dot / Del) recognition:
+    # * NumLock ON:  VK_NUMPAD0 (0x60) / VK_DECIMAL (0x6E)
+    # * NumLock OFF: VK_INSERT (0x2D) / VK_DELETE (0x2E) or keypad scancodes 0x52 / 0x53
+    if vk in (VK_NUMPAD0, VK_INSERT) or (not extended and scan == 0x52):
+        return "0"
+    if vk in (VK_DECIMAL, VK_DELETE) or (not extended and scan == 0x53):
+        return "."
     if vk == VK_HOME and extended:
         return "Home"
-    if not extended and vk in _WIN_NUMLOCK_OFF_VKS and scan in _WIN_NUMPAD_SCANCODES:
+    if not extended and scan in _WIN_NUMPAD_SCANCODES:
         return _WIN_NUMPAD_SCANCODES[scan]
+    if not extended and vk in _WIN_NUMLOCK_OFF_VK_MAP:
+        return _WIN_NUMLOCK_OFF_VK_MAP[vk]
     return WIN_VK.get(vk)
 
 
@@ -309,6 +351,8 @@ if IS_WIN:
         wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p,
         ctypes.POINTER(wintypes.UINT), wintypes.UINT,
     ]
+    _user32.MapVirtualKeyW.restype = wintypes.UINT
+    _user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     _kernel32.GetCurrentThread.restype = wintypes.HANDLE
     _kernel32.SetThreadPriority.restype = wintypes.BOOL
