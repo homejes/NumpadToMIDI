@@ -138,22 +138,30 @@ class DebounceTests(unittest.TestCase):
         self.assertEqual(rec.events, [("1", True), ("1", False)])
 
     def test_rolling_50ms_triplet_burst_and_raw_dedup(self):
-        import time
+        from unittest.mock import patch
         from key_hook import KeyboardDevice, RI_KEY_BREAK
 
-        # 3 consecutive '0' presses spaced ~25 ms apart (total span ~55 ms > 50 ms,
-        # but each consecutive interval is 25 ms < 50 ms) must fire '000' and never '0'
-        hook, rec = make(burst_window_ms=50)
-        for idx in range(3):
-            if idx > 0:
-                time.sleep(0.025)
-            hook._dispatch("0", True)
-            hook._dispatch("0", False)
+        # Default burst_window must be 50 ms (0.050 s)
+        default_hook, _ = KeyHook(Recorder()), None
+        self.assertAlmostEqual(default_hook.burst_window, 0.050, places=4)
+
+        # 3 consecutive '0' presses spaced 30 ms apart (total span 60 ms > 50 ms,
+        # but each consecutive interval is 30 ms < 50 ms) must fire '000' and never '0'
+        clock = [100.0]
+        with patch("key_hook.time.perf_counter", side_effect=lambda: clock[0]):
+            hook, rec = make(burst_window_ms=50)
+            for idx in range(3):
+                if idx > 0:
+                    clock[0] += 0.030  # +30 ms between consecutive presses (total 60 ms > 50 ms)
+                hook._dispatch("0", True)
+                clock[0] += 0.005
+                hook._dispatch("0", False)
+            hook.stop()
         self.assertEqual(rec.events, [("000", True), ("000", False)])
 
         # Verify _queue_from_ll + _process_raw_keyboard deduplication prevents duplicate
         # KEYDOWN/KEYUP events from corrupting the '000' state machine
-        hook2, rec2 = make(burst_window_ms=50)
+        hook2, rec2 = make(burst_window_ms=500)
         hook2._devices = [KeyboardDevice(r"HID\VID_1C4F&PID_0002", "USB Keypad", "", {3003})]
         hook2._device_by_handle = {3003: hook2._devices[0]}
         hook2.set_target_device(r"HID\VID_1C4F&PID_0002")
@@ -165,6 +173,7 @@ class DebounceTests(unittest.TestCase):
             item = hook2._win_queue.get_nowait()
             if item:
                 hook2._dispatch(item[0], item[1])
+        hook2.stop()
         self.assertEqual(rec2.events, [("000", True), ("000", False)])
 
 
