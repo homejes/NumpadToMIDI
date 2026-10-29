@@ -1,6 +1,7 @@
 """NumpadToMIDI - turn a 23-key USB numpad into a (virtual) MIDI controller."""
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import sys
@@ -10,7 +11,9 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, QSize, Qt, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import (
+    QAbstractNativeEventFilter, QObject, QSize, QTimer, Qt, QVariantAnimation, pyqtSignal,
+)
 from PyQt6.QtGui import (
     QAction, QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap,
 )
@@ -24,8 +27,34 @@ from key_hook import KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES, KEY_SPAN, Ke
 from midi_engine import MidiEngine, note_name
 from version import VERSION
 
+if sys.platform == "win32":
+    from ctypes import wintypes
+
 APP_NAME = "NumpadToMIDI"
 OCTAVE_MIN, OCTAVE_MAX = -3, 5
+
+# Win32 WM_APPCOMMAND constants (0x0319)
+WM_APPCOMMAND = 0x0319
+APPCOMMAND_BROWSER_SEARCH = 5
+APPCOMMAND_BROWSER_HOME = 7
+APPCOMMAND_LAUNCH_MAIL = 15
+APPCOMMAND_LAUNCH_APP1 = 17
+APPCOMMAND_LAUNCH_APP2 = 18
+APPCOMMAND_BROWSER_HOME_ALT = 19
+
+APPCOMMAND_TO_KEY: dict[int, str] = {
+    APPCOMMAND_BROWSER_SEARCH: "Home",
+    APPCOMMAND_BROWSER_HOME: "Home",
+    APPCOMMAND_BROWSER_HOME_ALT: "Home",
+    APPCOMMAND_LAUNCH_MAIL: "Email",
+    APPCOMMAND_LAUNCH_APP1: "Calc",
+    APPCOMMAND_LAUNCH_APP2: "Calc",
+}
+
+
+def get_appcommand_lparam(lparam: int) -> int:
+    """Win32 GET_APPCOMMAND_LPARAM(lParam) macro."""
+    return (int(lparam) >> 16) & 0xFFF
 
 
 # =============================================================================
@@ -165,6 +194,18 @@ class Controller(QObject):
             f"vel {velocity:>3}   <- {name} ({source})"
         )
 
+    def handle_appcommand(self, cmd: int) -> bool:
+        """Consume Win32 WM_APPCOMMAND for Browser/Mail/Calc keys and trigger MIDI if needed."""
+        name = APPCOMMAND_TO_KEY.get(cmd)
+        if name is None:
+            return False
+        with self._lock:
+            already_active = name in self._active
+        if not already_active:
+            self.handle_key(name, True, "appcmd")
+            QTimer.singleShot(90, lambda n=name: self.handle_key(n, False, "appcmd"))
+        return True
+
     @staticmethod
     def _ts() -> str:
         now = time.time()
@@ -211,6 +252,26 @@ class Controller(QObject):
         self.panic()
         self.config.save()
         self.engine.close()
+
+
+class WinAppCommandFilter(QAbstractNativeEventFilter):
+    """Application-wide native event filter that traps WM_APPCOMMAND (0x0319) on Windows."""
+
+    def __init__(self, ctrl: Controller) -> None:
+        super().__init__()
+        self.ctrl = ctrl
+
+    def nativeEventFilter(self, eventType, message):
+        if sys.platform == "win32" and message:
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_APPCOMMAND:
+                    cmd = get_appcommand_lparam(msg.lParam)
+                    if self.ctrl.handle_appcommand(cmd):
+                        return True, 1
+            except Exception:
+                pass
+        return False, 0
 
 
 # =============================================================================
@@ -533,7 +594,19 @@ class MainWindow(QMainWindow):
         mon.addWidget(self.monitor, 1)
         right.addWidget(mon_card, 1)
 
-    # ---- system tray ---------------------------------------------------------
+    # ---- system tray & native events -----------------------------------------
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32" and message:
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_APPCOMMAND:
+                    cmd = get_appcommand_lparam(msg.lParam)
+                    if self.ctrl.handle_appcommand(cmd):
+                        return True, 1
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
     def _setup_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip(f"{APP_NAME} {VERSION}")
@@ -687,6 +760,9 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
     engine.open_auto(config["port_name"])
     ctrl = Controller(config, engine)
     win = MainWindow(ctrl)
+    # Keep a reference to the native event filter on the window so it isn't GC'd
+    win._native_filter = WinAppCommandFilter(ctrl)
+    app.installNativeEventFilter(win._native_filter)
     app.aboutToQuit.connect(ctrl.shutdown)
     ctrl.log.emit(f"{ctrl._ts()}  {engine.description}")
     if start_hook:
@@ -710,6 +786,9 @@ def selftest() -> int:
         win.show()
         ctrl.handle_key("7", True)
         ctrl.handle_key("7", False)
+        assert ctrl.handle_appcommand(APPCOMMAND_BROWSER_HOME_ALT) is True
+        assert ctrl.handle_appcommand(APPCOMMAND_LAUNCH_MAIL) is True
+        assert ctrl.handle_appcommand(APPCOMMAND_LAUNCH_APP2) is True
         app.processEvents()
         assert len(win._pads) == len(KEY_NAMES) == 23
         assert ctrl.note_for("0") == 36

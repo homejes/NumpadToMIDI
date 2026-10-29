@@ -44,8 +44,10 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(win_key_name(13, 0, True), "Enter")
         self.assertIsNone(win_key_name(13, 0, False))  # main Enter is ignored
         self.assertEqual(win_key_name(0xAC, 0x32, True), "Home")   # VK_BROWSER_HOME
+        self.assertEqual(win_key_name(0xAA, 0, False), "Home")     # VK_BROWSER_SEARCH
         self.assertEqual(win_key_name(0x00, 0x32, True), "Home")   # scancode 0xE032
         self.assertEqual(win_key_name(0xB4, 0, False), "Email")    # VK_LAUNCH_MAIL
+        self.assertEqual(win_key_name(0xB6, 0, False), "Calc")     # VK_LAUNCH_APP1
         self.assertEqual(win_key_name(0xB7, 0, False), "Calc")     # VK_LAUNCH_APP2
         self.assertEqual(win_key_name(0x08, 0, False), "Backspace")
         self.assertEqual(win_key_name(36, 0x47, False), "7")       # NumLock-off numpad 7
@@ -54,6 +56,11 @@ class LayoutTests(unittest.TestCase):
     def test_exclusive_mode_default_on(self):
         hook, _ = make()
         self.assertTrue(hook._suppress)
+
+    def test_start_and_stop_hook(self):
+        hook, _ = make()
+        hook.start()
+        hook.stop()
 
 
 class DebounceTests(unittest.TestCase):
