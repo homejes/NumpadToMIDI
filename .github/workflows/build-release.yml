@@ -120,6 +120,8 @@ jobs:
           if (-not (Select-String -Path selftest.log -Pattern "Virtual MIDI source")) {
             throw "Installed app did not create the virtual MIDI source"
           }
+          Set-Service -Name Audiosrv -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name Audiosrv -ErrorAction SilentlyContinue
           python tests/e2e_windows_driver.py
           if ($LASTEXITCODE -ne 0) { throw "Virtual MIDI port end-to-end test failed" }
 
