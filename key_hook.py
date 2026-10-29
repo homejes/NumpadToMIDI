@@ -7,6 +7,10 @@ names and guarantees *exactly one* "down" and one "up" per physical press:
 * Stray releases are ignored.
 * The "000" key of financial numpads, which hardware-wise just emits three quick
   ``0`` presses, is recognised as a burst and reported as a single ``000`` key.
+* Multimedia/launcher keys on 23-key numpads (``VK_BROWSER_HOME`` 0xAC / scancode
+  0xE032, ``VK_LAUNCH_MAIL`` 0xB4, ``VK_LAUNCH_APP2`` 0xB7) are intercepted and
+  suppressed in ``WH_KEYBOARD_LL`` (returning 1) so Windows never opens Chrome,
+  Mail, or Calculator.
 
 The module is pure logic on top of ``_dispatch`` so it can be unit-tested
 without a keyboard (see ``tests/test_key_logic.py``).
@@ -23,37 +27,68 @@ from pynput import keyboard
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
-# (name, row, col) listed in NOTE ORDER (index 0 -> base note, i.e. C1 / 36).
-# The order follows a drum-rack: bottom-left pad first, then left->right,
-# bottom->top. 23 keys in total.
+# (name, row, col) listed in CHROMATIC NOTE ORDER (index 0 -> base note C1 / 36).
+# Matches the physical 6-row M-Tech 23-key USB numpad from bottom-left to top-right:
+#   Row 0 (Top):    [ Home ]    [ Tab ]  [ Email ] [ Calc ]       (notes 55..58)
+#   Row 1:          [ NumLock ] [ / ]    [ * ]     [ Backspace ]  (notes 51..54)
+#   Row 2:          [ 7 ]       [ 8 ]    [ 9 ]     [ - ]          (notes 47..50)
+#   Row 3:          [ 4 ]       [ 5 ]    [ 6 ]     [ + ]          (notes 43..46)
+#   Row 4:          [ 1 ]       [ 2 ]    [ 3 ]     [ Enter ]      (notes 39..42, Enter spans rows 4-5)
+#   Row 5 (Bottom): [ 0 ]       [ 000 ]  [ . ]     [ (Enter) ]    (notes 36..38)
 KEY_LAYOUT: list[tuple[str, int, int]] = [
     ("0", 5, 0), ("000", 5, 1), (".", 5, 2),
     ("1", 4, 0), ("2", 4, 1), ("3", 4, 2), ("Enter", 4, 3),
-    ("4", 3, 0), ("5", 3, 1), ("6", 3, 2), ("=", 3, 3),
-    ("7", 2, 0), ("8", 2, 1), ("9", 2, 2), ("+", 2, 3),
-    ("Tab", 1, 0), ("/", 1, 1), ("*", 1, 2), ("-", 1, 3),
-    ("Calc", 0, 0), ("Email", 0, 1), ("NumLock", 0, 2), ("Backspace", 0, 3),
+    ("4", 3, 0), ("5", 3, 1), ("6", 3, 2), ("+", 3, 3),
+    ("7", 2, 0), ("8", 2, 1), ("9", 2, 2), ("-", 2, 3),
+    ("NumLock", 1, 0), ("/", 1, 1), ("*", 1, 2), ("Backspace", 1, 3),
+    ("Home", 0, 0), ("Tab", 0, 1), ("Email", 0, 2), ("Calc", 0, 3),
 ]
+KEY_SPAN: dict[str, tuple[int, int]] = {
+    "Enter": (2, 1),  # tall 2-row key covering (row 4, col 3) and (row 5, col 3)
+}
+KEY_DISPLAY: dict[str, str] = {
+    "Home": "\u2302 Home",
+    "Backspace": "Backspace \u2190",
+    ".": ". (Del)",
+}
 KEY_NAMES: list[str] = [k[0] for k in KEY_LAYOUT]
 KEY_INDEX: dict[str, int] = {name: i for i, name in enumerate(KEY_NAMES)}
 
 # --- Windows virtual-key codes ------------------------------------------------
+VK_BACK = 0x08          # 8   - Backspace
+VK_TAB = 0x09           # 9   - Tab
+VK_RETURN = 0x0D        # 13  - Enter (extended = numpad Enter)
+VK_HOME = 0x24          # 36  - Home (extended = dedicated/numpad Home)
+VK_NUMLOCK = 0x90       # 144 - NumLock
+VK_BROWSER_HOME = 0xAC  # 172 - Browser/Home multimedia key (scancode 0xE032)
+VK_LAUNCH_MAIL = 0xB4   # 180 - Email multimedia key
+VK_LAUNCH_APP2 = 0xB7   # 183 - Calculator multimedia key
+
 WIN_VK: dict[int, str] = {
-    **{96 + i: str(i) for i in range(10)},  # VK_NUMPAD0..9
-    110: ".",        # VK_DECIMAL
-    107: "+",        # VK_ADD
-    109: "-",        # VK_SUBTRACT
-    106: "*",        # VK_MULTIPLY
-    111: "/",        # VK_DIVIDE
-    9: "Tab",        # VK_TAB
-    8: "Backspace",  # VK_BACK
-    183: "Calc",     # VK_LAUNCH_APP2 (calculator key)
-    180: "Email",    # VK_LAUNCH_MAIL
-    144: "NumLock",  # VK_NUMLOCK
+    **{96 + i: str(i) for i in range(10)},  # VK_NUMPAD0..9 (0x60..0x69)
+    110: ".",                # VK_DECIMAL (0x6E)
+    107: "+",                # VK_ADD (0x6B)
+    109: "-",                # VK_SUBTRACT (0x6D)
+    106: "*",                # VK_MULTIPLY (0x6A)
+    111: "/",                # VK_DIVIDE (0x6F)
+    VK_TAB: "Tab",           # 0x09
+    VK_BACK: "Backspace",    # 0x08
+    VK_NUMLOCK: "NumLock",   # 0x90
+    VK_BROWSER_HOME: "Home", # 0xAC (172)
+    VK_LAUNCH_MAIL: "Email", # 0xB4 (180)
+    VK_LAUNCH_APP2: "Calc",  # 0xB7 (183)
 }
-_WIN_VK_ENTER = 13
-_WIN_VK_OEM_PLUS = 187
-_WIN_SCAN_NUMPAD_EQUALS = 0x59
+
+# Hardware numpad scan codes when NumLock is OFF (non-extended, so dedicated
+# arrow/navigation cluster keys - which carry LLKHF_EXTENDED - are unaffected).
+_WIN_NUMPAD_SCANCODES: dict[int, str] = {
+    0x52: "0", 0x4F: "1", 0x50: "2", 0x51: "3", 0x4B: "4",
+    0x4C: "5", 0x4D: "6", 0x47: "7", 0x48: "8", 0x49: "9",
+    0x53: ".",
+}
+_WIN_NUMLOCK_OFF_VKS = frozenset({12, 33, 34, 35, 36, 37, 38, 39, 40, 45, 46})
+_WIN_SCAN_BROWSER_HOME = 0x32
+_ALWAYS_SUPPRESS_KEYS = frozenset({"Home", "Email", "Calc"})
 _WM_KEYDOWN, _WM_KEYUP, _WM_SYSKEYDOWN, _WM_SYSKEYUP = 0x100, 0x101, 0x104, 0x105
 _LLKHF_EXTENDED = 0x01
 
@@ -62,17 +97,21 @@ MAC_VK: dict[int, str] = {
     82: "0", 83: "1", 84: "2", 85: "3", 86: "4", 87: "5", 88: "6", 89: "7",
     91: "8", 92: "9",
     65: ".", 67: "*", 69: "+", 71: "NumLock",  # keypad Clear == NumLock
-    75: "/", 76: "Enter", 78: "-", 81: "=",
+    75: "/", 76: "Enter", 78: "-", 115: "Home",
     48: "Tab", 51: "Backspace",
 }
 
 
 def win_key_name(vk: int, scan: int, extended: bool) -> Optional[str]:
     """Map a Windows low-level keyboard event to a logical numpad key name."""
-    if vk == _WIN_VK_ENTER:  # only the *extended* Enter is the numpad one
+    if vk == VK_RETURN:  # only the *extended* Enter is the numpad one
         return "Enter" if extended else None
-    if vk == _WIN_VK_OEM_PLUS and scan == _WIN_SCAN_NUMPAD_EQUALS:
-        return "="
+    if vk == VK_BROWSER_HOME or (scan == _WIN_SCAN_BROWSER_HOME and extended):
+        return "Home"
+    if vk == VK_HOME and extended:
+        return "Home"
+    if not extended and vk in _WIN_NUMLOCK_OFF_VKS and scan in _WIN_NUMPAD_SCANCODES:
+        return _WIN_NUMPAD_SCANCODES[scan]
     return WIN_VK.get(vk)
 
 
@@ -93,12 +132,12 @@ class KeyHook:
         *,
         detect_triple_zero: bool = True,
         burst_window_ms: float = 35.0,
-        suppress: bool = False,
+        suppress: bool = True,
     ) -> None:
         self._on_key = on_key
         self.detect_triple_zero = detect_triple_zero
         self.burst_window = max(0.005, burst_window_ms / 1000.0)
-        self._suppress = suppress
+        self._suppress = bool(suppress)
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
@@ -113,7 +152,7 @@ class KeyHook:
 
     # ------------------------------------------------------------------ control
     def set_suppress(self, value: bool) -> None:
-        """Block numpad keys from reaching other apps (best effort)."""
+        """Enable or disable Exclusive Mode (swallowing numpad keys from the OS)."""
         self._suppress = bool(value)
 
     def start(self) -> None:
@@ -144,8 +183,14 @@ class KeyHook:
 
     # ----------------------------------------------------- platform event sources
     def _win_filter(self, msg: int, data) -> bool:
-        """pynput low-level hook filter. Handles everything, then returns False
-        so pynput's own callbacks are skipped (we do not need them)."""
+        """pynput WH_KEYBOARD_LL hook filter.
+
+        When Exclusive Mode is enabled (or for multimedia launcher keys like
+        VK_BROWSER_HOME / VK_LAUNCH_MAIL / VK_LAUNCH_APP2), raises
+        ``SuppressException`` so ``SystemHook._handler`` immediately returns 1
+        without calling ``CallNextHookEx``, preventing Windows from opening
+        Chrome/Mail/Calculator or sending digits to focused apps.
+        """
         try:
             name = win_key_name(
                 int(data.vkCode), int(data.scanCode), bool(data.flags & _LLKHF_EXTENDED)
@@ -155,8 +200,8 @@ class KeyHook:
                     self._dispatch(name, True)
                 elif msg in (_WM_KEYUP, _WM_SYSKEYUP):
                     self._dispatch(name, False)
-                if self._suppress:
-                    self._listener.suppress_event()  # raises SuppressException
+                if (self._suppress or name in _ALWAYS_SUPPRESS_KEYS) and self._listener is not None:
+                    self._listener.suppress_event()  # raises SuppressException -> return 1
         except Exception as exc:  # never break the OS hook chain
             if exc.__class__.__name__ == "SuppressException":
                 raise
@@ -174,7 +219,7 @@ class KeyHook:
             if name is None:
                 return event
             self._dispatch(name, event_type == Quartz.kCGEventKeyDown)
-            return None if self._suppress else event
+            return None if (self._suppress or name in _ALWAYS_SUPPRESS_KEYS) else event
         except Exception:
             return event
 

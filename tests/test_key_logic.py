@@ -1,6 +1,6 @@
 import unittest
 
-from key_hook import KEY_INDEX, KEY_LAYOUT, KeyHook, win_key_name
+from key_hook import KEY_INDEX, KEY_LAYOUT, KEY_SPAN, KeyHook, win_key_name
 
 
 class Recorder:
@@ -22,10 +22,20 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(len({k[0] for k in KEY_LAYOUT}), 23)
         self.assertEqual(len({(k[1], k[2]) for k in KEY_LAYOUT}), 23)
         self.assertEqual(KEY_INDEX["0"], 0)
+        self.assertEqual(KEY_SPAN.get("Enter"), (2, 1))
+
+    def test_mtech_hardware_row_alignment_and_chromatic_order(self):
+        by_row = {r: [name for name, row, _ in KEY_LAYOUT if row == r] for r in range(6)}
+        self.assertEqual(by_row[0], ["Home", "Tab", "Email", "Calc"])
+        self.assertEqual(by_row[1], ["NumLock", "/", "*", "Backspace"])
+        self.assertEqual(by_row[2], ["7", "8", "9", "-"])
+        self.assertEqual(by_row[3], ["4", "5", "6", "+"])
+        self.assertEqual(by_row[4], ["1", "2", "3", "Enter"])
+        self.assertEqual(by_row[5], ["0", "000", "."])
 
     def test_required_keys_present(self):
         for name in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "000", "Enter",
-                     "+", "-", "*", "/", "Tab", "Backspace", "Calc", "Email"]:
+                     "+", "-", "*", "/", "Tab", "Backspace", "Calc", "Email", "Home", "NumLock"]:
             self.assertIn(name, KEY_INDEX)
 
     def test_windows_mapping(self):
@@ -33,9 +43,17 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(win_key_name(105, 0, False), "9")
         self.assertEqual(win_key_name(13, 0, True), "Enter")
         self.assertIsNone(win_key_name(13, 0, False))  # main Enter is ignored
-        self.assertEqual(win_key_name(183, 0, False), "Calc")
-        self.assertEqual(win_key_name(180, 0, False), "Email")
+        self.assertEqual(win_key_name(0xAC, 0x32, True), "Home")   # VK_BROWSER_HOME
+        self.assertEqual(win_key_name(0x00, 0x32, True), "Home")   # scancode 0xE032
+        self.assertEqual(win_key_name(0xB4, 0, False), "Email")    # VK_LAUNCH_MAIL
+        self.assertEqual(win_key_name(0xB7, 0, False), "Calc")     # VK_LAUNCH_APP2
+        self.assertEqual(win_key_name(0x08, 0, False), "Backspace")
+        self.assertEqual(win_key_name(36, 0x47, False), "7")       # NumLock-off numpad 7
         self.assertIsNone(win_key_name(65, 0, False))
+
+    def test_exclusive_mode_default_on(self):
+        hook, _ = make()
+        self.assertTrue(hook._suppress)
 
 
 class DebounceTests(unittest.TestCase):

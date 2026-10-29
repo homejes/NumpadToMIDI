@@ -1,32 +1,40 @@
 # NumpadToMIDI
 
-Turn a 23-key USB numpad into a MIDI controller (Windows 11 & macOS). Every key is a
-pad in a Drum Rack layout: the bottom-left `0` key is **C1 (MIDI note 36)** and the
+Turn a 23-key M-Tech USB numpad into a MIDI controller (Windows 11 & macOS). Every key is a
+pad in a chromatic Drum Rack layout: the bottom-left `0` key is **C1 (MIDI note 36)** and the
 notes climb left→right, bottom→top (23 keys → notes 36–58).
 
 ## Features
 - Exactly **one Note On per press** and **one Note Off per release** (OS auto-repeat is ignored).
 - The **`000`** key (which hardware sends as three fast `0` presses) is detected as a single key.
-- Supported keys: `0-9`, `.`, `000`, `Enter`, `+`, `-`, `*`, `/`, `Tab`, `Backspace`, `Calc`, `Email`
-  (plus `NumLock` and `=` to fill the 23 pads).
+- Physical **M-Tech 23-key layout**: `Home` (`VK_BROWSER_HOME` / `0xAC`), `Tab`, `Email` (`0xB4`),
+  `Calc` (`0xB7`), `NumLock`, `/`, `*`, `Backspace`, `0-9`, `. (Del)`, `000`, `+`, `-`, and a
+  2-row tall `Enter` key.
+- **Exclusive Mode (Block OS Keystrokes)** enabled by default: intercepts and swallows keypad
+  and multimedia keys (`VK_BROWSER_HOME`, `VK_LAUNCH_MAIL`, `VK_LAUNCH_APP2`, `VK_BACK`, digits)
+  in `WH_KEYBOARD_LL` (`return 1`) so Chrome, Mail, or Calculator never launch and DAW text
+  inputs are never polluted.
+- **System Tray background mode**: clicking the window close button (`X`) minimizes to the
+  system tray with a notification (`Open NumpadToMIDI`, `Mute MIDI`, `Quit NumpadToMIDI`;
+  double-click the tray icon to restore).
 - Dark PyQt6 UI: lighting pad grid (click pads with the mouse too), live MIDI monitor,
   octave shift (−3…+5), MIDI channel 1–16, velocity, panic button.
 - macOS: native **virtual MIDI source** called `NumpadToMIDI`.
 - Windows: creates a virtual MIDI port called **`NumpadToMIDI`** directly via the
   [teVirtualMIDI](https://www.tobias-erichsen.de/software/virtualmidi.html) driver
-  (automatically installed by `NumpadToMIDI-Setup-v1.1.0.exe`). If the driver is not
+  (automatically installed by `NumpadToMIDI-Setup-v1.2.0.exe`). If the driver is not
   present, falls back to any existing loopback port (e.g.
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)), then to the first
   available output, or runs silently if none exists.
 
-## Pad layout (note order from C1)
+## Pad layout (M-Tech 23-key chromatic note order from C1 = 36)
 ```
- Calc(55) Email(56) NumLock(57) Backspace(58)
- Tab(51)  /(52)   *(53)     -(54)
- 7(47)    8(48)   9(49)     +(50)
- 4(43)    5(44)   6(45)     =(46)
- 1(39)    2(40)    3(41)    Enter(42)
- 0(36)    000(37)  .(38)
+ Row 1 (Top):    [ Home (55) ]    [ Tab (56) ]  [ Email (57) ] [ Calc (58) ]
+ Row 2:          [ NumLock (51) ] [ / (52) ]    [ * (53) ]     [ Backspace (54) ]
+ Row 3:          [ 7 (47) ]       [ 8 (48) ]    [ 9 (49) ]     [ - (50) ]
+ Row 4:          [ 4 (43) ]       [ 5 (44) ]    [ 6 (45) ]     [ + (46) ]
+ Row 5:          [ 1 (39) ]       [ 2 (40) ]    [ 3 (41) ]     [ Enter (42) ]
+ Row 6 (Bottom): [ 0 (36) ]       [ 000 (37) ]  [ . (38) ]     [ (Enter)    ]
 ```
 
 ## Run from source
@@ -46,29 +54,30 @@ Output: `dist/NumpadToMIDI-Windows.exe` (Windows) or `dist/NumpadToMIDI.app` (ma
 To build the platform installers:
 - **Windows (Inno Setup 6.3+):**
   ```powershell
-  ISCC.exe /DAppVersion=1.1.0 installer\windows_installer.iss
+  ISCC.exe /DAppVersion=1.2.0 installer\windows_installer.iss
   ```
-  Produces `dist/NumpadToMIDI-Setup-v1.1.0.exe` (bundles the app, creates Desktop and
+  Produces `dist/NumpadToMIDI-Setup-v1.2.0.exe` (bundles the app, creates Desktop and
   Start Menu shortcuts, elevates to Administrator, and silently downloads + installs
   the `teVirtualMIDI` virtual MIDI driver if missing).
 - **macOS (DMG with `/Applications` link and setup guide):**
   ```bash
-  bash installer/make_dmg.sh 1.1.0
+  bash installer/make_dmg.sh 1.2.0
   ```
-  Produces `dist/NumpadToMIDI-macOS-v1.1.0.dmg`.
+  Produces `dist/NumpadToMIDI-macOS-v1.2.0.dmg`.
 
 ## Releases / CI
 `.github/workflows/build-release.yml` builds both platforms on every `v*` tag (and manual
-`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.1.0.exe` and
-`NumpadToMIDI-macOS-v1.1.0.dmg` to the GitHub Release.
+`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.2.0.exe` and
+`NumpadToMIDI-macOS-v1.2.0.dmg` to the GitHub Release.
 
 ## Notes & limitations
-- **Windows:** keep **NumLock on**. Only the *extended* (numpad) Enter is recognised.
+- **Windows:** works with NumLock on or off. Only the *extended* (numpad) Enter is recognised.
   `Tab`/`Backspace` cannot be told apart from the main keyboard's keys.
 - **macOS:** grant the app **Input Monitoring** (and, for blocking keys, **Accessibility**) in
   *System Settings → Privacy & Security*. The CI build is ad-hoc signed only, so on first run
   right-click → *Open* (or `xattr -dr com.apple.quarantine NumpadToMIDI.app`).
   `Calc`/`Email` keys are not delivered to apps by macOS; those pads work via mouse only.
-- *Block numpad keys from other apps* prevents the numpad from also typing into the focused app.
+- *Exclusive Mode (Block OS Keystrokes)* prevents the numpad from typing into the focused app or
+  launching browser/mail/calculator shortcuts.
 - Settings are stored in `%APPDATA%\NumpadToMIDI\config.json` (Windows) or
   `~/Library/Application Support/NumpadToMIDI/config.json` (macOS); `config.json` in this repo holds the defaults.

@@ -11,13 +11,16 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QObject, QSize, Qt, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPen
+from PyQt6.QtGui import (
+    QAction, QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMainWindow, QPlainTextEdit, QPushButton, QSizePolicy, QSlider, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QPlainTextEdit, QPushButton, QSizePolicy, QSlider,
+    QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from key_hook import KEY_INDEX, KEY_LAYOUT, KEY_NAMES, KeyHook
+from key_hook import KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES, KEY_SPAN, KeyHook
 from midi_engine import MidiEngine, note_name
 from version import VERSION
 
@@ -49,7 +52,8 @@ class Config:
         "channel": 1,
         "velocity": 100,
         "port_name": "",
-        "suppress_keys": False,
+        "suppress_keys": True,
+        "exclusive_mode": True,
         "triple_zero_detection": True,
         "burst_window_ms": 35,
     }
@@ -57,13 +61,23 @@ class Config:
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = path or (user_config_dir() / "config.json")
         self.data: dict = dict(self.DEFAULTS)
+        user_has_exclusive = False
         for source in (resource_path("config.json"), self.path):
             try:
                 loaded = json.loads(Path(source).read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
+                    if source == self.path and "exclusive_mode" in loaded:
+                        user_has_exclusive = True
                     self.data.update({k: v for k, v in loaded.items() if k in self.DEFAULTS})
             except (OSError, ValueError):
                 pass
+        # Upgrade path from v1.0/v1.1: if the user config pre-dates `exclusive_mode`,
+        # default Exclusive Mode (and `suppress_keys`) to True.
+        if not user_has_exclusive:
+            self.data["exclusive_mode"] = True
+            self.data["suppress_keys"] = True
+        else:
+            self.data["suppress_keys"] = bool(self.data["exclusive_mode"])
         self._sanitize()
 
     def _sanitize(self) -> None:
@@ -73,6 +87,8 @@ class Config:
         d["channel"] = max(1, min(16, int(d["channel"])))
         d["velocity"] = max(1, min(127, int(d["velocity"])))
         d["burst_window_ms"] = max(5, min(200, float(d["burst_window_ms"])))
+        d["exclusive_mode"] = bool(d["exclusive_mode"])
+        d["suppress_keys"] = bool(d["suppress_keys"])
 
     def __getitem__(self, key: str):
         return self.data[key]
@@ -93,12 +109,14 @@ class Config:
 # =============================================================================
 class Controller(QObject):
     key_state = pyqtSignal(str, bool)   # key name, is_down
+    mute_changed = pyqtSignal(bool)     # is_muted
     log = pyqtSignal(str)
 
     def __init__(self, config: Config, engine: MidiEngine) -> None:
         super().__init__()
         self.config = config
         self.engine = engine
+        self.muted = False
         self._lock = threading.Lock()
         self._active: dict[str, tuple[int, int]] = {}  # key -> (note, channel)
         self.hook = KeyHook(
@@ -129,16 +147,18 @@ class Controller(QObject):
                     return
                 channel, velocity = self.config["channel"], self.config["velocity"]
                 self._active[name] = (note, channel)
-                self.engine.note_on(channel, note, velocity)
-                label = "NOTE ON "
+                if not self.muted:
+                    self.engine.note_on(channel, note, velocity)
+                label = "MUTE ON " if self.muted else "NOTE ON "
             else:
                 entry = self._active.pop(name, None)
                 if entry is None:
                     return
                 note, channel = entry
                 velocity = 0
-                self.engine.note_off(channel, note)
-                label = "NOTE OFF"
+                if not self.muted:
+                    self.engine.note_off(channel, note)
+                label = "MUTE OFF" if self.muted else "NOTE OFF"
         self.key_state.emit(name, down)
         self.log.emit(
             f"{self._ts()}  ch{channel:>2}  {label}  {note:>3} {note_name(note):<4} "
@@ -161,8 +181,20 @@ class Controller(QObject):
         self.config["velocity"] = max(1, min(127, velocity))
 
     def set_suppress(self, value: bool) -> None:
-        self.config["suppress_keys"] = bool(value)
-        self.hook.set_suppress(value)
+        enabled = bool(value)
+        self.config["suppress_keys"] = enabled
+        self.config["exclusive_mode"] = enabled
+        self.hook.set_suppress(enabled)
+
+    def set_muted(self, value: bool) -> None:
+        muted = bool(value)
+        if self.muted == muted:
+            return
+        if muted:
+            self.panic()
+        self.muted = muted
+        self.mute_changed.emit(muted)
+        self.log.emit(f"{self._ts()}  MIDI {'muted' if muted else 'unmuted'}")
 
     def panic(self) -> None:
         with self._lock:
@@ -203,7 +235,10 @@ QPushButton#step { padding: 4px 0px; min-width: 34px; font-weight: 700; font-siz
 QComboBox { background: #1c2130; color: #e6ebf5; border: 1px solid #2d3447;
             border-radius: 8px; padding: 5px 10px; min-width: 70px; }
 QComboBox QAbstractItemView { background: #1c2130; color: #e6ebf5; selection-background-color: #3a4360; }
-QCheckBox { color: #c9d1e0; spacing: 8px; }
+QCheckBox { color: #c9d1e0; spacing: 8px; font-weight: 600; }
+QMenu { background: #161a24; color: #e6ebf5; border: 1px solid #2d3447; padding: 4px; }
+QMenu::item { padding: 6px 20px; border-radius: 6px; }
+QMenu::item:selected { background: #2d3447; }
 QSlider::groove:horizontal { height: 6px; background: #232938; border-radius: 3px; }
 QSlider::sub-page:horizontal { background: #7c5cff; border-radius: 3px; }
 QSlider::handle:horizontal { background: #ffffff; width: 16px; margin: -6px 0; border-radius: 8px; }
@@ -213,6 +248,25 @@ QScrollBar:vertical { background: #0b0d13; width: 10px; }
 QScrollBar::handle:vertical { background: #2d3447; border-radius: 5px; min-height: 24px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
+
+
+def make_app_icon() -> QIcon:
+    """Render a crisp 64x64 pad-grid icon for the window and system tray."""
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor("#161a24"))
+    p.setPen(QPen(QColor("#7c5cff"), 3))
+    p.drawRoundedRect(4, 4, 56, 56, 14, 14)
+    colors = ("#7c5cff", "#3ddc84", "#ffb454", "#ff6b81")
+    for idx in range(9):
+        r, c = divmod(idx, 3)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(colors[(r + c) % len(colors)]))
+        p.drawRoundedRect(13 + c * 14, 13 + r * 14, 10, 10, 3, 3)
+    p.end()
+    return QIcon(pix)
 
 
 def mix(a: QColor, b: QColor, t: float) -> QColor:
@@ -230,9 +284,16 @@ class PadWidget(QWidget):
     pressed = pyqtSignal(str)
     released = pyqtSignal(str)
 
-    def __init__(self, name: str, index: int, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        index: int,
+        display: Optional[str] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.name = name
+        self.display = display or KEY_DISPLAY.get(name, name)
         self._note_text = ""
         self._glow = 0.0
         self._color = QColor.fromHsv(int(index * 360 / len(KEY_NAMES)) % 360, 170, 255)
@@ -293,11 +354,13 @@ class PadWidget(QWidget):
         p.setPen(text_color)
         big = QFont(self.font())
         big.setBold(True)
-        big.setPixelSize(max(12, min(rect.width(), rect.height()) // (3 if len(self.name) < 4 else 5)))
+        cell_dim = min(rect.width(), rect.height())
+        divisor = 3 if len(self.display) < 4 else (5 if len(self.display) < 8 else 6)
+        big.setPixelSize(max(11, cell_dim // divisor))
         p.setFont(big)
-        p.drawText(rect.adjusted(0, 0, 0, -rect.height() // 5), Qt.AlignmentFlag.AlignCenter, self.name)
+        p.drawText(rect.adjusted(4, 0, -4, -rect.height() // 5), Qt.AlignmentFlag.AlignCenter, self.display)
         small = QFont(self.font())
-        small.setPixelSize(max(9, rect.height() // 8))
+        small.setPixelSize(max(9, cell_dim // 8))
         p.setFont(small)
         sub = mix(QColor("#6b7592"), QColor("#1a1d29"), g)
         p.setPen(sub)
@@ -310,12 +373,16 @@ class MainWindow(QMainWindow):
     def __init__(self, ctrl: Controller) -> None:
         super().__init__()
         self.ctrl = ctrl
+        self._quitting = False
         self.setWindowTitle(f"NumpadToMIDI {VERSION}")
+        self.setWindowIcon(make_app_icon())
         self.resize(1040, 680)
         self.setMinimumSize(880, 600)
         self._pads: dict[str, PadWidget] = {}
         self._build()
+        self._setup_tray()
         ctrl.key_state.connect(self._on_key_state)
+        ctrl.mute_changed.connect(self._on_mute_changed)
         ctrl.log.connect(self._append_log)
         self._refresh_notes()
         self._refresh_status()
@@ -349,7 +416,7 @@ class MainWindow(QMainWindow):
         titles = QVBoxLayout()
         title = QLabel("NumpadToMIDI")
         title.setObjectName("title")
-        sub = QLabel("23-key USB numpad  \u2192  MIDI  (Drum Rack layout, C1 = 36)")
+        sub = QLabel("23-key M-Tech USB numpad  \u2192  MIDI  (Chromatic Drum Rack layout, C1 = 36)")
         sub.setObjectName("subtitle")
         titles.addWidget(title)
         titles.addWidget(sub)
@@ -363,16 +430,17 @@ class MainWindow(QMainWindow):
         body.setSpacing(14)
         outer.addLayout(body, 1)
 
-        # pad grid
+        # pad grid (6 rows x 4 columns; Enter spans rows 4-5 in column 3)
         pads_card, pads_lay = self._card()
-        pads_lay.addWidget(self._section("Pads"))
+        pads_lay.addWidget(self._section("Pads (M-Tech 23-Key Layout)"))
         grid = QGridLayout()
         grid.setSpacing(6)
         for index, (name, row, col) in enumerate(KEY_LAYOUT):
             pad = PadWidget(name, index)
-            pad.pressed.connect(lambda n: self.ctrl.handle_key(n, True, "mouse"))
-            pad.released.connect(lambda n: self.ctrl.handle_key(n, False, "mouse"))
-            grid.addWidget(pad, row, col)
+            pad.pressed.connect(lambda n=name: self.ctrl.handle_key(n, True, "mouse"))
+            pad.released.connect(lambda n=name: self.ctrl.handle_key(n, False, "mouse"))
+            rspan, cspan = KEY_SPAN.get(name, (1, 1))
+            grid.addWidget(pad, row, col, rspan, cspan)
             self._pads[name] = pad
         for r in range(6):
             grid.setRowStretch(r, 1)
@@ -434,7 +502,7 @@ class MainWindow(QMainWindow):
         form.addWidget(refresh, 3, 3)
         ctl.addLayout(form)
 
-        self.suppress = QCheckBox("Block numpad keys from other apps")
+        self.suppress = QCheckBox("Exclusive Mode (Block OS Keystrokes)")
         self.suppress.setChecked(bool(cfg["suppress_keys"]))
         self.suppress.toggled.connect(self.ctrl.set_suppress)
         ctl.addWidget(self.suppress)
@@ -464,6 +532,66 @@ class MainWindow(QMainWindow):
         self.monitor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         mon.addWidget(self.monitor, 1)
         right.addWidget(mon_card, 1)
+
+    # ---- system tray ---------------------------------------------------------
+    def _setup_tray(self) -> None:
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip(f"{APP_NAME} {VERSION}")
+
+        self.tray_menu = QMenu(self)
+        self.action_open = QAction("Open NumpadToMIDI", self)
+        self.action_open.triggered.connect(self.restore_from_tray)
+        self.tray_menu.addAction(self.action_open)
+
+        self.action_mute = QAction("Mute MIDI", self)
+        self.action_mute.setCheckable(True)
+        self.action_mute.setChecked(self.ctrl.muted)
+        self.action_mute.toggled.connect(self.ctrl.set_muted)
+        self.tray_menu.addAction(self.action_mute)
+
+        self.tray_menu.addSeparator()
+
+        self.action_quit = QAction("Quit NumpadToMIDI", self)
+        self.action_quit.triggered.connect(self.quit_app)
+        self.tray_menu.addAction(self.action_quit)
+
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.restore_from_tray()
+
+    def _on_mute_changed(self, muted: bool) -> None:
+        self.action_mute.blockSignals(True)
+        self.action_mute.setChecked(muted)
+        self.action_mute.blockSignals(False)
+
+    def restore_from_tray(self) -> None:
+        self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self) -> None:
+        self._quitting = True
+        self.tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._quitting and QSystemTrayIcon.isSystemTrayAvailable() and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray.showMessage(
+                APP_NAME,
+                "NumpadToMIDI is running in the system tray",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+            return
+        event.accept()
 
     # ---- behaviour -----------------------------------------------------------
     def _shift_octave(self, delta: int) -> None:
@@ -552,6 +680,8 @@ class MainWindow(QMainWindow):
 def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWindow]:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyleSheet(STYLE)
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        app.setQuitOnLastWindowClosed(False)
     config = Config()
     engine = MidiEngine()
     engine.open_auto(config["port_name"])
@@ -583,6 +713,14 @@ def selftest() -> int:
         app.processEvents()
         assert len(win._pads) == len(KEY_NAMES) == 23
         assert ctrl.note_for("0") == 36
+        assert ctrl.note_for("Home") == 55
+        assert ctrl.note_for("Calc") == 58
+        assert win.suppress.isChecked() is True
+        assert [a.text() for a in win.tray_menu.actions() if not a.isSeparator()] == [
+            "Open NumpadToMIDI",
+            "Mute MIDI",
+            "Quit NumpadToMIDI",
+        ]
         lines.append(f"SELFTEST OK ({ctrl.engine.description})")
         ctrl.shutdown()
     except Exception:
