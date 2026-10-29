@@ -6,6 +6,10 @@ import sys
 
 from PyInstaller.utils.hooks import collect_submodules
 
+_version = {}
+exec(open("version.py", encoding="utf-8").read(), _version)
+APP_VERSION = _version["VERSION"]
+
 hiddenimports = collect_submodules("rtmidi")
 if sys.platform == "win32":
     hiddenimports += ["pynput.keyboard._win32", "pynput.mouse._win32"]
@@ -47,7 +51,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "NumpadToMIDI",
             "CFBundleDisplayName": "NumpadToMIDI",
-            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
             "NSHighResolutionCapable": True,
             "NSInputMonitoringUsageDescription":
                 "NumpadToMIDI listens to your numpad to send MIDI notes.",

@@ -1,0 +1,23 @@
+NumpadToMIDI - virtual MIDI driver notice
+==========================================
+
+Windows cannot create virtual MIDI ports by itself. NumpadToMIDI uses the
+"teVirtualMIDI" driver by Tobias Erichsen to create a port called "NumpadToMIDI"
+that appears as a MIDI input in your DAW.
+
+If the driver is not already on your PC, this installer will DOWNLOAD the
+official loopMIDI package (which contains the driver) directly from
+https://www.tobias-erichsen.de, check its checksum, and install it silently.
+Nothing from that package is stored in the NumpadToMIDI repository or inside
+this installer.
+
+The driver and loopMIDI are copyrighted by Tobias Erichsen and are free for
+PRIVATE, non-commercial use only. Commercial use or redistribution requires a
+licence from the author: https://www.tobias-erichsen.de
+
+You can opt out on the "Select Additional Tasks" page by un-ticking
+"Install the virtual MIDI driver". NumpadToMIDI then falls back to any existing
+loopback MIDI port (for example one created with loopMIDI).
+
+The driver is shared with other applications and is NOT removed when you
+uninstall NumpadToMIDI.

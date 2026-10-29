@@ -16,11 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            asset: NumpadToMIDI-Windows.exe
-          - os: macos-latest
-            asset: NumpadToMIDI-macOS.zip
+        os: [windows-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,16 +32,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Resolve version (version.py is the source of truth)
+        shell: bash
+        run: |
+          VERSION="$(python -c 'from version import VERSION; print(VERSION)')"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version.py (v$VERSION)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building NumpadToMIDI v$VERSION"
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
       - name: Build with PyInstaller
         run: pyinstaller build.spec --noconfirm
 
-      - name: Package macOS app
-        if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent dist/NumpadToMIDI.app dist/NumpadToMIDI-macOS.zip
-
+      # ------------------------------------------------------------ Windows
       - name: Smoke test frozen binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -55,17 +59,104 @@ jobs:
           if (Test-Path selftest.log) { Get-Content selftest.log }
           if ($p.ExitCode -ne 0) { throw "Selftest failed with exit code $($p.ExitCode)" }
 
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after installation" }
+          & $iscc /? 2>&1 | Select-Object -First 3
+
+      - name: Compile Inno Setup installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" installer\windows_installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Test installer - silent install (driver + app + shortcuts)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = "dist\NumpadToMIDI-Setup-v$env:VERSION.exe"
+          if (-not (Test-Path $setup)) { throw "$setup was not produced" }
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+            "/LOG=$PWD\installer.log", "/TASKS=desktopicon,installdriver")
+          Write-Host "Installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "Installer failed with exit code $($p.ExitCode)" }
+          $checks = @{
+            "app exe"       = "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe"
+            "start menu"    = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\NumpadToMIDI\NumpadToMIDI.lnk"
+            "desktop"       = "$env:PUBLIC\Desktop\NumpadToMIDI.lnk"
+            "midi driver"   = "$env:SystemRoot\System32\teVirtualMIDI64.dll"
+          }
+          $failed = $false
+          foreach ($k in $checks.Keys) {
+            $ok = Test-Path $checks[$k]
+            Write-Host ("{0,-12} {1}  {2}" -f $k, $(if ($ok) {"OK  "} else {"MISSING"}), $checks[$k])
+            if (-not $ok) { $failed = $true }
+          }
+          if ($failed) { throw "Installation verification failed" }
+
+      - name: Show installer log
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: if (Test-Path installer.log) { Get-Content installer.log -Tail 120 } else { "no installer.log" }
+
+      - name: Test installed app and virtual MIDI port
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item selftest.log -ErrorAction SilentlyContinue
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content selftest.log
+          if ($p.ExitCode -ne 0) { throw "Installed app selftest failed ($($p.ExitCode))" }
+          if (-not (Select-String -Path selftest.log -Pattern "Virtual MIDI source")) {
+            throw "Installed app did not create the virtual MIDI source"
+          }
+          python tests/e2e_windows_driver.py
+          if ($LASTEXITCODE -ne 0) { throw "Virtual MIDI port end-to-end test failed" }
+
+      - name: Test uninstall
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Uninstaller failed ($($p.ExitCode))" }
+          Start-Sleep -Seconds 2
+          if (Test-Path "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe") { throw "App was not removed" }
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/NumpadToMIDI-Setup-v${{ env.VERSION }}.exe
+          if-no-files-found: error
+
+      # -------------------------------------------------------------- macOS
       - name: Smoke test frozen binary (macOS)
         if: runner.os == 'macOS'
         run: |
           QT_QPA_PLATFORM=offscreen dist/NumpadToMIDI.app/Contents/MacOS/NumpadToMIDI --selftest
           cat selftest.log
 
-      - name: Upload build artifact
+      - name: Create DMG
+        if: runner.os == 'macOS'
+        run: bash installer/make_dmg.sh "$VERSION"
+
+      - name: Upload macOS DMG
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: macos-dmg
+          path: dist/NumpadToMIDI-macOS-v${{ env.VERSION }}.dmg
           if-no-files-found: error
 
   release:
@@ -80,13 +171,17 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: List assets
-        run: ls -lh release-assets
+      - name: Verify assets
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ls -lh release-assets
+          test -f "release-assets/NumpadToMIDI-Setup-v${VERSION}.exe"
+          test -f "release-assets/NumpadToMIDI-macOS-v${VERSION}.dmg"
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/NumpadToMIDI-Windows.exe
-            release-assets/NumpadToMIDI-macOS.zip
+            release-assets/NumpadToMIDI-Setup-v*.exe
+            release-assets/NumpadToMIDI-macOS-v*.dmg
           generate_release_notes: true

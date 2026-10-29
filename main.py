@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from key_hook import KEY_INDEX, KEY_LAYOUT, KEY_NAMES, KeyHook
 from midi_engine import MidiEngine, note_name
+from version import VERSION
 
 APP_NAME = "NumpadToMIDI"
 OCTAVE_MIN, OCTAVE_MAX = -3, 5
@@ -309,7 +310,7 @@ class MainWindow(QMainWindow):
     def __init__(self, ctrl: Controller) -> None:
         super().__init__()
         self.ctrl = ctrl
-        self.setWindowTitle("NumpadToMIDI")
+        self.setWindowTitle(f"NumpadToMIDI {VERSION}")
         self.resize(1040, 680)
         self.setMinimumSize(880, 600)
         self._pads: dict[str, PadWidget] = {}
@@ -476,9 +477,13 @@ class MainWindow(QMainWindow):
 
     def _on_port_chosen(self, index: int) -> None:
         name = self.port.itemData(index)
+        self.ctrl.panic()
         if name:
             self.ctrl.engine.open_port_by_name(name)
             self.ctrl.config["port_name"] = name
+        elif self.ctrl.engine.supports_virtual:  # "built-in virtual port" entry
+            self.ctrl.config["port_name"] = ""
+            self.ctrl.engine.open_auto("")
         self._refresh_status()
 
     def _reopen_ports(self) -> None:
@@ -502,26 +507,32 @@ class MainWindow(QMainWindow):
 
         self.port.blockSignals(True)
         self.port.clear()
-        if engine.mode == "virtual":
-            self.port.addItem(f"Virtual: {engine.port_name}", None)
+        ports = engine.list_ports()
+        if sys.platform == "darwin":  # macOS: always the native virtual source
+            self.port.addItem(f"Virtual: {engine.port_name or engine.CLIENT_NAME}", None)
             self.port.setEnabled(False)
         else:
             self.port.setEnabled(True)
-            ports = engine.list_ports()
+            if engine.supports_virtual:
+                self.port.addItem(f"Virtual port: {engine.CLIENT_NAME} (built-in)", None)
             for name in ports:
                 self.port.addItem(name, name)
-            if not ports:
-                self.port.addItem("(no MIDI outputs found)", None)
+            if engine.mode == "virtual":
+                self.port.setCurrentIndex(0)
             elif engine.port_name in ports:
-                self.port.setCurrentIndex(ports.index(engine.port_name))
+                self.port.setCurrentIndex(ports.index(engine.port_name) + (1 if engine.supports_virtual else 0))
+            if self.port.count() == 0:
+                self.port.addItem("(no MIDI outputs found)", None)
         self.port.blockSignals(False)
 
         if engine.mode == "virtual":
-            self.hint.setText("Select \u201cNumpadToMIDI\u201d as a MIDI input in your DAW.")
+            self.hint.setText(
+                f"Select \u201c{engine.port_name}\u201d as a MIDI input in your DAW."
+            )
         elif sys.platform == "win32":
             self.hint.setText(
-                "Windows cannot create virtual MIDI ports. Install loopMIDI, create a port, "
-                "press Refresh, then select that port as MIDI input in your DAW."
+                "The virtual MIDI driver is not installed. Re-run the NumpadToMIDI installer "
+                "(it installs the driver), or install loopMIDI, create a port and press Refresh."
             )
         else:
             self.hint.setText("")
