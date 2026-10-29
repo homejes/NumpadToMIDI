@@ -6,10 +6,9 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 
 ## Features
 - Exactly **one Note On per press** and **one Note Off per release** (OS auto-repeat is ignored).
-- The **`000`** key (which hardware sends as a rapid 3-stroke burst of the physical `0` key) is detected as a single key (MIDI Note 37 / `C#1`) **regardless of whether NumLock is ON or OFF** (`VK_NUMPAD0` `0x60` and `VK_INSERT` `0x2D` / scancode `0x52`).
-- **Exclusive Pad Mode (Auto-Choke / LivePadRig) `[Shortcut: .]`**: optional monophonic radio-style pad latch mode where pressing a new pad automatically sends MIDI Note Off for the previously active note before triggering the new Note On (and pressing the same pad again toggles it off). Pressing the physical `.` (`Del`) key on the USB Numpad—or clicking the `[ Mode: Choke (.) ]` pad in the UI—toggles Exclusive Pad Mode on/off in real time without sending a MIDI note.
+- The **`000`** key (which hardware sends as a rapid 3-stroke burst of the physical `0` key) is detected as a single key (MIDI Note 37 / `C#1`, velocity 127) **regardless of whether NumLock is ON or OFF** (`VK_NUMPAD0` `0x60` and `VK_INSERT` `0x2D` / scancode `0x52`).
 - Physical **M-Tech 23-key layout**: `Home` (`VK_BROWSER_HOME` / `0xAC`), `Tab`, `Email` (`0xB4`),
-  `Calc` (`0xB7`), `NumLock`, `/`, `*`, `Backspace`, `0-9`, `[ Mode: Choke (.) ]`, `000`, `+`, `-`, and a
+  `Calc` (`0xB7`), `NumLock`, `/`, `*`, `Backspace`, `0-9`, `.`, `000`, `+`, `-`, and a
   2-row tall `Enter` key.
 - **Target USB Keypad selector (Win32 Raw Input API)**: choose `"All Connected Keypads (Default)"` or lock NumpadToMIDI to a specific external USB keypad (`HID\VID_xxxx&PID_xxxx`) so your primary laptop/desktop keyboard is unaffected.
 - **Exclusive Mode (Block OS Keystrokes)** enabled by default: intercepts and swallows keypad
@@ -21,10 +20,10 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
   double-click the tray icon to restore).
 - Dark PyQt6 UI with custom 3x3 pad-grid icon (`assets/icon.ico`, `assets/icon.icns`, `assets/icon.png`), lighting pad grid (click pads with the mouse too), live MIDI monitor,
   octave shift (−3…+5), MIDI channel 1–16, velocity, panic button.
-- macOS: native **virtual MIDI source** called `NumpadToMIDI`.
+- macOS: native **virtual MIDI source** called `NumpadToMIDI` with native builds for both Intel (`x86_64`) and Apple Silicon (`arm64`).
 - Windows: creates a virtual MIDI port called **`NumpadToMIDI`** directly via the
   [teVirtualMIDI](https://www.tobias-erichsen.de/software/virtualmidi.html) driver
-  (automatically installed by `NumpadToMIDI-Setup-v1.4.5.exe`). If the driver is not
+  (automatically installed by `NumpadToMIDI-Setup-v1.5.0.exe`). If the driver is not
   present, falls back to any existing loopback port (e.g.
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)), then to the first
   available output, or runs silently if none exists.
@@ -36,7 +35,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
  Row 3:          [ 7 (47) ]       [ 8 (48) ]    [ 9 (49) ]               [ - (50) ]
  Row 4:          [ 4 (43) ]       [ 5 (44) ]    [ 6 (45) ]               [ + (46) ]
  Row 5:          [ 1 (39) ]       [ 2 (40) ]    [ 3 (41) ]               [ Enter (42) ]
- Row 6 (Bottom): [ 0 (36) ]       [ 000 (37) ]  [ Mode: Choke (.) ]      [ (Enter)    ]
+ Row 6 (Bottom): [ 0 (36) ]       [ 000 (37) ]  [ . (38) ]               [ (Enter)    ]
 ```
 
 ## Run from source
@@ -56,21 +55,23 @@ Output: `dist/NumpadToMIDI-Windows.exe` (Windows) or `dist/NumpadToMIDI.app` (ma
 To build the platform installers:
 - **Windows (Inno Setup 6.3+):**
   ```powershell
-  ISCC.exe /DAppVersion=1.4.5 installer\windows_installer.iss
+  ISCC.exe /DAppVersion=1.5.0 installer\windows_installer.iss
   ```
-  Produces `dist/NumpadToMIDI-Setup-v1.4.5.exe` (bundles the app, creates Desktop and
+  Produces `dist/NumpadToMIDI-Setup-v1.5.0.exe` (bundles the app, creates Desktop and
   Start Menu shortcuts, elevates to Administrator, and silently downloads + installs
   the `teVirtualMIDI` virtual MIDI driver if missing).
 - **macOS (DMG with `/Applications` link and setup guide):**
   ```bash
-  bash installer/make_dmg.sh 1.4.5
+  bash installer/make_dmg.sh 1.5.0 Intel         # Intel x86_64 Macs
+  bash installer/make_dmg.sh 1.5.0 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
   ```
-  Produces `dist/NumpadToMIDI-macOS-v1.4.5.dmg`.
+  Produces `dist/NumpadToMIDI-macOS-Intel-v1.5.0.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v1.5.0.dmg` (and `dist/NumpadToMIDI-macOS-v1.5.0.dmg`).
 
 ## Releases / CI
 `.github/workflows/build-release.yml` builds both platforms on every `v*` tag (and manual
-`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.4.5.exe` and
-`NumpadToMIDI-macOS-v1.4.5.dmg` to the GitHub Release.
+`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.5.0.exe`,
+`NumpadToMIDI-macOS-Intel-v1.5.0.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v1.5.0.dmg`
+to the GitHub Release.
 
 ## Notes & limitations
 - **Windows:** works with NumLock on or off. Only the *extended* (numpad) Enter is recognised.

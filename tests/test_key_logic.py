@@ -152,9 +152,9 @@ class DebounceTests(unittest.TestCase):
         from unittest.mock import patch
         from key_hook import KeyboardDevice, RI_KEY_BREAK
 
-        # Default burst_window must be 75 ms (0.075 s)
+        # Default burst_window must be 100 ms (0.100 s)
         default_hook, _ = KeyHook(Recorder()), None
-        self.assertAlmostEqual(default_hook.burst_window, 0.075, places=4)
+        self.assertAlmostEqual(default_hook.burst_window, 0.100, places=4)
 
         # 3 consecutive '0' presses spaced 30 ms apart (total span 60 ms > 50 ms,
         # but each consecutive interval is 30 ms < 50 ms) must fire '000' and never '0'
@@ -383,18 +383,15 @@ class StartupSafetyTests(unittest.TestCase):
         engine.note_on = lambda ch, n, vel=100: sent.append(("ON", n, vel))
         engine.note_off = lambda ch, n: sent.append(("OFF", n))
         ctrl = Controller(Config(), engine)
-        orig_excl = ctrl.exclusive_pad_mode
         try:
-            ctrl.set_exclusive_pad_mode(False)
             sent.clear()
             ctrl.handle_key("000", True)
             ctrl.handle_key("000", False)
             self.assertEqual(sent, [("ON", 37, 127), ("OFF", 37)])
         finally:
-            ctrl.set_exclusive_pad_mode(orig_excl)
             ctrl.shutdown()
 
-    def test_exclusive_pad_mode_choke_and_dot_toggle(self):
+    def test_dot_key_maps_to_note_38(self):
         from PyQt6.QtWidgets import QApplication
         from main import Config, Controller, MainWindow, MidiEngine
 
@@ -402,67 +399,18 @@ class StartupSafetyTests(unittest.TestCase):
         cfg = Config()
         engine = MidiEngine()
         midi_log = []
-        orig_on = engine.note_on
-        orig_off = engine.note_off
-        engine.note_on = lambda ch, n, vel=100: (midi_log.append(("ON", ch, n, vel)), orig_on(ch, n, vel))
-        engine.note_off = lambda ch, n: (midi_log.append(("OFF", ch, n, 0)), orig_off(ch, n))
+        engine.note_on = lambda ch, n, vel=100: midi_log.append(("ON", ch, n, vel))
+        engine.note_off = lambda ch, n: midi_log.append(("OFF", ch, n))
         ctrl = Controller(cfg, engine)
         win = MainWindow(ctrl)
-        orig_excl = ctrl.exclusive_pad_mode
         try:
-            ctrl.set_exclusive_pad_mode(False)
-            midi_log.clear()
-
-            # '.' key must never map to a MIDI note and must toggle exclusive_pad_mode
-            self.assertIsNone(ctrl.note_for("."))
+            # '.' key maps to standard MIDI Note 38 (D1)
+            self.assertEqual(ctrl.note_for("."), 38)
+            self.assertEqual(win._pads["."].display, ".")
             ctrl.handle_key(".", True)
             ctrl.handle_key(".", False)
-            self.assertTrue(ctrl.exclusive_pad_mode)
-            self.assertTrue(win.exclusive_pad.isChecked())
-            self.assertTrue(win._pads["."]._mode_active)
-            self.assertEqual(midi_log, [])
-
-            # Press Pad '1' (Note 39): sends Note On, and releasing key does NOT send Note Off
-            ctrl.handle_key("1", True)
-            ctrl.handle_key("1", False)
-            self.assertEqual(ctrl.currently_active_note, 39)
-            self.assertEqual(midi_log, [("ON", 1, 39, 100)])
-
-            # Press Pad '2' (Note 40): immediately chokes Note 39 (Note Off) BEFORE sending Note 40 On
-            ctrl.handle_key("2", True)
-            ctrl.handle_key("2", False)
-            self.assertEqual(ctrl.currently_active_note, 40)
-            self.assertEqual(
-                midi_log,
-                [
-                    ("ON", 1, 39, 100),
-                    ("OFF", 1, 39, 0),
-                    ("ON", 1, 40, 100),
-                ],
-            )
-
-            # Pressing the same Pad '2' again toggles Note 40 off and sets currently_active_note = None
-            ctrl.handle_key("2", True)
-            ctrl.handle_key("2", False)
-            self.assertIsNone(ctrl.currently_active_note)
-            self.assertEqual(
-                midi_log,
-                [
-                    ("ON", 1, 39, 100),
-                    ("OFF", 1, 39, 0),
-                    ("ON", 1, 40, 100),
-                    ("OFF", 1, 40, 0),
-                ],
-            )
-
-            # Pressing '.' again disables exclusive_pad_mode
-            ctrl.handle_key(".", True)
-            ctrl.handle_key(".", False)
-            self.assertFalse(ctrl.exclusive_pad_mode)
-            self.assertFalse(win.exclusive_pad.isChecked())
-            self.assertFalse(win._pads["."]._mode_active)
+            self.assertEqual(midi_log, [("ON", 1, 38, 100), ("OFF", 1, 38)])
         finally:
-            ctrl.set_exclusive_pad_mode(orig_excl)
             ctrl.shutdown()
 
     def test_numlock_off_vk_insert_hardware_cadence_burst(self):

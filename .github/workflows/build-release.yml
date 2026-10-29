@@ -11,12 +11,20 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.os }}${{ matrix.arch && format(' - {0}', matrix.arch) || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact_name: windows-installer
+          - os: macos-13
+            arch: "Intel"
+            artifact_name: macos-intel-dmg
+          - os: macos-14
+            arch: "AppleSilicon"
+            artifact_name: macos-applesilicon-dmg
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -153,14 +161,14 @@ jobs:
 
       - name: Create DMG
         if: runner.os == 'macOS'
-        run: bash installer/make_dmg.sh "$VERSION"
+        run: bash installer/make_dmg.sh "$VERSION" "${{ matrix.arch }}"
 
       - name: Upload macOS DMG
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: macos-dmg
-          path: dist/NumpadToMIDI-macOS-v${{ env.VERSION }}.dmg
+          name: ${{ matrix.artifact_name }}
+          path: dist/NumpadToMIDI-macOS-*.dmg
           if-no-files-found: error
 
   release:
@@ -180,6 +188,8 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           ls -lh release-assets
           test -f "release-assets/NumpadToMIDI-Setup-v${VERSION}.exe"
+          test -f "release-assets/NumpadToMIDI-macOS-Intel-v${VERSION}.dmg"
+          test -f "release-assets/NumpadToMIDI-macOS-AppleSilicon-v${VERSION}.dmg"
           test -f "release-assets/NumpadToMIDI-macOS-v${VERSION}.dmg"
 
       - name: Publish release assets
@@ -187,5 +197,5 @@ jobs:
         with:
           files: |
             release-assets/NumpadToMIDI-Setup-v*.exe
-            release-assets/NumpadToMIDI-macOS-v*.dmg
+            release-assets/NumpadToMIDI-macOS-*.dmg
           generate_release_notes: true

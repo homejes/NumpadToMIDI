@@ -13,7 +13,7 @@
 ;     the installer (see installer\driver_notice.txt).
 
 #ifndef AppVersion
-  #define AppVersion "1.4.5"
+  #define AppVersion "1.5.0"
 #endif
 #define AppName      "NumpadToMIDI"
 #define AppExeName   "NumpadToMIDI.exe"

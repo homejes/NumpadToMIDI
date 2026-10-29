@@ -89,7 +89,6 @@ KEY_SPAN: dict[str, tuple[int, int]] = {
 KEY_DISPLAY: dict[str, str] = {
     "Home": "\u2302 Home",
     "Backspace": "Backspace \u2190",
-    ".": "[ Mode: Choke (.) ]",
 }
 KEY_NAMES: list[str] = [k[0] for k in KEY_LAYOUT]
 KEY_INDEX: dict[str, int] = {name: i for i, name in enumerate(KEY_NAMES)}
@@ -548,7 +547,7 @@ class KeyHook:
         on_key: KeyCallback,
         *,
         detect_triple_zero: bool = True,
-        burst_window_ms: float = 75.0,
+        burst_window_ms: float = 100.0,
         suppress: bool = True,
         target_device: str = ALL_DEVICES_ID,
     ) -> None:
@@ -560,12 +559,11 @@ class KeyHook:
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
-        # 000-burst detection state (rolling buffer of consecutive keypad-0 presses: VK_NUMPAD0 or keypad VK_INSERT)
+        # 000-burst detection state (NumLock-independent triplet detector)
         self._zbuf: list[bool] = []
-        self._zdown_times: list[float] = []
-        self._zlast_down = 0.0
-        self._last_zero_ts = 0.0
-        self._zlast_vk = 0
+        self._zlast_ts: float = 0.0
+        self._last_zero_ts: float = 0.0
+        self._zlast_vk: int = 0
         self._timer: Optional[threading.Timer] = None
         self._triple_timer: Optional[threading.Timer] = None
         self._triple_ups_left = 0
@@ -667,10 +665,10 @@ class KeyHook:
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0) -> None:
         """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
         now = time.perf_counter()
-        # Tight 5 ms dedup window, clearing opposite edge for this key to prevent dedup cross-stroke bleed
+        # 50 ms dedup window, clearing opposite edge for this key to prevent dedup cross-stroke bleed
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup
-            if (now - item[2] < 0.005 and item[0] != name)
+            if (now - item[2] < 0.050 and item[0] != name)
         ]
         self._pending_raw_dedup.append((name, is_down, now))
         self._win_queue.put_nowait((name, is_down, vk))
@@ -683,7 +681,7 @@ class KeyHook:
         self._last_raw_matched = matched
         self._last_raw_time = now
         self._pending_raw_dedup = [
-            item for item in self._pending_raw_dedup if now - item[2] < 0.005
+            item for item in self._pending_raw_dedup if now - item[2] < 0.050
         ]
         if not matched:
             return False
@@ -739,8 +737,8 @@ class KeyHook:
                 self._cancel_timer()
                 self._cancel_triple_timer()
                 self._zbuf.clear()
-                self._zdown_times.clear()
-                self._zlast_down = 0.0
+                self._zlast_ts = 0.0
+                self._zlast_vk = 0
                 self._triple_ups_left = 0
                 for name in list(self._down):
                     self._emit(name, False)
@@ -771,8 +769,8 @@ class KeyHook:
             self._cancel_timer()
             self._cancel_triple_timer()
             self._zbuf.clear()
-            self._zdown_times.clear()
-            self._zlast_down = 0.0
+            self._zlast_ts = 0.0
+            self._zlast_vk = 0
             self._triple_ups_left = 0
             for name in list(self._down):
                 self._emit(name, False)
@@ -1006,7 +1004,7 @@ class KeyHook:
             delta_ms,
         )
 
-        eff_window = max(self.burst_window, 0.075)
+        eff_window = max(self.burst_window, 0.100)
         # Slower firmware debounce/scan cadence observed on NumLock-OFF VK_INSERT bursts
         if vk == VK_INSERT or self._zlast_vk == VK_INSERT:
             eff_window = max(eff_window, 0.140)
@@ -1030,13 +1028,12 @@ class KeyHook:
                     self._emit("000", False)
                 return
 
-        # --- 2. A burst whose consecutive-press window has expired is flushed *now*,
-        # so correctness never depends on how quickly the flush timer thread gets scheduled
-        if self._zbuf and self._zlast_down > 0.0 and (now - self._zlast_down) > eff_window:
+        # --- 2. Sliding window timeout check:
+        # If buffered events have expired without completing a triplet, flush them now
+        if self._zbuf and self._zlast_ts > 0.0 and (now - self._zlast_ts) > eff_window:
             self._cancel_timer()
             pending, self._zbuf = self._zbuf[:], []
-            self._zdown_times.clear()
-            self._zlast_down = 0.0
+            self._zlast_ts = 0.0
             for pending_down in pending:
                 self._emit("0", pending_down)
 
@@ -1048,43 +1045,34 @@ class KeyHook:
             if not down:
                 return  # stray release
 
-        # --- 4. Rolling triplet burst evaluation (consecutive '0' presses within eff_window)
+        # --- 4. Buffer the current event and evaluate triplet burst
         self._zbuf.append(down)
-        if down:
-            if self._zdown_times and (now - self._zdown_times[-1]) > eff_window:
-                self._zdown_times.clear()
-            self._zdown_times.append(now)
-            if len(self._zdown_times) > 3:
-                self._zdown_times = self._zdown_times[-3:]
-            self._zlast_down = now
+        self._zlast_ts = now
 
-            if len(self._zdown_times) >= 3:
-                self._cancel_timer()
-                if "0" in self._down:
-                    self._emit("0", False)
-                downs = sum(1 for x in self._zbuf if x)
-                ups = len(self._zbuf) - downs
-                self._zbuf.clear()
-                self._zdown_times.clear()
-                self._zlast_down = 0.0
-                logger.info(
-                    "Keypad 0 triplet detected [%s] -> firing '000' Note On (MIDI Note 37)",
-                    source,
-                )
-                self._emit("000", True)
-                self._triple_started = now
-                self._triple_ups_left = max(0, 3 - ups)
-                if self._triple_ups_left == 0:
-                    self._emit("000", False)
-                else:
-                    self._start_triple_timer()
-                return
-
-            # 1st or 2nd '0' press: (re)schedule the window timer from this press
+        downs = sum(1 for x in self._zbuf if x)
+        if downs >= 3:
             self._cancel_timer()
-            self._timer = threading.Timer(eff_window, self._flush_zero)
-            self._timer.daemon = True
-            self._timer.start()
+            ups = len(self._zbuf) - downs
+            self._zbuf.clear()
+            self._zlast_ts = 0.0
+            logger.info(
+                "Keypad 0 triplet detected [%s] -> firing '000' Note On (MIDI Note 37)",
+                source,
+            )
+            self._emit("000", True)
+            self._triple_started = now
+            self._triple_ups_left = max(0, 3 - ups)
+            if self._triple_ups_left == 0:
+                self._emit("000", False)
+            else:
+                self._start_triple_timer()
+            return
+
+        # Less than 3 downs so far: (re)schedule the flush timer
+        self._cancel_timer()
+        self._timer = threading.Timer(eff_window, self._flush_zero)
+        self._timer.daemon = True
+        self._timer.start()
 
     def _flush_zero(self) -> None:
         with self._lock:
@@ -1092,8 +1080,7 @@ class KeyHook:
                 return  # cancelled while we were waiting for the lock
             self._timer = None
             pending, self._zbuf = self._zbuf[:], []
-            self._zdown_times.clear()
-            self._zlast_down = 0.0
+            self._zlast_ts = 0.0
             for down in pending:
                 self._emit("0", down)
 

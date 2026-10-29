@@ -161,9 +161,8 @@ class Config:
         "target_device": "",
         "suppress_keys": True,
         "exclusive_mode": True,
-        "exclusive_pad_mode": False,
         "triple_zero_detection": True,
-        "burst_window_ms": 75,
+        "burst_window_ms": 100,
     }
 
     def __init__(self, path: Optional[Path] = None) -> None:
@@ -198,7 +197,6 @@ class Config:
         d["target_device"] = str(d.get("target_device", "") or "")
         d["exclusive_mode"] = bool(d["exclusive_mode"])
         d["suppress_keys"] = bool(d["suppress_keys"])
-        d["exclusive_pad_mode"] = bool(d.get("exclusive_pad_mode", False))
 
     def __getitem__(self, key: str):
         return self.data[key]
@@ -220,7 +218,6 @@ class Config:
 class Controller(QObject):
     key_state = pyqtSignal(str, bool)   # key name, is_down
     mute_changed = pyqtSignal(bool)     # is_muted
-    exclusive_pad_mode_changed = pyqtSignal(bool)  # is_exclusive_pad_mode
     log = pyqtSignal(str)
 
     def __init__(self, config: Config, engine: MidiEngine) -> None:
@@ -230,10 +227,6 @@ class Controller(QObject):
         self.muted = False
         self._lock = threading.Lock()
         self._active: dict[str, tuple[int, int]] = {}  # key -> (note, channel)
-        self._physically_down: set[str] = set()
-        self._dot_held = False
-        self._active_choke_key: Optional[str] = None
-        self.engine.set_exclusive_pad_mode(bool(config["exclusive_pad_mode"]))
         self.hook = KeyHook(
             self._on_hook_key,
             detect_triple_zero=bool(config["triple_zero_detection"]),
@@ -241,14 +234,6 @@ class Controller(QObject):
             suppress=bool(config["suppress_keys"]),
             target_device=str(config["target_device"]),
         )
-
-    @property
-    def exclusive_pad_mode(self) -> bool:
-        return bool(self.config["exclusive_pad_mode"])
-
-    @property
-    def currently_active_note(self) -> Optional[int]:
-        return self.engine.currently_active_note
 
     # ---- mapping -------------------------------------------------------------
     TRIPLE_ZERO_VELOCITY = 127
@@ -260,8 +245,6 @@ class Controller(QObject):
         return int(self.config["velocity"])
 
     def note_for(self, name: str) -> Optional[int]:
-        if name == ".":
-            return None
         note = self.config["base_note"] + self.config["octave"] * 12 + KEY_INDEX[name]
         return note if 0 <= note <= 127 else None
 
@@ -271,69 +254,6 @@ class Controller(QObject):
 
     def handle_key(self, name: str, down: bool, source: str = "key") -> None:
         """Called from the hook thread or the GUI (mouse). Thread-safe."""
-        if name == ".":
-            with self._lock:
-                if down:
-                    if self._dot_held:
-                        return
-                    self._dot_held = True
-                else:
-                    self._dot_held = False
-                    return
-            self.toggle_exclusive_pad_mode(source=source)
-            return
-
-        if self.exclusive_pad_mode:
-            if not down:
-                with self._lock:
-                    self._physically_down.discard(name)
-                return
-            with self._lock:
-                if name in self._physically_down:
-                    return
-                self._physically_down.add(name)
-                note = self.note_for(name)
-                if note is None:
-                    self.log.emit(f"{self._ts()}  {name}: note out of range (change octave)")
-                    return
-                channel, velocity = self.config["channel"], self._velocity_for(name)
-                prev_key = self._active_choke_key
-                choked, started = self.engine.trigger_exclusive_note(
-                    channel, note, velocity, muted=self.muted
-                )
-                if not started:
-                    choked_note, choked_ch = choked if choked is not None else (note, channel)
-                    if prev_key:
-                        self._active.pop(prev_key, None)
-                    self._active_choke_key = None
-                else:
-                    if choked is not None and prev_key:
-                        self._active.pop(prev_key, None)
-                    self._active_choke_key = name
-                    self._active[name] = (note, channel)
-            if not started:
-                self.key_state.emit(prev_key or name, False)
-                self.log.emit(
-                    f"{self._ts()}  ch{choked_ch:>2}  CHOKE OFF {choked_note:>3} {note_name(choked_note):<4} "
-                    f"vel   0   <- {name} ({source})"
-                )
-                return
-            if choked is not None:
-                choked_note, choked_ch = choked
-                if prev_key and prev_key != name:
-                    self.key_state.emit(prev_key, False)
-                self.log.emit(
-                    f"{self._ts()}  ch{choked_ch:>2}  CHOKE OFF {choked_note:>3} {note_name(choked_note):<4} "
-                    f"vel   0   <- choked by {name}"
-                )
-            label = "MUTE ON " if self.muted else "NOTE ON "
-            self.key_state.emit(name, True)
-            self.log.emit(
-                f"{self._ts()}  ch{channel:>2}  {label}  {note:>3} {note_name(note):<4} "
-                f"vel {velocity:>3}   <- {name} ({source})"
-            )
-            return
-
         with self._lock:
             if down:
                 if name in self._active:
@@ -368,11 +288,7 @@ class Controller(QObject):
         if name is None:
             return False
         with self._lock:
-            already_active = (
-                (name in self._physically_down)
-                if self.exclusive_pad_mode
-                else (name in self._active)
-            )
+            already_active = name in self._active
         if not already_active:
             self.handle_key(name, True, "appcmd")
             QTimer.singleShot(90, lambda n=name: self.handle_key(n, False, "appcmd"))
@@ -385,13 +301,9 @@ class Controller(QObject):
 
     # ---- settings ------------------------------------------------------------
     def set_channel(self, channel: int) -> None:
-        if self.exclusive_pad_mode and self.currently_active_note is not None:
-            self.panic()
         self.config["channel"] = max(1, min(16, channel))
 
     def set_octave(self, octave: int) -> None:
-        if self.exclusive_pad_mode and self.currently_active_note is not None:
-            self.panic()
         self.config["octave"] = max(OCTAVE_MIN, min(OCTAVE_MAX, octave))
 
     def set_velocity(self, velocity: int) -> None:
@@ -402,23 +314,6 @@ class Controller(QObject):
         self.config["suppress_keys"] = enabled
         self.config["exclusive_mode"] = enabled
         self.hook.set_suppress(enabled)
-
-    def set_exclusive_pad_mode(self, value: bool, source: str = "ui") -> None:
-        enabled = bool(value)
-        if bool(self.config["exclusive_pad_mode"]) == enabled and self.engine.exclusive_pad_mode == enabled:
-            return
-        self.panic()
-        self.config["exclusive_pad_mode"] = enabled
-        self.engine.set_exclusive_pad_mode(enabled)
-        self.config.save()
-        self.exclusive_pad_mode_changed.emit(enabled)
-        state_str = "ON (Monophonic Auto-Choke)" if enabled else "OFF (Polyphonic Hold)"
-        self.log.emit(f"{self._ts()}  Exclusive Pad Mode: {state_str} [{source}]")
-
-    def toggle_exclusive_pad_mode(self, source: str = ".") -> bool:
-        new_state = not self.exclusive_pad_mode
-        self.set_exclusive_pad_mode(new_state, source=source)
-        return new_state
 
     def set_target_device(self, device_id: str) -> None:
         target = (device_id or "").strip()
@@ -443,8 +338,6 @@ class Controller(QObject):
         with self._lock:
             held = list(self._active.items())
             self._active.clear()
-            self._physically_down.clear()
-            self._active_choke_key = None
         for name, (note, channel) in held:
             self.engine.note_off(channel, note)
             self.key_state.emit(name, False)
@@ -575,7 +468,6 @@ class PadWidget(QWidget):
         self.display = display or KEY_DISPLAY.get(name, name)
         self._note_text = ""
         self._glow = 0.0
-        self._mode_active = False
         self._color = QColor.fromHsv(int(index * 360 / len(KEY_NAMES)) % 360, 170, 255)
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(380)
@@ -591,12 +483,6 @@ class PadWidget(QWidget):
     def set_note_text(self, text: str) -> None:
         self._note_text = text
         self.update()
-
-    def set_mode_active(self, active: bool) -> None:
-        active = bool(active)
-        if self._mode_active != active:
-            self._mode_active = active
-            self.update()
 
     def light(self, on: bool) -> None:
         self._anim.stop()
@@ -626,32 +512,18 @@ class PadWidget(QWidget):
         rect = self.rect().adjusted(4, 4, -4, -4)
         base, edge = QColor("#1b2030"), QColor("#2a3145")
         g = self._glow
-        if self._mode_active:
-            cyan, purple = QColor("#00e5ff"), QColor("#8b5cf6")
-            for i, alpha in ((6, 36), (4, 58), (2, 88)):
-                halo = QColor(cyan)
-                halo.setAlpha(alpha)
+        if g > 0.01:  # soft halo
+            for i, alpha in ((6, 28), (4, 46), (2, 70)):
+                halo = QColor(self._color)
+                halo.setAlpha(int(alpha * g))
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(halo)
                 p.drawRoundedRect(rect.adjusted(-i // 2, -i // 2, i // 2, i // 2), 14, 14)
-            p.setBrush(mix(mix(base, purple, 0.42), cyan, g * 0.6))
-            p.setPen(QPen(cyan, 2.2))
-            p.drawRoundedRect(rect, 12, 12)
-            text_color = QColor("#ffffff")
-            sub_color = QColor("#00e5ff")
-        else:
-            if g > 0.01:  # soft halo
-                for i, alpha in ((6, 28), (4, 46), (2, 70)):
-                    halo = QColor(self._color)
-                    halo.setAlpha(int(alpha * g))
-                    p.setPen(Qt.PenStyle.NoPen)
-                    p.setBrush(halo)
-                    p.drawRoundedRect(rect.adjusted(-i // 2, -i // 2, i // 2, i // 2), 14, 14)
-            p.setBrush(mix(base, self._color, g * 0.92))
-            p.setPen(QPen(mix(edge, self._color, g), 1.5))
-            p.drawRoundedRect(rect, 12, 12)
-            text_color = mix(QColor("#d6dcec"), QColor("#0b0d14"), g)
-            sub_color = mix(QColor("#6b7592"), QColor("#1a1d29"), g)
+        p.setBrush(mix(base, self._color, g * 0.92))
+        p.setPen(QPen(mix(edge, self._color, g), 1.5))
+        p.drawRoundedRect(rect, 12, 12)
+        text_color = mix(QColor("#d6dcec"), QColor("#0b0d14"), g)
+        sub_color = mix(QColor("#6b7592"), QColor("#1a1d29"), g)
 
         p.setPen(text_color)
         big = QFont(self.font())
@@ -674,7 +546,6 @@ class PadWidget(QWidget):
         )
         small = QFont(self.font())
         small.setPixelSize(max(9, cell_dim // 8))
-        small.setBold(self._mode_active)
         p.setFont(small)
         p.setPen(sub_color)
         p.drawText(rect.adjusted(0, 0, 0, -6), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
@@ -710,7 +581,6 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         ctrl.key_state.connect(self._on_key_state)
         ctrl.mute_changed.connect(self._on_mute_changed)
-        ctrl.exclusive_pad_mode_changed.connect(self._on_exclusive_pad_mode_changed)
         ctrl.log.connect(self._append_log)
         self._refresh_notes()
         self._refresh_status()
@@ -855,14 +725,6 @@ class MainWindow(QMainWindow):
         self.suppress.toggled.connect(self.ctrl.set_suppress)
         ctl.addWidget(self.suppress)
 
-        self.exclusive_pad = QCheckBox(
-            "Exclusive Pad Mode (Auto-Choke / LivePadRig) [Shortcut: .]"
-        )
-        self.exclusive_pad.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.exclusive_pad.setChecked(bool(cfg["exclusive_pad_mode"]))
-        self.exclusive_pad.toggled.connect(self.ctrl.set_exclusive_pad_mode)
-        ctl.addWidget(self.exclusive_pad)
-
         self.hint = QLabel()
         self.hint.setWordWrap(True)
         self.hint.setObjectName("subtitle")
@@ -927,12 +789,6 @@ class MainWindow(QMainWindow):
         self.action_mute.blockSignals(True)
         self.action_mute.setChecked(muted)
         self.action_mute.blockSignals(False)
-
-    def _on_exclusive_pad_mode_changed(self, active: bool) -> None:
-        self.exclusive_pad.blockSignals(True)
-        self.exclusive_pad.setChecked(active)
-        self.exclusive_pad.blockSignals(False)
-        self._refresh_notes()
 
     def restore_from_tray(self) -> None:
         self.showNormal()
@@ -1024,12 +880,7 @@ class MainWindow(QMainWindow):
         cfg = self.ctrl.config
         base = cfg["base_note"] + cfg["octave"] * 12
         self.octave_label.setText(f"{cfg['octave']:+d}  ({note_name(max(0, min(127, base)))})")
-        choke_active = bool(cfg["exclusive_pad_mode"])
         for name, pad in self._pads.items():
-            if name == ".":
-                pad.set_mode_active(choke_active)
-                pad.set_note_text("ACTIVE \u00b7 ON" if choke_active else "OFF \u00b7 Press .")
-                continue
             note = self.ctrl.note_for(name)
             pad.set_note_text("--" if note is None else f"{note_name(note)} \u00b7 {note}")
 
@@ -1134,8 +985,6 @@ def selftest() -> int:
         ctrl.log.connect(lines.append)
         win.show()
         app.processEvents()
-        orig_excl = ctrl.exclusive_pad_mode
-        ctrl.set_exclusive_pad_mode(False)
         ctrl.handle_key("7", True)
         ctrl.handle_key("7", False)
         assert ctrl.handle_appcommand(APPCOMMAND_BROWSER_HOME_ALT) is True
@@ -1160,37 +1009,15 @@ def selftest() -> int:
         assert win.channel.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert win.velocity.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert win.suppress.focusPolicy() == Qt.FocusPolicy.NoFocus
-        assert win.exclusive_pad.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert win.monitor.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert ctrl.note_for("0") == 36
         assert ctrl.note_for("000") == 37
-        assert ctrl.note_for(".") is None
+        assert ctrl.note_for(".") == 38
         assert ctrl.note_for("Home") == 55
         assert ctrl.note_for("Calc") == 58
-        assert win._pads["."].display == "[ Mode: Choke (.) ]"
-        # Test '.' hardware/UI toggle & Monophonic Choke Pad Mode
+        assert win._pads["."].display == "."
         ctrl.handle_key(".", True)
         ctrl.handle_key(".", False)
-        assert ctrl.exclusive_pad_mode is True
-        assert win.exclusive_pad.isChecked() is True
-        assert win._pads["."]._mode_active is True
-        ctrl.handle_key("1", True)
-        ctrl.handle_key("1", False)
-        assert ctrl.currently_active_note == ctrl.note_for("1")
-        ctrl.handle_key("2", True)
-        ctrl.handle_key("2", False)
-        assert ctrl.currently_active_note == ctrl.note_for("2")
-        # Pressing the same pad again toggles it off
-        ctrl.handle_key("2", True)
-        ctrl.handle_key("2", False)
-        assert ctrl.currently_active_note is None
-        # Toggle off via '.'
-        ctrl.handle_key(".", True)
-        ctrl.handle_key(".", False)
-        assert ctrl.exclusive_pad_mode is False
-        assert win.exclusive_pad.isChecked() is False
-        assert win._pads["."]._mode_active is False
-        ctrl.set_exclusive_pad_mode(orig_excl)
         assert ctrl.config["burst_window_ms"] >= 50
         assert win.suppress.isChecked() is True
         assert str(ctrl.config.path).endswith("config.json")

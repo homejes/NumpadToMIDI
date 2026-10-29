@@ -358,9 +358,6 @@ class MidiEngine:
         self.mode = "none"  # "virtual" | "loopback" | "fallback" | "none"
         self.port_name = ""
         self.error = _RTMIDI_ERROR or ""
-        self.exclusive_pad_mode: bool = False
-        self.currently_active_note: Optional[int] = None
-        self.currently_active_channel: int = 1
         if rtmidi is not None:
             try:
                 self._out = rtmidi.MidiOut(name=self.CLIENT_NAME)
@@ -532,53 +529,7 @@ class MidiEngine:
     def note_off(self, channel: int, note: int) -> None:
         self._send([0x80 | ((channel - 1) & 0x0F), note & 0x7F, 0])
 
-    def set_exclusive_pad_mode(self, enabled: bool) -> Optional[tuple[int, int]]:
-        """Enable or disable monophonic choke mode; returns (note, channel) if an active note was choked."""
-        self.exclusive_pad_mode = bool(enabled)
-        if not self.exclusive_pad_mode and self.currently_active_note is not None:
-            prev_note = self.currently_active_note
-            prev_ch = self.currently_active_channel
-            self.currently_active_note = None
-            self.note_off(prev_ch, prev_note)
-            return prev_note, prev_ch
-        return None
-
-    def trigger_exclusive_note(
-        self, channel: int, note: int, velocity: int = 100, muted: bool = False
-    ) -> tuple[Optional[tuple[int, int]], bool]:
-        """Monophonic radio-style choke logic for Exclusive Pad Mode.
-
-        Returns ``(choked_note_and_channel, new_note_started)``:
-        * If ``currently_active_note`` is playing and equals ``note``: sends Note Off
-          (toggles off), sets ``currently_active_note = None``, returns ``((note, prev_ch), False)``.
-        * If ``currently_active_note`` is playing and differs from ``note``: immediately sends
-          Note Off for ``currently_active_note``, then sends Note On for ``note``, sets
-          ``currently_active_note = note``, returns ``((prev_note, prev_ch), True)``.
-        * If ``currently_active_note`` is ``None``: sends Note On for ``note``, sets
-          ``currently_active_note = note``, returns ``(None, True)``.
-        """
-        prev = self.currently_active_note
-        prev_ch = self.currently_active_channel
-        if prev is not None and prev == note:
-            self.currently_active_note = None
-            if not muted:
-                self.note_off(prev_ch, prev)
-            return (prev, prev_ch), False
-
-        choked: Optional[tuple[int, int]] = None
-        if prev is not None and prev != note:
-            choked = (prev, prev_ch)
-            if not muted:
-                self.note_off(prev_ch, prev)
-
-        self.currently_active_note = note
-        self.currently_active_channel = channel
-        if not muted:
-            self.note_on(channel, note, velocity)
-        return choked, True
-
     def all_notes_off(self, channel: Optional[int] = None) -> None:
-        self.currently_active_note = None
         channels = range(1, 17) if channel is None else [channel]
         for ch in channels:
             self._send([0xB0 | ((ch - 1) & 0x0F), 123, 0])  # CC123 All Notes Off
