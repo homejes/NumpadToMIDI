@@ -13,9 +13,12 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
 import threading
 from typing import Optional
+
+logger = logging.getLogger("NumpadToMIDI.midi")
 
 try:
     import rtmidi
@@ -57,7 +60,7 @@ class TeVirtualMidiPort:
             if IS_WIN:
                 name = "teVirtualMIDI64.dll" if sys.maxsize > 2**32 else "teVirtualMIDI.dll"
                 try:
-                    dll = ctypes.WinDLL(name)
+                    dll = ctypes.windll.LoadLibrary(name)
                     dll.virtualMIDICreatePortEx2.restype = ctypes.c_void_p
                     dll.virtualMIDICreatePortEx2.argtypes = [
                         ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_size_t,
@@ -70,7 +73,9 @@ class TeVirtualMidiPort:
                     dll.virtualMIDIClosePort.restype = None
                     dll.virtualMIDIClosePort.argtypes = [ctypes.c_void_p]
                     cls._dll = dll
-                except (OSError, AttributeError):
+                    logger.info("Loaded virtual MIDI driver library: %s", name)
+                except Exception as exc:
+                    logger.warning("Could not load %s (falling back to standard MIDI ports): %s", name, exc)
                     cls._dll = None
         return cls._dll
 
@@ -86,7 +91,13 @@ class TeVirtualMidiPort:
         dll = self._load()
         if dll is None:
             return False
-        handle = dll.virtualMIDICreatePortEx2(name, None, 0, 65535, self.FLAGS_INSTANTIATE_TX_ONLY)
+        try:
+            handle = dll.virtualMIDICreatePortEx2(
+                name, None, 0, 65535, self.FLAGS_INSTANTIATE_TX_ONLY
+            )
+        except Exception as exc:
+            logger.warning("virtualMIDICreatePortEx2(%s) failed: %s", name, exc)
+            return False
         if not handle:
             return False
         self._handle, self.name = handle, name
@@ -95,13 +106,24 @@ class TeVirtualMidiPort:
     def send(self, message: list[int]) -> bool:
         if not self._handle:
             return False
-        buf = (ctypes.c_ubyte * len(message))(*message)
-        return bool(self._load().virtualMIDISendData(self._handle, buf, len(message)))
+        dll = self._load()
+        if dll is None:
+            return False
+        try:
+            buf = (ctypes.c_ubyte * len(message))(*message)
+            return bool(dll.virtualMIDISendData(self._handle, buf, len(message)))
+        except Exception as exc:
+            logger.warning("virtualMIDISendData failed: %s", exc)
+            return False
 
     def close(self) -> None:
         if self._handle:
             try:
-                self._load().virtualMIDIClosePort(self._handle)
+                dll = self._load()
+                if dll is not None:
+                    dll.virtualMIDIClosePort(self._handle)
+            except Exception as exc:
+                logger.warning("virtualMIDIClosePort failed: %s", exc)
             finally:
                 self._handle, self.name = None, ""
 

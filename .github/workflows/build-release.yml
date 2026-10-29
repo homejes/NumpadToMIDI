@@ -54,9 +54,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:SELFTEST_LOG = "$PWD\selftest.log"
           $p = Start-Process -FilePath "dist/NumpadToMIDI-Windows.exe" -ArgumentList "--selftest" -Wait -PassThru
           if (Test-Path selftest.log) { Get-Content selftest.log }
+          if (Test-Path "$env:TEMP\NumpadToMIDI.log") { Get-Content "$env:TEMP\NumpadToMIDI.log" }
           if ($p.ExitCode -ne 0) { throw "Selftest failed with exit code $($p.ExitCode)" }
 
       - name: Install Inno Setup
@@ -113,8 +114,8 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item selftest.log -ErrorAction SilentlyContinue
-          $env:QT_QPA_PLATFORM = "offscreen"
-          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe" -ArgumentList "--selftest" -Wait -PassThru
+          $env:SELFTEST_LOG = "$PWD\selftest.log"
+          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe" -WorkingDirectory "$env:ProgramFiles\NumpadToMIDI" -ArgumentList "--selftest" -Wait -PassThru
           Get-Content selftest.log
           if ($p.ExitCode -ne 0) { throw "Installed app selftest failed ($($p.ExitCode))" }
           if (-not (Select-String -Path selftest.log -Pattern "Virtual MIDI source")) {

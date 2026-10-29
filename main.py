@@ -3,13 +3,76 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from pathlib import Path
 from typing import Optional
+
+APP_NAME = "NumpadToMIDI"
+LOG_FILE_TEMP = os.path.join(tempfile.gettempdir(), "NumpadToMIDI.log")
+LOG_FILE_APPDATA = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME, "debug.log"
+)
+
+
+def _setup_crash_logging() -> logging.Logger:
+    """Configure file logging and fatal exception hooks before any GUI imports."""
+    log = logging.getLogger(APP_NAME)
+    if log.handlers:
+        return log
+    log.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    for log_path in (LOG_FILE_TEMP, LOG_FILE_APPDATA):
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            fh = logging.FileHandler(log_path, encoding="utf-8")
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+        except Exception:
+            pass
+    if not log.handlers:
+        log.addHandler(logging.NullHandler())
+    return log
+
+
+logger = _setup_crash_logging()
+
+
+def _show_fatal_dialog(title: str, details: str) -> None:
+    """Display a native Windows MessageBoxW error dialog so crashes are never silent."""
+    if "--selftest" in sys.argv:
+        return
+    if sys.platform == "win32":
+        try:
+            msg = (
+                f"{details}\n\n"
+                f"Diagnostic log saved to:\n{LOG_FILE_TEMP}\n{LOG_FILE_APPDATA}"
+            )
+            ctypes.windll.user32.MessageBoxW(0, msg[:3500], title, 0x00000010)
+        except Exception:
+            pass
+
+
+def _excepthook(exc_type, exc_value, exc_tb) -> None:
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    logger.critical("Unhandled fatal exception:\n%s", tb_text)
+    _show_fatal_dialog(f"{APP_NAME} Fatal Error", tb_text)
+
+
+def _threading_excepthook(args) -> None:
+    tb_text = "".join(
+        traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+    )
+    logger.critical("Unhandled thread exception (%s):\n%s", getattr(args, "thread", None), tb_text)
+
+
+sys.excepthook = _excepthook
+threading.excepthook = _threading_excepthook
 
 from PyQt6.QtCore import (
     QAbstractNativeEventFilter, QObject, QSize, QTimer, Qt, QVariantAnimation, pyqtSignal,
@@ -30,7 +93,6 @@ from version import VERSION
 if sys.platform == "win32":
     from ctypes import wintypes
 
-APP_NAME = "NumpadToMIDI"
 OCTAVE_MIN, OCTAVE_MAX = -3, 5
 
 # Win32 WM_APPCOMMAND constants (0x0319)
@@ -68,10 +130,22 @@ def resource_path(name: str) -> Path:
 
 def user_config_dir() -> Path:
     if sys.platform == "win32":
-        return Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
+        return Path(os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME))
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path.home() / ".config" / APP_NAME
+
+
+def user_config_path() -> Path:
+    if sys.platform == "win32":
+        return Path(
+            os.path.join(
+                os.environ.get("APPDATA", os.path.expanduser("~")),
+                APP_NAME,
+                "config.json",
+            )
+        )
+    return user_config_dir() / "config.json"
 
 
 class Config:
@@ -88,7 +162,7 @@ class Config:
     }
 
     def __init__(self, path: Optional[Path] = None) -> None:
-        self.path = path or (user_config_dir() / "config.json")
+        self.path = Path(path) if path is not None else user_config_path()
         self.data: dict = dict(self.DEFAULTS)
         user_has_exclusive = False
         for source in (resource_path("config.json"), self.path):
@@ -264,11 +338,12 @@ class WinAppCommandFilter(QAbstractNativeEventFilter):
     def nativeEventFilter(self, eventType, message):
         if sys.platform == "win32" and message:
             try:
-                msg = wintypes.MSG.from_address(int(message))
-                if msg.message == WM_APPCOMMAND:
-                    cmd = get_appcommand_lparam(msg.lParam)
-                    if self.ctrl.handle_appcommand(cmd):
-                        return True, 1
+                if b"windows" in bytes(eventType):
+                    msg = wintypes.MSG.from_address(int(message))
+                    if msg.message == WM_APPCOMMAND:
+                        cmd = get_appcommand_lparam(msg.lParam)
+                        if self.ctrl.handle_appcommand(cmd):
+                            return True, 1
             except Exception:
                 pass
         return False, 0
@@ -594,19 +669,7 @@ class MainWindow(QMainWindow):
         mon.addWidget(self.monitor, 1)
         right.addWidget(mon_card, 1)
 
-    # ---- system tray & native events -----------------------------------------
-    def nativeEvent(self, eventType, message):
-        if sys.platform == "win32" and message:
-            try:
-                msg = wintypes.MSG.from_address(int(message))
-                if msg.message == WM_APPCOMMAND:
-                    cmd = get_appcommand_lparam(msg.lParam)
-                    if self.ctrl.handle_appcommand(cmd):
-                        return True, 1
-            except Exception:
-                pass
-        return super().nativeEvent(eventType, message)
-
+    # ---- system tray ---------------------------------------------------------
     def _setup_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip(f"{APP_NAME} {VERSION}")
@@ -751,13 +814,16 @@ class MainWindow(QMainWindow):
 # Entry points
 # =============================================================================
 def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWindow]:
+    logger.info("Starting %s %s (platform=%s)", APP_NAME, VERSION, sys.platform)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     if QSystemTrayIcon.isSystemTrayAvailable():
         app.setQuitOnLastWindowClosed(False)
     config = Config()
+    logger.info("Loaded configuration from %s", config.path)
     engine = MidiEngine()
     engine.open_auto(config["port_name"])
+    logger.info("MIDI engine initialized: %s", engine.description)
     ctrl = Controller(config, engine)
     win = MainWindow(ctrl)
     # Keep a reference to the native event filter on the window so it isn't GC'd
@@ -776,48 +842,78 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
 
 
 def selftest() -> int:
-    """Headless smoke test used by CI against the frozen binary."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    """Smoke test used locally and by CI against the frozen binary."""
+    if sys.platform != "win32":
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     lines: list[str] = []
     code = 0
     try:
-        app, ctrl, win = build_app(start_hook=False)
+        app, ctrl, win = build_app(start_hook=(sys.platform == "win32"))
         ctrl.log.connect(lines.append)
         win.show()
+        app.processEvents()
         ctrl.handle_key("7", True)
         ctrl.handle_key("7", False)
         assert ctrl.handle_appcommand(APPCOMMAND_BROWSER_HOME_ALT) is True
         assert ctrl.handle_appcommand(APPCOMMAND_LAUNCH_MAIL) is True
         assert ctrl.handle_appcommand(APPCOMMAND_LAUNCH_APP2) is True
+        if sys.platform == "win32" and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            hwnd = int(win.winId())
+            res = ctypes.windll.user32.SendMessageW(
+                hwnd, WM_APPCOMMAND, hwnd, APPCOMMAND_BROWSER_HOME_ALT << 16
+            )
+            assert res == 1, f"Expected WM_APPCOMMAND LRESULT 1, got {res}"
         app.processEvents()
         assert len(win._pads) == len(KEY_NAMES) == 23
         assert ctrl.note_for("0") == 36
         assert ctrl.note_for("Home") == 55
         assert ctrl.note_for("Calc") == 58
         assert win.suppress.isChecked() is True
+        assert str(ctrl.config.path).endswith("config.json")
+        if sys.platform == "win32":
+            assert APP_NAME in str(ctrl.config.path)
         assert [a.text() for a in win.tray_menu.actions() if not a.isSeparator()] == [
             "Open NumpadToMIDI",
             "Mute MIDI",
             "Quit NumpadToMIDI",
         ]
+        win.hide()
         lines.append(f"SELFTEST OK ({ctrl.engine.description})")
         ctrl.shutdown()
     except Exception:
         code = 1
-        lines.append("SELFTEST FAILED\n" + traceback.format_exc())
-    try:
-        Path("selftest.log").write_text("\n".join(lines), encoding="utf-8")
-    except OSError:
-        pass
+        err = "SELFTEST FAILED\n" + traceback.format_exc()
+        lines.append(err)
+        logger.error(err)
+    payload = "\n".join(lines)
+    targets = [
+        Path("selftest.log"),
+        Path(os.path.join(tempfile.gettempdir(), "NumpadToMIDI-selftest.log")),
+    ]
+    env_target = os.environ.get("SELFTEST_LOG")
+    if env_target:
+        targets.insert(0, Path(env_target))
+    for target in targets:
+        try:
+            target.write_text(payload, encoding="utf-8")
+        except OSError:
+            pass
     return code
 
 
 def main() -> int:
-    if "--selftest" in sys.argv:
-        return selftest()
-    app, ctrl, win = build_app()
-    win.show()
-    return app.exec()
+    try:
+        if "--selftest" in sys.argv:
+            return selftest()
+        app, ctrl, win = build_app()
+        win.show()
+        logger.info("Main window shown; entering Qt event loop")
+        return app.exec()
+    except Exception as exc:
+        tb_text = traceback.format_exc()
+        logger.critical("Fatal error in main(): %s\n%s", exc, tb_text)
+        _show_fatal_dialog(f"{APP_NAME} Startup Error", tb_text)
+        return 1
 
 
 if __name__ == "__main__":

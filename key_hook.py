@@ -23,11 +23,14 @@ without a keyboard (see ``tests/test_key_logic.py``).
 from __future__ import annotations
 
 import ctypes
+import logging
 import queue
 import sys
 import threading
 import time
 from typing import Callable, Optional
+
+logger = logging.getLogger("NumpadToMIDI.hook")
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -241,28 +244,31 @@ class KeyHook:
         if self._running:
             return
         self._running = True
-        if IS_WIN:
-            self._win_ready.clear()
-            self._win_worker = threading.Thread(
-                target=self._win_dispatch_loop, name="NumpadDispatchWorker", daemon=True
-            )
-            self._win_worker.start()
-            self._win_thread = threading.Thread(
-                target=self._win_message_pump, name="NumpadKeyboardHookPump", daemon=True
-            )
-            self._win_thread.start()
-            self._win_ready.wait(timeout=2.0)
-            return
+        try:
+            if IS_WIN:
+                self._win_ready.clear()
+                self._win_worker = threading.Thread(
+                    target=self._win_dispatch_loop, name="NumpadDispatchWorker", daemon=True
+                )
+                self._win_worker.start()
+                self._win_thread = threading.Thread(
+                    target=self._win_message_pump, name="NumpadKeyboardHookPump", daemon=True
+                )
+                self._win_thread.start()
+                self._win_ready.wait(timeout=2.0)
+                return
 
-        kwargs: dict = {"on_press": lambda key: None, "on_release": lambda key: None}
-        if IS_MAC:
-            kwargs["darwin_intercept"] = self._mac_intercept
-        else:  # pragma: no cover - Linux is not a supported target
-            kwargs["on_press"] = self._generic_press
-            kwargs["on_release"] = self._generic_release
-        self._listener = keyboard.Listener(**kwargs)
-        self._listener.daemon = True
-        self._listener.start()
+            kwargs: dict = {"on_press": lambda key: None, "on_release": lambda key: None}
+            if IS_MAC:
+                kwargs["darwin_intercept"] = self._mac_intercept
+            else:  # pragma: no cover - Linux is not a supported target
+                kwargs["on_press"] = self._generic_press
+                kwargs["on_release"] = self._generic_release
+            self._listener = keyboard.Listener(**kwargs)
+            self._listener.daemon = True
+            self._listener.start()
+        except Exception as exc:
+            logger.error("Failed to start keyboard hook: %s", exc, exc_info=True)
 
     def stop(self) -> None:
         if not self._running and self._listener is None:
@@ -274,21 +280,27 @@ class KeyHook:
                     self._emit(name, False)
             return
         self._running = False
-        if IS_WIN:
-            tid = self._win_thread_id
-            if tid:
-                _user32.PostThreadMessageW(tid, _WM_QUIT, 0, 0)
-            self._win_queue.put(None)
-            if self._win_thread is not None:
-                self._win_thread.join(timeout=1.5)
-                self._win_thread = None
-            if self._win_worker is not None:
-                self._win_worker.join(timeout=1.5)
-                self._win_worker = None
-        else:
-            listener, self._listener = self._listener, None
-            if listener is not None:
-                listener.stop()
+        try:
+            if IS_WIN:
+                tid = self._win_thread_id
+                if tid:
+                    try:
+                        _user32.PostThreadMessageW(tid, _WM_QUIT, 0, 0)
+                    except Exception:
+                        pass
+                self._win_queue.put(None)
+                if self._win_thread is not None:
+                    self._win_thread.join(timeout=1.5)
+                    self._win_thread = None
+                if self._win_worker is not None:
+                    self._win_worker.join(timeout=1.5)
+                    self._win_worker = None
+            else:
+                listener, self._listener = self._listener, None
+                if listener is not None:
+                    listener.stop()
+        except Exception as exc:
+            logger.warning("Error stopping keyboard hook: %s", exc)
         with self._lock:
             self._cancel_timer()
             self._zbuf.clear()
@@ -299,46 +311,63 @@ class KeyHook:
     # --------------------------------------- Windows dedicated WH_KEYBOARD_LL
     def _win_message_pump(self) -> None:  # pragma: no cover - real OS hook loop
         """Dedicated high-priority Win32 message loop owning WH_KEYBOARD_LL."""
-        self._win_thread_id = int(_kernel32.GetCurrentThreadId())
-        _kernel32.SetThreadPriority(_kernel32.GetCurrentThread(), _THREAD_PRIORITY_HIGHEST)
-
-        # Force message queue creation before installing hook
-        msg = wintypes.MSG()
-        _user32.PostThreadMessageW(self._win_thread_id, 0, 0, 0)
-        _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-
-        def _ll_proc(nCode: int, wParam: int, lParam: int) -> int:
-            if nCode == _HC_ACTION and lParam:
-                if wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN, _WM_KEYUP, _WM_SYSKEYUP):
-                    kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    extended = bool(kb.flags & _LLKHF_EXTENDED)
-                    name = win_key_name(int(kb.vkCode), int(kb.scanCode), extended)
-                    if name is not None:
-                        is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
-                        self._win_queue.put_nowait((name, is_down))
-                        if self._suppress or name in _ALWAYS_SUPPRESS_KEYS:
-                            # Strictly return 1 without calling CallNextHookEx so Windows
-                            # never converts VK_BROWSER_HOME / VK_LAUNCH_MAIL / VK_LAUNCH_APP2
-                            # into ShellExecute or passes numpad digits to apps.
-                            return 1
-            return int(_user32.CallNextHookEx(self._win_hook_handle, nCode, wParam, lParam))
-
-        self._win_proc_ref = LOWLEVELKEYBOARDPROC(_ll_proc)
-        self._win_hook_handle = _user32.SetWindowsHookExW(
-            _WH_KEYBOARD_LL, self._win_proc_ref, None, 0
-        )
-        self._win_ready.set()
-
         try:
+            self._win_thread_id = int(_kernel32.GetCurrentThreadId())
+            try:
+                _kernel32.SetThreadPriority(_kernel32.GetCurrentThread(), _THREAD_PRIORITY_HIGHEST)
+            except Exception:
+                pass
+
+            # Force message queue creation before installing hook
+            msg = wintypes.MSG()
+            _user32.PostThreadMessageW(self._win_thread_id, 0, 0, 0)
+            _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+
+            def _ll_proc(nCode: int, wParam: int, lParam: int) -> int:
+                try:
+                    if nCode == _HC_ACTION and lParam:
+                        if wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN, _WM_KEYUP, _WM_SYSKEYUP):
+                            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                            extended = bool(kb.flags & _LLKHF_EXTENDED)
+                            name = win_key_name(int(kb.vkCode), int(kb.scanCode), extended)
+                            if name is not None:
+                                is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
+                                self._win_queue.put_nowait((name, is_down))
+                                if self._suppress or name in _ALWAYS_SUPPRESS_KEYS:
+                                    # Strictly return 1 without calling CallNextHookEx so Windows
+                                    # never converts VK_BROWSER_HOME / VK_LAUNCH_MAIL / VK_LAUNCH_APP2
+                                    # into ShellExecute or passes numpad digits to apps.
+                                    return 1
+                except Exception as exc:
+                    logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
+                return int(_user32.CallNextHookEx(self._win_hook_handle, nCode, wParam, lParam))
+
+            self._win_proc_ref = LOWLEVELKEYBOARDPROC(_ll_proc)
+            self._win_hook_handle = _user32.SetWindowsHookExW(
+                _WH_KEYBOARD_LL, self._win_proc_ref, None, 0
+            )
+            if not self._win_hook_handle:
+                logger.error("SetWindowsHookExW(WH_KEYBOARD_LL) returned NULL")
+                self._win_ready.set()
+                return
+            logger.info("Installed WH_KEYBOARD_LL hook (handle=%s)", self._win_hook_handle)
+            self._win_ready.set()
+
             while self._running:
                 ret = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret <= 0:  # 0 == WM_QUIT, -1 == error
                     break
                 _user32.TranslateMessage(ctypes.byref(msg))
                 _user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            logger.error("Win32 hook message pump error: %s", exc, exc_info=True)
+            self._win_ready.set()
         finally:
             if self._win_hook_handle:
-                _user32.UnhookWindowsHookEx(self._win_hook_handle)
+                try:
+                    _user32.UnhookWindowsHookEx(self._win_hook_handle)
+                except Exception:
+                    pass
                 self._win_hook_handle = None
             self._win_thread_id = 0
             self._win_proc_ref = None

@@ -138,5 +138,22 @@ class DebounceTests(unittest.TestCase):
         self.assertEqual(rec.events, [("1", True), ("1", False)])
 
 
+class StartupSafetyTests(unittest.TestCase):
+    def test_config_path_uses_user_data_dir(self):
+        import sys
+        from main import APP_NAME, Config, user_config_path
+
+        cfg = Config()
+        self.assertEqual(cfg.path, user_config_path())
+        self.assertTrue(str(cfg.path).endswith("config.json"))
+        if sys.platform == "win32":
+            self.assertIn(APP_NAME, str(cfg.path))
+
+    def test_mainwindow_does_not_override_nativeevent(self):
+        from main import MainWindow
+
+        self.assertNotIn("nativeEvent", MainWindow.__dict__)
+
+
 if __name__ == "__main__":
     unittest.main()
