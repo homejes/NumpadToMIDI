@@ -83,10 +83,10 @@ function DriverPresent: Boolean;
 var
   Count: Cardinal;
 begin
-  { {sys} is the native 64-bit System32 because of ArchitecturesInstallIn64BitMode.
-    Also check that the teVirtualMIDI64 PnP device node is enumerated (Count > 0). }
+  // {sys} is the native 64-bit System32 because of ArchitecturesInstallIn64BitMode.
+  // Also check that the teVirtualMIDI64 PnP device node is enumerated (Count > 0).
   Result := FileExists(ExpandConstant('{sys}\{#DriverDll}')) and
-            RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\teVirtualMIDI64\Enum', 'Count', Count) and
+            RegQueryDWordValue(HKEY_LOCAL_MACHINE, 'SYSTEM\CurrentControlSet\Services\teVirtualMIDI64\Enum', 'Count', Count) and
             (Count > 0);
 end;
 
@@ -97,7 +97,7 @@ begin
   Result := True;
 end;
 
-{ Runs for both interactive and silent installs, right before files are copied. }
+// Runs for both interactive and silent installs, right before files are copied.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
@@ -149,7 +149,7 @@ begin
     Exit;
   end;
   WizardForm.StatusLabel.Caption := 'Installing the virtual MIDI driver...';
-  { the vendor package is a WiX bundle: /quiet /norestart is its silent mode }
+  // the vendor package is a WiX bundle: /quiet /norestart is its silent mode
   if Exec(SetupExe, '/install /quiet /norestart', ExtractDir, SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
     Log(Format('Driver installer exit code: %d', [ResultCode]));
@@ -160,7 +160,7 @@ begin
       Log(Format('Driver repair exit code: %d', [ResultCode]));
     end;
     case ResultCode of
-      0, 1638: ; { installed / newer version already present }
+      0, 1638: ; // installed / newer version already present
       3010: SuppressibleMsgBox('Windows must be restarted to finish installing the virtual MIDI driver.',
                                mbInformation, MB_OK, IDOK);
     else
