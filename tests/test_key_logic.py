@@ -71,14 +71,14 @@ class DebounceTests(unittest.TestCase):
         self.assertEqual(rec.events, [("0", True), ("0", False)])
 
     def test_triple_zero_down_up_pairs(self):
-        hook, rec = make()
+        hook, rec = make(burst_window_ms=2000)
         for _ in range(3):
             hook._dispatch("0", True)
             hook._dispatch("0", False)
         self.assertEqual(rec.events, [("000", True), ("000", False)])
 
     def test_triple_zero_all_downs_then_ups(self):
-        hook, rec = make()
+        hook, rec = make(burst_window_ms=2000)
         for _ in range(3):
             hook._dispatch("0", True)
         for _ in range(3):
@@ -86,13 +86,13 @@ class DebounceTests(unittest.TestCase):
         self.assertEqual(rec.events, [("000", True), ("000", False)])
 
     def test_zero_after_triple_still_works(self):
-        hook, rec = make()
+        hook, rec = make(burst_window_ms=500)
         import time
         for _ in range(3):
             hook._dispatch("0", True)
             hook._dispatch("0", False)
         hook._dispatch("0", True)
-        time.sleep(0.08)
+        time.sleep(0.7)
         hook._dispatch("0", False)
         self.assertEqual(
             rec.events,

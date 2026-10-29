@@ -104,6 +104,7 @@ class KeyHook:
         self._down: set[str] = set()
         # 000-burst detection state
         self._zbuf: list[bool] = []
+        self._zfirst = 0.0
         self._timer: Optional[threading.Timer] = None
         self._triple_ups_left = 0
         self._triple_started = 0.0
@@ -229,6 +230,13 @@ class KeyHook:
                     if self._triple_ups_left == 0:
                         self._emit("000", False)
                 return
+        # --- a burst whose window has expired is flushed *now*, so correctness
+        # never depends on how quickly the flush timer thread gets scheduled
+        if self._zbuf and now - self._zfirst > self.burst_window:
+            self._cancel_timer()
+            pending, self._zbuf = self._zbuf, []
+            for pending_down in pending:
+                self._emit("0", pending_down)
         # --- no burst in progress
         if not self._zbuf:
             if "0" in self._down:
@@ -236,6 +244,8 @@ class KeyHook:
                 return
             if not down:
                 return  # stray release
+        if not self._zbuf:
+            self._zfirst = now
         self._zbuf.append(down)
         downs = sum(self._zbuf)
         if downs >= 3:
