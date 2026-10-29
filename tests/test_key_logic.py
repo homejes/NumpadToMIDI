@@ -201,6 +201,65 @@ class StartupSafetyTests(unittest.TestCase):
         self.assertTrue(hook._process_raw_keyboard(2002, 0x67, 0x47, 0))
         self.assertTrue(hook._process_raw_keyboard(2002, 0x67, 0x47, RI_KEY_BREAK))
 
+    def test_home_appcommand_swallowed_with_target_device_and_combobox_nofocus(self):
+        from PyQt6.QtCore import QEvent, Qt
+        from PyQt6.QtGui import QKeyEvent
+        from PyQt6.QtWidgets import QApplication
+        from main import (
+            APPCOMMAND_BROWSER_HOME_ALT,
+            APPCOMMAND_LAUNCH_APP2,
+            APPCOMMAND_LAUNCH_MAIL,
+            Config,
+            Controller,
+            MainWindow,
+            MidiEngine,
+        )
+
+        app = QApplication.instance() or QApplication([])
+        cfg = Config()
+        engine = MidiEngine()
+        ctrl = Controller(cfg, engine)
+        win = MainWindow(ctrl)
+        try:
+            # Verify all interactive controls refuse keyboard focus
+            for widget in (
+                win.device,
+                win.device_combo,
+                win.port,
+                win.channel,
+                win.velocity,
+                win.suppress,
+                win.monitor,
+            ):
+                self.assertEqual(widget.focusPolicy(), Qt.FocusPolicy.NoFocus)
+            for pad in win._pads.values():
+                self.assertEqual(pad.focusPolicy(), Qt.FocusPolicy.NoFocus)
+
+            # Verify pressing '1', '2', Up, Down does not change Target USB Keypad combo selection
+            win.device.clear()
+            win.device.addItem("All Connected Keypads (Default)", "")
+            win.device.addItem(r"USB Keypad (HID\VID_04D9&PID_1203)", r"HID\VID_04D9&PID_1203")
+            win.device.setCurrentIndex(1)
+            for key, text in (
+                (Qt.Key.Key_1, "1"),
+                (Qt.Key.Key_2, "2"),
+                (Qt.Key.Key_Up, ""),
+                (Qt.Key.Key_Down, ""),
+            ):
+                ev = QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier, text)
+                QApplication.sendEvent(win.device, ev)
+            self.assertEqual(win.device.currentIndex(), 1)
+
+            # Verify Home/Mail/Calc WM_APPCOMMAND is swallowed even when a specific USB keypad is targeted
+            ctrl.set_target_device(r"HID\VID_04D9&PID_1203")
+            ctrl.hook._last_raw_matched = False
+            self.assertTrue(ctrl.handle_appcommand(APPCOMMAND_BROWSER_HOME_ALT))
+            self.assertTrue(ctrl.handle_appcommand(APPCOMMAND_LAUNCH_MAIL))
+            self.assertTrue(ctrl.handle_appcommand(APPCOMMAND_LAUNCH_APP2))
+        finally:
+            ctrl.set_target_device("")
+            ctrl.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

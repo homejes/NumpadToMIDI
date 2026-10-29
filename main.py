@@ -279,8 +279,6 @@ class Controller(QObject):
         name = APPCOMMAND_TO_KEY.get(cmd)
         if name is None:
             return False
-        if self.hook.target_device and not self.hook._last_raw_matched:
-            return False
         with self._lock:
             already_active = name in self._active
         if not already_active:
@@ -461,6 +459,7 @@ class PadWidget(QWidget):
         self.setMinimumSize(78, 78)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
     def sizeHint(self) -> QSize:
         return QSize(96, 96)
@@ -525,6 +524,20 @@ class PadWidget(QWidget):
         p.drawText(rect.adjusted(0, 0, 0, -6), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
                    self._note_text)
         p.end()
+
+
+class NoKeyComboBox(QComboBox):
+    """QComboBox that never accepts keyboard focus or key events (e.g. '1', '2', arrows)."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def keyPressEvent(self, event) -> None:
+        event.ignore()
+
+    def keyReleaseEvent(self, event) -> None:
+        event.ignore()
 
 
 class MainWindow(QMainWindow):
@@ -620,7 +633,8 @@ class MainWindow(QMainWindow):
         form.setHorizontalSpacing(10)
 
         form.addWidget(QLabel("MIDI channel"), 0, 0)
-        self.channel = QComboBox()
+        self.channel = NoKeyComboBox()
+        self.channel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.channel.addItems([str(i) for i in range(1, 17)])
         self.channel.setCurrentIndex(cfg["channel"] - 1)
         self.channel.currentIndexChanged.connect(lambda i: self.ctrl.set_channel(i + 1))
@@ -630,6 +644,7 @@ class MainWindow(QMainWindow):
         minus, plus = QPushButton("\u2212"), QPushButton("+")
         for b in (minus, plus):
             b.setObjectName("step")
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.octave_label = QLabel()
         self.octave_label.setObjectName("value")
         self.octave_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -641,6 +656,7 @@ class MainWindow(QMainWindow):
 
         form.addWidget(QLabel("Velocity"), 2, 0)
         self.velocity = QSlider(Qt.Orientation.Horizontal)
+        self.velocity.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.velocity.setRange(1, 127)
         self.velocity.setValue(cfg["velocity"])
         self.velocity_label = QLabel(str(cfg["velocity"]))
@@ -651,27 +667,33 @@ class MainWindow(QMainWindow):
         form.addWidget(self.velocity_label, 2, 3)
 
         form.addWidget(QLabel("MIDI output"), 3, 0)
-        self.port = QComboBox()
+        self.port = NoKeyComboBox()
+        self.port.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.port.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.port.setMinimumContentsLength(14)
         self.port.activated.connect(self._on_port_chosen)
         refresh = QPushButton("Refresh")
+        refresh.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         refresh.clicked.connect(self._reopen_ports)
         form.addWidget(self.port, 3, 1, 1, 2)
         form.addWidget(refresh, 3, 3)
 
         form.addWidget(QLabel("Target USB Keypad"), 4, 0)
-        self.device = QComboBox()
+        self.device = NoKeyComboBox()
+        self.device.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.device_combo = self.device
         self.device.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.device.setMinimumContentsLength(14)
         self.device.activated.connect(self._on_device_chosen)
         self.refresh_device_btn = QPushButton("Refresh")
+        self.refresh_device_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.refresh_device_btn.clicked.connect(self._refresh_devices)
         form.addWidget(self.device, 4, 1, 1, 2)
         form.addWidget(self.refresh_device_btn, 4, 3)
         ctl.addLayout(form)
 
         self.suppress = QCheckBox("Exclusive Mode (Block OS Keystrokes)")
+        self.suppress.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.suppress.setChecked(bool(cfg["suppress_keys"]))
         self.suppress.toggled.connect(self.ctrl.set_suppress)
         ctl.addWidget(self.suppress)
@@ -688,14 +710,17 @@ class MainWindow(QMainWindow):
         top.addStretch(1)
         panic = QPushButton("Panic")
         panic.setObjectName("danger")
+        panic.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         panic.clicked.connect(self.ctrl.panic)
         clear = QPushButton("Clear")
+        clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         clear.clicked.connect(lambda: self.monitor.clear())
         top.addWidget(panic)
         top.addWidget(clear)
         mon.addLayout(top)
         self.monitor = QPlainTextEdit()
         self.monitor.setReadOnly(True)
+        self.monitor.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.monitor.setMaximumBlockCount(600)
         self.monitor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.monitor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -782,6 +807,7 @@ class MainWindow(QMainWindow):
             self.ctrl.config["port_name"] = ""
             self.ctrl.engine.open_auto("")
         self._refresh_status()
+        self.port.clearFocus()
 
     def _reopen_ports(self) -> None:
         self.ctrl.panic()
@@ -791,6 +817,7 @@ class MainWindow(QMainWindow):
     def _on_device_chosen(self, index: int) -> None:
         dev_id = self.device.itemData(index) or ALL_DEVICES_ID
         self.ctrl.set_target_device(str(dev_id))
+        self.device.clearFocus()
 
     def _refresh_devices(self) -> None:
         devices = self.ctrl.hook.refresh_devices()
@@ -923,6 +950,9 @@ def selftest() -> int:
         assert ctrl.handle_appcommand(APPCOMMAND_BROWSER_HOME_ALT) is True
         assert ctrl.handle_appcommand(APPCOMMAND_LAUNCH_MAIL) is True
         assert ctrl.handle_appcommand(APPCOMMAND_LAUNCH_APP2) is True
+        ctrl.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        assert ctrl.handle_appcommand(APPCOMMAND_BROWSER_HOME_ALT) is True
+        ctrl.hook.set_target_device("")
         if sys.platform == "win32" and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             hwnd = int(win.winId())
             res = ctypes.windll.user32.SendMessageW(
@@ -934,6 +964,12 @@ def selftest() -> int:
         assert not win.windowIcon().isNull()
         assert win.device.count() >= 1
         assert win.device.itemText(0) == ALL_DEVICES_LABEL
+        assert win.device.focusPolicy() == Qt.FocusPolicy.NoFocus
+        assert win.port.focusPolicy() == Qt.FocusPolicy.NoFocus
+        assert win.channel.focusPolicy() == Qt.FocusPolicy.NoFocus
+        assert win.velocity.focusPolicy() == Qt.FocusPolicy.NoFocus
+        assert win.suppress.focusPolicy() == Qt.FocusPolicy.NoFocus
+        assert win.monitor.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert ctrl.note_for("0") == 36
         assert ctrl.note_for("Home") == 55
         assert ctrl.note_for("Calc") == 58

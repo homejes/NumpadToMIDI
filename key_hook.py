@@ -505,7 +505,8 @@ class KeyHook:
         self._device_by_handle: dict[int, KeyboardDevice] = {}
         self._target_handles: set[int] = set()
         self._last_raw_hdevice: int = 0
-        self._last_raw_matched: bool = not bool(self._target_device)
+        self._last_raw_matched: bool = True
+        self._last_raw_time: float = 0.0
 
         # Non-Windows pynput listener
         self._listener = None
@@ -535,7 +536,7 @@ class KeyHook:
         with self._lock:
             self._target_device = (device_id or "").strip()
             self._rebuild_target_handles()
-            self._last_raw_matched = not bool(self._target_device)
+            self._last_raw_matched = True
 
     def refresh_devices(self) -> list[KeyboardDevice]:
         """Re-enumerate connected keyboard/keypad devices via Win32 Raw Input API."""
@@ -596,6 +597,7 @@ class KeyHook:
         matched = self.matches_device(h_device)
         self._last_raw_hdevice = h_device
         self._last_raw_matched = matched
+        self._last_raw_time = time.monotonic()
         if not matched:
             return False
         extended = bool(flags & RI_KEY_E0)
@@ -748,24 +750,30 @@ class KeyHook:
                             name = win_key_name(int(kb.vkCode), int(kb.scanCode), extended)
                             if name is not None:
                                 is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
+                                if name in _ALWAYS_SUPPRESS_KEYS:
+                                    # Multimedia launcher keys (VK_BROWSER_HOME 0xAC,
+                                    # VK_BROWSER_SEARCH 0xAA, VK_LAUNCH_MAIL 0xB4,
+                                    # VK_LAUNCH_APP1 0xB6, VK_LAUNCH_APP2 0xB7) are HID
+                                    # Consumer Control events that do not emit RIM_TYPEKEYBOARD
+                                    # WM_INPUT packets and will launch Chrome/Mail/Calc if
+                                    # either key-down or key-up reaches CallNextHookEx.
+                                    self._win_queue.put_nowait((name, is_down))
+                                    return 1
                                 if not self._target_device:
                                     # "All Connected Keypads (Default)" mode:
                                     # Dispatch immediately and suppress if Exclusive Mode is on.
                                     self._win_queue.put_nowait((name, is_down))
-                                    if self._suppress or name in _ALWAYS_SUPPRESS_KEYS:
+                                    if self._suppress:
                                         return 1
                                 else:
                                     # Specific USB keypad selected:
-                                    # Only suppress when the active Raw Input device matches
-                                    # the selected USB keypad (or for dedicated launcher keys
-                                    # when the last device matched), and let WM_INPUT verify
-                                    # RAWINPUT.header.hDevice for key releases and non-matching
-                                    # keyboards so primary keyboard typing is never blocked.
+                                    # Suppress numpad keys when the active Raw Input device
+                                    # matches the selected USB keypad, while allowing WM_KEYUP
+                                    # and non-matching keyboards to reach WM_INPUT so primary
+                                    # keyboard typing is never blocked.
                                     if self._last_raw_matched and name not in ("Tab", "Backspace"):
-                                        if is_down and (
-                                            self._suppress or name in _ALWAYS_SUPPRESS_KEYS
-                                        ):
-                                            self._win_queue.put_nowait((name, True))
+                                        self._win_queue.put_nowait((name, is_down))
+                                        if is_down and self._suppress:
                                             return 1
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
