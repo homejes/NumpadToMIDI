@@ -92,6 +92,7 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "Installer failed with exit code $($p.ExitCode)" }
           $checks = @{
             "app exe"       = "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe"
+            "app icon"      = "$env:ProgramFiles\NumpadToMIDI\icon.ico"
             "start menu"    = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\NumpadToMIDI\NumpadToMIDI.lnk"
             "desktop"       = "$env:PUBLIC\Desktop\NumpadToMIDI.lnk"
             "midi driver"   = "$env:SystemRoot\System32\teVirtualMIDI64.dll"

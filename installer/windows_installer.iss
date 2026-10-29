@@ -1,7 +1,7 @@
 ; NumpadToMIDI - Windows all-in-one installer (Inno Setup 6.3+)
 ;
 ; Build (from the repository root, after `pyinstaller build.spec`):
-;   ISCC.exe /DAppVersion=1.2.2 installer\windows_installer.iss
+;   ISCC.exe /DAppVersion=1.3.0 installer\windows_installer.iss
 ; Output: dist\NumpadToMIDI-Setup-v<AppVersion>.exe
 ;
 ; The installer
@@ -13,7 +13,7 @@
 ;     the installer (see installer\driver_notice.txt).
 
 #ifndef AppVersion
-  #define AppVersion "1.2.2"
+  #define AppVersion "1.3.0"
 #endif
 #define AppName      "NumpadToMIDI"
 #define AppExeName   "NumpadToMIDI.exe"
@@ -37,7 +37,8 @@ AppUpdatesURL={#AppUrl}/releases
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-UninstallDisplayIcon={app}\{#AppExeName}
+SetupIconFile=..\assets\icon.ico
+UninstallDisplayIcon={app}\icon.ico
 UninstallDisplayName={#AppName}
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
@@ -64,14 +65,15 @@ Name: "installdriver"; Description: "Install the virtual MIDI driver (teVirtualM
 
 [Files]
 Source: "..\dist\NumpadToMIDI-Windows.exe"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
+Source: "..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\config.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "driver_notice.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser

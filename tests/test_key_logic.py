@@ -154,6 +154,53 @@ class StartupSafetyTests(unittest.TestCase):
 
         self.assertNotIn("nativeEvent", MainWindow.__dict__)
 
+    def test_icon_assets_exist_and_valid(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1] / "assets"
+        for name in ("icon.png", "icon.ico", "icon.icns"):
+            p = root / name
+            self.assertTrue(p.is_file(), f"Missing asset {p}")
+            self.assertGreater(p.stat().st_size, 1024)
+
+    def test_extract_hardware_id_and_raw_device_filtering(self):
+        from key_hook import KeyboardDevice, RI_KEY_BREAK, extract_hardware_id
+
+        self.assertEqual(
+            extract_hardware_id(r"\\?\HID#VID_04D9&PID_1203&MI_00#7&1234#0"),
+            r"HID\VID_04D9&PID_1203",
+        )
+        self.assertEqual(
+            extract_hardware_id(
+                r"HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&021235_PID&aa22_REV&0001"
+            ),
+            r"HID\VID_1235&PID_AA22",
+        )
+
+        hook, _ = make()
+        hook._devices = [
+            KeyboardDevice(r"ACPI\PNP0303", "Laptop Keyboard", "", {1001}),
+            KeyboardDevice(r"HID\VID_04D9&PID_1203", "M-Tech USB Keypad", "", {2002}),
+        ]
+        hook._device_by_handle = {
+            1001: hook._devices[0],
+            2002: hook._devices[1],
+        }
+        # Default (""): all devices match
+        hook.set_target_device("")
+        self.assertTrue(hook.matches_device(1001))
+        self.assertTrue(hook.matches_device(2002))
+
+        # Select only the M-Tech USB keypad (handle 2002)
+        hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.assertFalse(hook.matches_device(1001))
+        self.assertTrue(hook.matches_device(2002))
+
+        # Laptop keyboard (1001) is ignored; USB keypad (2002) is processed
+        self.assertFalse(hook._process_raw_keyboard(1001, 0x67, 0x47, 0))
+        self.assertTrue(hook._process_raw_keyboard(2002, 0x67, 0x47, 0))
+        self.assertTrue(hook._process_raw_keyboard(2002, 0x67, 0x47, RI_KEY_BREAK))
+
 
 if __name__ == "__main__":
     unittest.main()

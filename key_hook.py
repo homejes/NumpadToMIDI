@@ -25,6 +25,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import queue
+import re
 import sys
 import threading
 import time
@@ -39,6 +40,32 @@ if not IS_WIN:
     from pynput import keyboard  # used on macOS / non-Windows platforms
 else:
     from ctypes import wintypes
+    import winreg
+
+ALL_DEVICES_ID = ""
+ALL_DEVICES_LABEL = "All Connected Keypads (Default)"
+
+
+class KeyboardDevice:
+    """Metadata for a connected keyboard/keypad discovered via Win32 Raw Input."""
+
+    def __init__(
+        self,
+        device_id: str,
+        label: str,
+        raw_path: str = "",
+        handles: Optional[set[int]] = None,
+    ) -> None:
+        self.device_id = device_id
+        self.label = label
+        self.raw_path = raw_path
+        self.handles: set[int] = set(handles or ())
+
+    def __repr__(self) -> str:
+        return (
+            f"KeyboardDevice(device_id={self.device_id!r}, label={self.label!r}, "
+            f"handles={sorted(self.handles)!r})"
+        )
 
 # (name, row, col) listed in CHROMATIC NOTE ORDER (index 0 -> base note C1 / 36).
 # Matches the physical 6-row M-Tech 23-key USB numpad from bottom-left to top-right:
@@ -143,8 +170,49 @@ def win_key_name(vk: int, scan: int, extended: bool) -> Optional[str]:
     return WIN_VK.get(vk)
 
 
+# --- Win32 Raw Input constants ------------------------------------------------
+HID_USAGE_PAGE_GENERIC = 0x01
+HID_USAGE_GENERIC_KEYBOARD = 0x06
+RIDEV_INPUTSINK = 0x00000100
+RIM_TYPEKEYBOARD = 1
+RIDI_DEVICENAME = 0x20000007
+RID_INPUT = 0x10000003
+_WM_INPUT = 0x00FF
+RI_KEY_BREAK = 0x0001
+RI_KEY_E0 = 0x0002
+RI_KEY_E1 = 0x0004
+
+
+def _clean_reg_desc(val: str) -> str:
+    if not val:
+        return ""
+    if ";" in val:
+        val = val.split(";")[-1]
+    return val.strip()
+
+
+def extract_hardware_id(pnp_or_path: str) -> str:
+    """Normalize a Win32 Raw Input device path or PnP ID into e.g. 'HID\\VID_04D9&PID_1203'."""
+    if not pnp_or_path:
+        return ""
+    s = pnp_or_path.strip().lstrip("\\?").lstrip("#").replace("#", "\\")
+    parts = [p for p in s.split("\\") if p]
+    if len(parts) >= 2:
+        bus = parts[0].upper()
+        dev = parts[1].upper()
+        m = re.search(r"(VID_[0-9A-F]{4}&PID_[0-9A-F]{4})", dev, re.I)
+        if m:
+            return f"{bus}\\{m.group(1).upper()}"
+        m2 = re.search(r"VID&[0-9A-F]{2}([0-9A-F]{4})_PID&([0-9A-F]{4})", dev, re.I)
+        if m2:
+            return f"{bus}\\VID_{m2.group(1).upper()}&PID_{m2.group(2).upper()}"
+        return f"{bus}\\{dev}"
+    return s.upper()
+
+
 if IS_WIN:
     LRESULT = ctypes.c_ssize_t
+    _HWND_MESSAGE = wintypes.HWND(-3)
 
     class KBDLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -153,6 +221,38 @@ if IS_WIN:
             ("flags", wintypes.DWORD),
             ("time", wintypes.DWORD),
             ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class RAWINPUTDEVICE(ctypes.Structure):
+        _fields_ = [
+            ("usUsagePage", wintypes.USHORT),
+            ("usUsage", wintypes.USHORT),
+            ("dwFlags", wintypes.DWORD),
+            ("hwndTarget", wintypes.HWND),
+        ]
+
+    class RAWINPUTDEVICELIST(ctypes.Structure):
+        _fields_ = [
+            ("hDevice", wintypes.HANDLE),
+            ("dwType", wintypes.DWORD),
+        ]
+
+    class RAWINPUTHEADER(ctypes.Structure):
+        _fields_ = [
+            ("dwType", wintypes.DWORD),
+            ("dwSize", wintypes.DWORD),
+            ("hDevice", wintypes.HANDLE),
+            ("wParam", wintypes.WPARAM),
+        ]
+
+    class RAWKEYBOARD(ctypes.Structure):
+        _fields_ = [
+            ("MakeCode", wintypes.USHORT),
+            ("Flags", wintypes.USHORT),
+            ("Reserved", wintypes.USHORT),
+            ("VKey", wintypes.USHORT),
+            ("Message", wintypes.UINT),
+            ("ExtraInformation", wintypes.ULONG),
         ]
 
     LOWLEVELKEYBOARDPROC = ctypes.WINFUNCTYPE(
@@ -184,17 +284,192 @@ if IS_WIN:
     _user32.PostThreadMessageW.argtypes = [
         wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
     ]
+    _user32.CreateWindowExW.restype = wintypes.HWND
+    _user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
+    _user32.DestroyWindow.restype = wintypes.BOOL
+    _user32.DestroyWindow.argtypes = [wintypes.HWND]
+    _user32.RegisterRawInputDevices.restype = wintypes.BOOL
+    _user32.RegisterRawInputDevices.argtypes = [
+        ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT
+    ]
+    _user32.GetRawInputDeviceList.restype = wintypes.UINT
+    _user32.GetRawInputDeviceList.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(wintypes.UINT), wintypes.UINT
+    ]
+    _user32.GetRawInputDeviceInfoW.restype = wintypes.UINT
+    _user32.GetRawInputDeviceInfoW.argtypes = [
+        wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(wintypes.UINT)
+    ]
+    _user32.GetRawInputData.restype = wintypes.UINT
+    _user32.GetRawInputData.argtypes = [
+        wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p,
+        ctypes.POINTER(wintypes.UINT), wintypes.UINT,
+    ]
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     _kernel32.GetCurrentThread.restype = wintypes.HANDLE
     _kernel32.SetThreadPriority.restype = wintypes.BOOL
     _kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
 
 
+def _lookup_pnp_friendly_name(pnp_id: str, hw_id: str) -> str:
+    """Resolve a human-readable keyboard description from the Windows PnP registry."""
+    if not IS_WIN:
+        return "Keyboard Device"
+    desc = ""
+    reg_path = f"SYSTEM\\CurrentControlSet\\Enum\\{pnp_id}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as k:
+            for field in ("FriendlyName", "DeviceDesc"):
+                try:
+                    val, _ = winreg.QueryValueEx(k, field)
+                    cleaned = _clean_reg_desc(str(val))
+                    if cleaned:
+                        desc = cleaned
+                        break
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    # Also check USB parent node if VID_xxxx&PID_xxxx is available
+    m = re.search(r"(VID_[0-9A-F]{4}&PID_[0-9A-F]{4})", hw_id, re.I)
+    if m:
+        usb_root = f"SYSTEM\\CurrentControlSet\\Enum\\USB\\{m.group(1).upper()}"
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, usb_root) as uk:
+                sub_idx = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(uk, sub_idx)
+                    except OSError:
+                        break
+                    sub_idx += 1
+                    try:
+                        with winreg.OpenKey(uk, sub) as sk:
+                            for field in ("FriendlyName", "BusReportedDeviceDesc", "DeviceDesc"):
+                                try:
+                                    val, _ = winreg.QueryValueEx(sk, field)
+                                    cleaned = _clean_reg_desc(str(val))
+                                    if cleaned and cleaned.lower() not in (
+                                        "usb input device",
+                                        "usb composite device",
+                                    ):
+                                        return f"{cleaned} - USB"
+                                except OSError:
+                                    pass
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    if not desc:
+        desc = "HID Keyboard Device" if hw_id.startswith("HID\\") else "Keyboard Device"
+    if hw_id.startswith("HID\\") and "USB" not in desc.upper():
+        desc = f"{desc} - USB"
+    return desc
+
+
+def _query_raw_device_path(h_device: int) -> str:
+    """Query RIDI_DEVICENAME for a Raw Input device handle on Windows."""
+    if not IS_WIN or not h_device:
+        return ""
+    try:
+        size = wintypes.UINT(0)
+        r1 = _user32.GetRawInputDeviceInfoW(
+            wintypes.HANDLE(h_device), RIDI_DEVICENAME, None, ctypes.byref(size)
+        )
+        if r1 != 0xFFFFFFFF and size.value > 0:
+            nbuf = ctypes.create_unicode_buffer(size.value + 2)
+            r2 = _user32.GetRawInputDeviceInfoW(
+                wintypes.HANDLE(h_device), RIDI_DEVICENAME, nbuf, ctypes.byref(size)
+            )
+            if r2 != 0xFFFFFFFF and nbuf.value:
+                return nbuf.value
+    except Exception:
+        pass
+    return ""
+
+
+def list_keyboard_devices() -> list[KeyboardDevice]:
+    """Enumerate connected keyboard/keypad devices via Win32 Raw Input API."""
+    if not IS_WIN:
+        return []
+    raw_handles: list[int] = []
+    handle_paths: dict[int, str] = {}
+    try:
+        num = wintypes.UINT(0)
+        _user32.GetRawInputDeviceList(
+            None, ctypes.byref(num), ctypes.sizeof(RAWINPUTDEVICELIST)
+        )
+        if num.value > 0:
+            buf = (RAWINPUTDEVICELIST * (num.value + 4))()
+            count = wintypes.UINT(num.value + 4)
+            res = _user32.GetRawInputDeviceList(
+                ctypes.byref(buf), ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST)
+            )
+            if res != 0xFFFFFFFF:
+                for i in range(int(res)):
+                    if buf[i].dwType == RIM_TYPEKEYBOARD and buf[i].hDevice:
+                        h = int(buf[i].hDevice)
+                        raw_handles.append(h)
+                        path = _query_raw_device_path(h)
+                        if path:
+                            handle_paths[h] = path
+    except Exception as exc:
+        logger.warning("GetRawInputDeviceList failed: %s", exc)
+
+    # Read kbdclass\Enum as fallback / enrichment when device paths are restricted
+    enum_pnp_ids: list[str] = []
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\kbdclass\Enum"
+        ) as k:
+            cnt, _ = winreg.QueryValueEx(k, "Count")
+            for idx in range(int(cnt)):
+                pnp_id, _ = winreg.QueryValueEx(k, str(idx))
+                if pnp_id:
+                    enum_pnp_ids.append(str(pnp_id))
+    except OSError:
+        pass
+
+    devices_by_id: dict[str, KeyboardDevice] = {}
+    total = max(len(raw_handles), len(enum_pnp_ids))
+    for idx in range(total):
+        h = raw_handles[idx] if idx < len(raw_handles) else 0
+        path = handle_paths.get(h, "")
+        if path:
+            cleaned = path.lstrip("\\?").lstrip("#")
+            parts = cleaned.split("#")
+            pnp_id = "\\".join(parts[:3]) if len(parts) >= 3 else cleaned
+        elif idx < len(enum_pnp_ids):
+            pnp_id = enum_pnp_ids[idx]
+            path = f"\\\\?\\{pnp_id.replace(chr(92), '#')}"
+        else:
+            pnp_id = f"HID\\KEYBOARD_{idx + 1}"
+            path = pnp_id
+
+        hw_id = extract_hardware_id(pnp_id)
+        if not hw_id:
+            continue
+        desc = _lookup_pnp_friendly_name(pnp_id, hw_id)
+        label = f"{desc} ({hw_id})"
+        existing = devices_by_id.get(hw_id)
+        if existing is None:
+            handles = {h} if h else set()
+            devices_by_id[hw_id] = KeyboardDevice(hw_id, label, path, handles)
+        elif h:
+            existing.handles.add(h)
+
+    return list(devices_by_id.values())
+
+
 KeyCallback = Callable[[str, bool], None]
 
 
 class KeyHook:
-    """Debounced global numpad listener.
+    """Debounced global numpad listener with optional Raw Input USB device filtering.
 
     ``on_key(name, is_down)`` is called from the worker (or timer) thread.
     """
@@ -208,11 +483,13 @@ class KeyHook:
         detect_triple_zero: bool = True,
         burst_window_ms: float = 35.0,
         suppress: bool = True,
+        target_device: str = ALL_DEVICES_ID,
     ) -> None:
         self._on_key = on_key
         self.detect_triple_zero = detect_triple_zero
         self.burst_window = max(0.005, burst_window_ms / 1000.0)
         self._suppress = bool(suppress)
+        self._target_device = (target_device or "").strip()
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
@@ -223,22 +500,111 @@ class KeyHook:
         self._triple_ups_left = 0
         self._triple_started = 0.0
 
+        # Raw Input device filtering state
+        self._devices: list[KeyboardDevice] = []
+        self._device_by_handle: dict[int, KeyboardDevice] = {}
+        self._target_handles: set[int] = set()
+        self._last_raw_hdevice: int = 0
+        self._last_raw_matched: bool = not bool(self._target_device)
+
         # Non-Windows pynput listener
         self._listener = None
-        # Windows native WH_KEYBOARD_LL state
+        # Windows native WH_KEYBOARD_LL + WM_INPUT state
         self._running = False
         self._win_thread: Optional[threading.Thread] = None
         self._win_worker: Optional[threading.Thread] = None
         self._win_thread_id: int = 0
         self._win_hook_handle = None
+        self._win_raw_hwnd = None
         self._win_proc_ref = None  # prevent GC of ctypes callback
         self._win_queue: queue.SimpleQueue[Optional[tuple[str, bool]]] = queue.SimpleQueue()
         self._win_ready = threading.Event()
+        self.refresh_devices()
 
     # ------------------------------------------------------------------ control
     def set_suppress(self, value: bool) -> None:
         """Enable or disable Exclusive Mode (swallowing numpad keys from the OS)."""
         self._suppress = bool(value)
+
+    @property
+    def target_device(self) -> str:
+        return self._target_device
+
+    def set_target_device(self, device_id: str) -> None:
+        """Select a specific USB keypad hardware ID, or '' for all connected keypads."""
+        with self._lock:
+            self._target_device = (device_id or "").strip()
+            self._rebuild_target_handles()
+            self._last_raw_matched = not bool(self._target_device)
+
+    def refresh_devices(self) -> list[KeyboardDevice]:
+        """Re-enumerate connected keyboard/keypad devices via Win32 Raw Input API."""
+        devices = list_keyboard_devices()
+        with self._lock:
+            self._devices = devices
+            self._device_by_handle = {}
+            for dev in devices:
+                for h in dev.handles:
+                    self._device_by_handle[h] = dev
+            self._rebuild_target_handles()
+        return list(devices)
+
+    def _rebuild_target_handles(self) -> None:
+        self._target_handles.clear()
+        target = self._target_device.upper()
+        if not target:
+            return
+        for dev in self._devices:
+            if (
+                target == dev.device_id.upper()
+                or target in dev.device_id.upper()
+                or target in dev.raw_path.upper()
+                or target == dev.label.upper()
+            ):
+                self._target_handles.update(dev.handles)
+
+    def matches_device(self, h_device: int) -> bool:
+        """Return True if Raw Input handle ``h_device`` matches the selected target device."""
+        target = self._target_device
+        if not target:
+            return True
+        if not h_device:
+            return False
+        with self._lock:
+            if h_device in self._target_handles:
+                return True
+            target_up = target.upper()
+            if target_up == f"HDEVICE:{h_device}" or target_up == str(h_device):
+                self._target_handles.add(h_device)
+                return True
+            if h_device not in self._device_by_handle:
+                path = _query_raw_device_path(h_device)
+                hw_id = extract_hardware_id(path) if path else f"HDEVICE:{h_device}"
+                dev = KeyboardDevice(hw_id, hw_id, path, {h_device})
+                self._device_by_handle[h_device] = dev
+                if (
+                    target_up == hw_id.upper()
+                    or target_up in hw_id.upper()
+                    or (path and target_up in path.upper())
+                ):
+                    self._target_handles.add(h_device)
+                    return True
+            return False
+
+    def _process_raw_keyboard(self, h_device: int, vk: int, scan: int, flags: int) -> bool:
+        """Filter and dispatch a Win32 RAWKEYBOARD event by its ``hDevice``."""
+        matched = self.matches_device(h_device)
+        self._last_raw_hdevice = h_device
+        self._last_raw_matched = matched
+        if not matched:
+            return False
+        extended = bool(flags & RI_KEY_E0)
+        is_down = not bool(flags & RI_KEY_BREAK)
+        name = win_key_name(vk, scan, extended)
+        if name is None:
+            return False
+        self._win_queue.put_nowait((name, is_down))
+        return True
 
     def start(self) -> None:
         if self._running:
@@ -308,9 +674,36 @@ class KeyHook:
             for name in list(self._down):
                 self._emit(name, False)
 
-    # --------------------------------------- Windows dedicated WH_KEYBOARD_LL
+    # --------------------------------------- Windows dedicated WH_KEYBOARD_LL + WM_INPUT
+    def _handle_wm_input(self, lparam: int) -> None:  # pragma: no cover - real OS message
+        if not lparam:
+            return
+        try:
+            size = wintypes.UINT(0)
+            hdr_size = ctypes.sizeof(RAWINPUTHEADER)
+            _user32.GetRawInputData(
+                wintypes.HANDLE(lparam), RID_INPUT, None, ctypes.byref(size), hdr_size
+            )
+            if size.value < hdr_size + ctypes.sizeof(RAWKEYBOARD):
+                return
+            buf = ctypes.create_string_buffer(size.value)
+            res = _user32.GetRawInputData(
+                wintypes.HANDLE(lparam), RID_INPUT, buf, ctypes.byref(size), hdr_size
+            )
+            if res == 0xFFFFFFFF:
+                return
+            hdr = RAWINPUTHEADER.from_buffer(buf)
+            if hdr.dwType != RIM_TYPEKEYBOARD:
+                return
+            rk = RAWKEYBOARD.from_buffer(buf, hdr_size)
+            self._process_raw_keyboard(
+                int(hdr.hDevice or 0), int(rk.VKey), int(rk.MakeCode), int(rk.Flags)
+            )
+        except Exception as exc:
+            logger.debug("WM_INPUT parse error: %s", exc)
+
     def _win_message_pump(self) -> None:  # pragma: no cover - real OS hook loop
-        """Dedicated high-priority Win32 message loop owning WH_KEYBOARD_LL."""
+        """Dedicated high-priority Win32 message loop owning WH_KEYBOARD_LL and WM_INPUT."""
         try:
             self._win_thread_id = int(_kernel32.GetCurrentThreadId())
             try:
@@ -323,6 +716,29 @@ class KeyHook:
             _user32.PostThreadMessageW(self._win_thread_id, 0, 0, 0)
             _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
 
+            # Register hidden message-only window for Raw Input (WM_INPUT)
+            try:
+                self._win_raw_hwnd = _user32.CreateWindowExW(
+                    0, "Static", "NumpadToMIDIRawInputSink", 0,
+                    0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
+                )
+                if self._win_raw_hwnd:
+                    rid = RAWINPUTDEVICE(
+                        HID_USAGE_PAGE_GENERIC,
+                        HID_USAGE_GENERIC_KEYBOARD,
+                        RIDEV_INPUTSINK,
+                        self._win_raw_hwnd,
+                    )
+                    if _user32.RegisterRawInputDevices(
+                        ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
+                    ):
+                        logger.info(
+                            "Registered Win32 Raw Input keyboard sink (hwnd=%s)",
+                            self._win_raw_hwnd,
+                        )
+            except Exception as exc:
+                logger.warning("Could not register Raw Input sink: %s", exc)
+
             def _ll_proc(nCode: int, wParam: int, lParam: int) -> int:
                 try:
                     if nCode == _HC_ACTION and lParam:
@@ -332,12 +748,25 @@ class KeyHook:
                             name = win_key_name(int(kb.vkCode), int(kb.scanCode), extended)
                             if name is not None:
                                 is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
-                                self._win_queue.put_nowait((name, is_down))
-                                if self._suppress or name in _ALWAYS_SUPPRESS_KEYS:
-                                    # Strictly return 1 without calling CallNextHookEx so Windows
-                                    # never converts VK_BROWSER_HOME / VK_LAUNCH_MAIL / VK_LAUNCH_APP2
-                                    # into ShellExecute or passes numpad digits to apps.
-                                    return 1
+                                if not self._target_device:
+                                    # "All Connected Keypads (Default)" mode:
+                                    # Dispatch immediately and suppress if Exclusive Mode is on.
+                                    self._win_queue.put_nowait((name, is_down))
+                                    if self._suppress or name in _ALWAYS_SUPPRESS_KEYS:
+                                        return 1
+                                else:
+                                    # Specific USB keypad selected:
+                                    # Only suppress when the active Raw Input device matches
+                                    # the selected USB keypad (or for dedicated launcher keys
+                                    # when the last device matched), and let WM_INPUT verify
+                                    # RAWINPUT.header.hDevice for key releases and non-matching
+                                    # keyboards so primary keyboard typing is never blocked.
+                                    if self._last_raw_matched and name not in ("Tab", "Backspace"):
+                                        if is_down and (
+                                            self._suppress or name in _ALWAYS_SUPPRESS_KEYS
+                                        ):
+                                            self._win_queue.put_nowait((name, True))
+                                            return 1
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
                 return int(_user32.CallNextHookEx(self._win_hook_handle, nCode, wParam, lParam))
@@ -357,6 +786,8 @@ class KeyHook:
                 ret = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret <= 0:  # 0 == WM_QUIT, -1 == error
                     break
+                if msg.message == _WM_INPUT:
+                    self._handle_wm_input(int(msg.lParam))
                 _user32.TranslateMessage(ctypes.byref(msg))
                 _user32.DispatchMessageW(ctypes.byref(msg))
         except Exception as exc:
@@ -369,6 +800,12 @@ class KeyHook:
                 except Exception:
                     pass
                 self._win_hook_handle = None
+            if self._win_raw_hwnd:
+                try:
+                    _user32.DestroyWindow(self._win_raw_hwnd)
+                except Exception:
+                    pass
+                self._win_raw_hwnd = None
             self._win_thread_id = 0
             self._win_proc_ref = None
 

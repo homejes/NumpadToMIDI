@@ -4,6 +4,7 @@
   "channel": 1,
   "velocity": 100,
   "port_name": "",
+  "target_device": "",
   "suppress_keys": true,
   "exclusive_mode": true,
   "triple_zero_detection": true,

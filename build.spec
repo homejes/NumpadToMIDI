@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 _version = {}
 exec(open("version.py", encoding="utf-8").read(), _version)
-APP_VERSION = _version.get("VERSION", "1.2.2")
+APP_VERSION = _version.get("VERSION", "1.3.0")
 
 hiddenimports = collect_submodules("rtmidi")
 if sys.platform == "win32":
@@ -20,7 +20,7 @@ a = Analysis(
     ["main.py"],
     pathex=["."],
     binaries=[],
-    datas=[("config.json", ".")],
+    datas=[("config.json", "."), ("assets", "assets")],
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
@@ -41,12 +41,13 @@ if sys.platform == "darwin":
         upx=False,
         console=False,
         argv_emulation=False,
+        icon="assets/icon.icns",
     )
     coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="NumpadToMIDI")
     app = BUNDLE(
         coll,
         name="NumpadToMIDI.app",
-        icon=None,
+        icon="assets/icon.icns",
         bundle_identifier="com.numpadtomidi.app",
         info_plist={
             "CFBundleName": "NumpadToMIDI",
@@ -72,4 +73,5 @@ else:
         upx=False,
         runtime_tmpdir=None,
         console=False,
+        icon="assets/icon.ico",
     )

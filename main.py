@@ -86,7 +86,10 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from key_hook import KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES, KEY_SPAN, KeyHook
+from key_hook import (
+    ALL_DEVICES_ID, ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
+    KEY_SPAN, KeyHook,
+)
 from midi_engine import MidiEngine, note_name
 from version import VERSION
 
@@ -155,6 +158,7 @@ class Config:
         "channel": 1,
         "velocity": 100,
         "port_name": "",
+        "target_device": "",
         "suppress_keys": True,
         "exclusive_mode": True,
         "triple_zero_detection": True,
@@ -190,6 +194,7 @@ class Config:
         d["channel"] = max(1, min(16, int(d["channel"])))
         d["velocity"] = max(1, min(127, int(d["velocity"])))
         d["burst_window_ms"] = max(5, min(200, float(d["burst_window_ms"])))
+        d["target_device"] = str(d.get("target_device", "") or "")
         d["exclusive_mode"] = bool(d["exclusive_mode"])
         d["suppress_keys"] = bool(d["suppress_keys"])
 
@@ -227,6 +232,7 @@ class Controller(QObject):
             detect_triple_zero=bool(config["triple_zero_detection"]),
             burst_window_ms=float(config["burst_window_ms"]),
             suppress=bool(config["suppress_keys"]),
+            target_device=str(config["target_device"]),
         )
 
     # ---- mapping -------------------------------------------------------------
@@ -273,6 +279,8 @@ class Controller(QObject):
         name = APPCOMMAND_TO_KEY.get(cmd)
         if name is None:
             return False
+        if self.hook.target_device and not self.hook._last_raw_matched:
+            return False
         with self._lock:
             already_active = name in self._active
         if not already_active:
@@ -300,6 +308,15 @@ class Controller(QObject):
         self.config["suppress_keys"] = enabled
         self.config["exclusive_mode"] = enabled
         self.hook.set_suppress(enabled)
+
+    def set_target_device(self, device_id: str) -> None:
+        target = (device_id or "").strip()
+        self.panic()
+        self.config["target_device"] = target
+        self.hook.set_target_device(target)
+        self.config.save()
+        label = target if target else ALL_DEVICES_LABEL
+        self.log.emit(f"{self._ts()}  Target USB keypad: {label}")
 
     def set_muted(self, value: bool) -> None:
         muted = bool(value)
@@ -387,7 +404,12 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 
 def make_app_icon() -> QIcon:
-    """Render a crisp 64x64 pad-grid icon for the window and system tray."""
+    """Load the high-res 3x3 pad-grid icon from assets/icon.png (with vector fallback)."""
+    for candidate in (resource_path("assets/icon.png"), Path("assets/icon.png")):
+        if candidate.is_file():
+            icon = QIcon(str(candidate))
+            if not icon.isNull():
+                return icon
     pix = QPixmap(64, 64)
     pix.fill(Qt.GlobalColor.transparent)
     p = QPainter(pix)
@@ -522,6 +544,7 @@ class MainWindow(QMainWindow):
         ctrl.log.connect(self._append_log)
         self._refresh_notes()
         self._refresh_status()
+        self._refresh_devices()
 
     # ---- construction --------------------------------------------------------
     def _card(self) -> tuple[QFrame, QVBoxLayout]:
@@ -636,6 +659,16 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(self._reopen_ports)
         form.addWidget(self.port, 3, 1, 1, 2)
         form.addWidget(refresh, 3, 3)
+
+        form.addWidget(QLabel("Target USB Keypad"), 4, 0)
+        self.device = QComboBox()
+        self.device.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.device.setMinimumContentsLength(14)
+        self.device.activated.connect(self._on_device_chosen)
+        self.refresh_device_btn = QPushButton("Refresh")
+        self.refresh_device_btn.clicked.connect(self._refresh_devices)
+        form.addWidget(self.device, 4, 1, 1, 2)
+        form.addWidget(self.refresh_device_btn, 4, 3)
         ctl.addLayout(form)
 
         self.suppress = QCheckBox("Exclusive Mode (Block OS Keystrokes)")
@@ -755,6 +788,31 @@ class MainWindow(QMainWindow):
         self.ctrl.engine.open_auto(self.ctrl.config["port_name"])
         self._refresh_status()
 
+    def _on_device_chosen(self, index: int) -> None:
+        dev_id = self.device.itemData(index) or ALL_DEVICES_ID
+        self.ctrl.set_target_device(str(dev_id))
+
+    def _refresh_devices(self) -> None:
+        devices = self.ctrl.hook.refresh_devices()
+        target = str(self.ctrl.config["target_device"] or "")
+        self.device.blockSignals(True)
+        self.device.clear()
+        self.device.addItem(ALL_DEVICES_LABEL, ALL_DEVICES_ID)
+        selected_idx = 0
+        for idx, dev in enumerate(devices, start=1):
+            self.device.addItem(dev.label, dev.device_id)
+            if target and (
+                target.upper() == dev.device_id.upper()
+                or target.upper() in dev.device_id.upper()
+                or target.upper() == dev.label.upper()
+            ):
+                selected_idx = idx
+        if target and selected_idx == 0:
+            self.device.addItem(f"{target} (disconnected)", target)
+            selected_idx = self.device.count() - 1
+        self.device.setCurrentIndex(selected_idx)
+        self.device.blockSignals(False)
+
     def _refresh_notes(self) -> None:
         cfg = self.ctrl.config
         base = cfg["base_note"] + cfg["octave"] * 12
@@ -815,7 +873,15 @@ class MainWindow(QMainWindow):
 # =============================================================================
 def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWindow]:
     logger.info("Starting %s %s (platform=%s)", APP_NAME, VERSION, sys.platform)
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"{APP_NAME}.App.{VERSION}"
+            )
+        except Exception:
+            pass
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setWindowIcon(make_app_icon())
     app.setStyleSheet(STYLE)
     if QSystemTrayIcon.isSystemTrayAvailable():
         app.setQuitOnLastWindowClosed(False)
@@ -865,6 +931,9 @@ def selftest() -> int:
             assert res == 1, f"Expected WM_APPCOMMAND LRESULT 1, got {res}"
         app.processEvents()
         assert len(win._pads) == len(KEY_NAMES) == 23
+        assert not win.windowIcon().isNull()
+        assert win.device.count() >= 1
+        assert win.device.itemText(0) == ALL_DEVICES_LABEL
         assert ctrl.note_for("0") == 36
         assert ctrl.note_for("Home") == 55
         assert ctrl.note_for("Calc") == 58
