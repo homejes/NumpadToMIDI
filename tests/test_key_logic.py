@@ -522,16 +522,17 @@ class StartupSafetyTests(unittest.TestCase):
 
         engine = MidiEngine()
         # Mock port creation failure with Error Code 5 (Access Denied)
-        with patch.object(TeVirtualMidiPort, "available", return_value=True):
-            with patch.object(TeVirtualMidiPort, "open", return_value=False):
-                TeVirtualMidiPort.last_error_code = 5
-                TeVirtualMidiPort.last_error_message = "error 5 (Access is denied.)"
-                engine.list_ports = MagicMock(return_value=["loopMIDI Port"])
-                engine._open_index = MagicMock(return_value="loopback")
-                mode = engine.open_auto("")
-                # Verify it does not crash, catches error 5, and falls back to loopMIDI
-                self.assertEqual(mode, "loopback")
-                engine._open_index.assert_called_once_with(0, "loopMIDI Port", "loopback")
+        with patch("midi_engine.IS_WIN", True):
+            with patch.object(TeVirtualMidiPort, "available", return_value=True):
+                with patch.object(TeVirtualMidiPort, "open", return_value=False):
+                    TeVirtualMidiPort.last_error_code = 5
+                    TeVirtualMidiPort.last_error_message = "error 5 (Access is denied.)"
+                    engine.list_ports = MagicMock(return_value=["loopMIDI Port"])
+                    engine._open_index = MagicMock(return_value="loopback")
+                    mode = engine.open_auto("")
+                    # Verify it does not crash, catches error 5, and falls back to loopMIDI
+                    self.assertEqual(mode, "loopback")
+                    engine._open_index.assert_called_once_with(0, "loopMIDI Port", "loopback")
 
     def test_async_queue_000_burst_detection(self):
         """Worker thread processing items from _win_queue fires '000' on 3 presses."""
