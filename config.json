@@ -1,0 +1,10 @@
+{
+  "base_note": 36,
+  "octave": 0,
+  "channel": 1,
+  "velocity": 100,
+  "port_name": "",
+  "suppress_keys": false,
+  "triple_zero_detection": true,
+  "burst_window_ms": 35
+}

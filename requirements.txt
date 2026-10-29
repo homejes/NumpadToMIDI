@@ -1,0 +1,4 @@
+PyQt6>=6.6
+pynput>=1.7.7
+python-rtmidi>=1.5.8
+pyinstaller>=6.6
