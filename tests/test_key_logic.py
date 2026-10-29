@@ -43,9 +43,8 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(win_key_name(0x2D, 0x52, False), "0")     # keypad VK_INSERT (NumLock OFF)
         self.assertEqual(win_key_name(0x2D, 0, False), "0")        # keypad VK_INSERT (scan 0)
         self.assertEqual(win_key_name(0x00, 0x52, False), "0")     # raw keypad scancode 0x52
-        # Dedicated Insert key on the main keyboard (E0 52) must NOT be hijacked...
-        self.assertIsNone(win_key_name(0x2D, 0x52, True))
-        # ...unless Raw Input verified it came from the selected target USB keypad
+        # Both standard and extended VK_INSERT map to keypad 0 for NumLock-independent burst detection
+        self.assertEqual(win_key_name(0x2D, 0x52, True), "0")
         self.assertEqual(win_key_name(0x2D, 0x52, True, keypad_verified=True), "0")
         self.assertEqual(win_key_name(0x6E, 0x53, False), ".")     # VK_DECIMAL (NumLock ON)
         self.assertEqual(win_key_name(0x2E, 0x53, False), ".")     # keypad VK_DELETE (NumLock OFF)
@@ -153,9 +152,9 @@ class DebounceTests(unittest.TestCase):
         from unittest.mock import patch
         from key_hook import KeyboardDevice, RI_KEY_BREAK
 
-        # Default burst_window must be 50 ms (0.050 s)
+        # Default burst_window must be 60 ms (0.060 s)
         default_hook, _ = KeyHook(Recorder()), None
-        self.assertAlmostEqual(default_hook.burst_window, 0.050, places=4)
+        self.assertAlmostEqual(default_hook.burst_window, 0.060, places=4)
 
         # 3 consecutive '0' presses spaced 30 ms apart (total span 60 ms > 50 ms,
         # but each consecutive interval is 30 ms < 50 ms) must fire '000' and never '0'
@@ -465,6 +464,51 @@ class StartupSafetyTests(unittest.TestCase):
         finally:
             ctrl.set_exclusive_pad_mode(orig_excl)
             ctrl.shutdown()
+
+    def test_numlock_off_vk_insert_hardware_cadence_burst(self):
+        """M-Tech hardware cadence (~50-80 ms between edges, ~110-130 ms between KEYDOWNs) yields Note 37."""
+        from unittest.mock import patch
+        from key_hook import VK_INSERT
+
+        clock = [2000.0]
+        with patch("key_hook.time.perf_counter", side_effect=lambda: clock[0]):
+            hook, rec = make(burst_window_ms=60)
+            # Timestamps matching live logs: down at 0, up at +48, down at +120, up at +192, down at +248, up at +312
+            hook._dispatch("0", True, VK_INSERT)
+            clock[0] += 0.048
+            hook._dispatch("0", False, VK_INSERT)
+            clock[0] += 0.072  # +72 ms from up (120 ms from 1st down)
+            hook._dispatch("0", True, VK_INSERT)
+            clock[0] += 0.072
+            hook._dispatch("0", False, VK_INSERT)
+            clock[0] += 0.056  # +56 ms from up (128 ms from 2nd down)
+            hook._dispatch("0", True, VK_INSERT)
+            clock[0] += 0.064
+            hook._dispatch("0", False, VK_INSERT)
+            hook.stop()
+        self.assertEqual(rec.events, [("000", True), ("000", False)])
+
+    def test_virtual_midi_port_teardown_and_reinitialize(self):
+        from unittest.mock import MagicMock
+        from midi_engine import MidiEngine, TeVirtualMidiPort
+
+        port1 = TeVirtualMidiPort()
+        port1._handle = 12345
+        port1.name = "NumpadToMIDI"
+        TeVirtualMidiPort._active_ports["NumpadToMIDI"] = port1
+
+        # Test proactive cleanup of active ports
+        self.assertIn("NumpadToMIDI", TeVirtualMidiPort._active_ports)
+        TeVirtualMidiPort.cleanup_orphaned("NumpadToMIDI")
+        self.assertNotIn("NumpadToMIDI", TeVirtualMidiPort._active_ports)
+        self.assertIsNone(port1._handle)
+
+        # Test MidiEngine.reinitialize_virtual_port sequence
+        engine = MidiEngine()
+        engine.open_auto = MagicMock(return_value="virtual")
+        res = engine.reinitialize_virtual_port()
+        engine.open_auto.assert_called_once_with("")
+        self.assertEqual(res, "virtual")
 
 
 if __name__ == "__main__":

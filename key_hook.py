@@ -182,10 +182,8 @@ MAC_VK: dict[int, str] = {
 def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = False) -> Optional[str]:
     """Map a Windows low-level keyboard event to a logical numpad key name.
 
-    ``keypad_verified`` is True when the event is known to come from the selected
-    target USB keypad (Raw Input ``hDevice`` match). Only then are *extended*
-    navigation codes (``E0 52`` Insert / ``E0 53`` Delete) accepted as keypad
-    '0' / '.', so the main keyboard's dedicated Insert/Delete keys stay untouched.
+    Both VK_NUMPAD0 (NumLock ON) and keypad VK_INSERT (NumLock OFF) map to "0"
+    so '000' burst detection works identically regardless of NumLock state.
     """
     if IS_WIN and vk in (0, 0xFF) and scan and not extended:
         try:
@@ -205,18 +203,17 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
     # NumLock-independent '0' / '000' and '.' (Dot / Del) recognition:
     # * NumLock ON:  VK_NUMPAD0 (0x60) / VK_DECIMAL (0x6E)
     # * NumLock OFF: VK_INSERT (0x2D) / VK_DELETE (0x2E) with keypad scancode 0x52 / 0x53
-    #   and NO extended flag (the dedicated Insert/Delete keys send E0 52 / E0 53).
     if vk == VK_NUMPAD0:
         return "0"
     if vk == VK_DECIMAL:
         return "."
     if vk == VK_INSERT or (vk in (0, 0xFF) and scan == 0x52):
-        return "0" if (not extended or keypad_verified) else None
+        return "0"
     if vk == VK_DELETE or (vk in (0, 0xFF) and scan == 0x53):
         return "." if (not extended or keypad_verified) else None
-    if not extended and scan == 0x52:
+    if scan == 0x52:
         return "0"
-    if not extended and scan == 0x53:
+    if scan == 0x53 and not extended:
         return "."
     if vk == VK_HOME and extended:
         return "Home"
@@ -551,7 +548,7 @@ class KeyHook:
         on_key: KeyCallback,
         *,
         detect_triple_zero: bool = True,
-        burst_window_ms: float = 50.0,
+        burst_window_ms: float = 60.0,
         suppress: bool = True,
         target_device: str = ALL_DEVICES_ID,
     ) -> None:
@@ -568,6 +565,7 @@ class KeyHook:
         self._zdown_times: list[float] = []
         self._zlast_down = 0.0
         self._last_zero_ts = 0.0
+        self._zlast_vk = 0
         self._timer: Optional[threading.Timer] = None
         self._triple_timer: Optional[threading.Timer] = None
         self._triple_ups_left = 0
@@ -669,8 +667,10 @@ class KeyHook:
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0) -> None:
         """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
         now = time.perf_counter()
+        # Tight 5 ms dedup window, clearing opposite edge for this key to prevent dedup cross-stroke bleed
         self._pending_raw_dedup = [
-            item for item in self._pending_raw_dedup if now - item[2] < 0.040
+            item for item in self._pending_raw_dedup
+            if (now - item[2] < 0.005 and item[0] != name)
         ]
         self._pending_raw_dedup.append((name, is_down, now))
         self._win_queue.put_nowait((name, is_down, vk))
@@ -683,7 +683,7 @@ class KeyHook:
         self._last_raw_matched = matched
         self._last_raw_time = now
         self._pending_raw_dedup = [
-            item for item in self._pending_raw_dedup if now - item[2] < 0.040
+            item for item in self._pending_raw_dedup if now - item[2] < 0.005
         ]
         if not matched:
             return False
@@ -696,6 +696,10 @@ class KeyHook:
             if q_name == name and q_down == is_down:
                 del self._pending_raw_dedup[idx]
                 return True
+        # Purge any opposite-edge dedup record for this key
+        self._pending_raw_dedup = [
+            item for item in self._pending_raw_dedup if item[0] != name or item[1] == is_down
+        ]
         self._win_queue.put_nowait((name, is_down, vk))
         return True
 
@@ -872,12 +876,9 @@ class KeyHook:
                                         return 1
                                 else:
                                     # Specific USB keypad selected:
-                                    # Only queue in _ll_proc when suppressing (return 1);
-                                    # non-suppressed events (such as WM_KEYUP) pass through
-                                    # CallNextHookEx and are queued once by _process_raw_keyboard
-                                    # after verifying hDevice.
+                                    # Suppress and dispatch in _ll_proc when matched and Exclusive Mode is on
                                     if self._last_raw_matched and name not in ("Tab", "Backspace"):
-                                        if is_down and self._suppress:
+                                        if self._suppress:
                                             self._queue_from_ll(name, is_down, vk_code)
                                             return 1
                 except Exception as exc:
@@ -1005,10 +1006,17 @@ class KeyHook:
             delta_ms,
         )
 
+        eff_window = max(self.burst_window, 0.060)
+        # Slower firmware debounce/scan cadence observed on NumLock-OFF VK_INSERT bursts
+        if vk == VK_INSERT or self._zlast_vk == VK_INSERT:
+            eff_window = max(eff_window, 0.140)
+        if vk:
+            self._zlast_vk = vk
+
         # --- 1. Finishing a recognised '000' press (waiting for its releases)
         if self._triple_ups_left > 0:
             if down:
-                if (now - self._triple_started) > max(self.burst_window, 0.050):
+                if (now - self._triple_started) > eff_window:
                     # Previous '000' burst has finished; emit Note Off and start fresh
                     self._cancel_triple_timer()
                     self._triple_ups_left = 0
@@ -1024,7 +1032,7 @@ class KeyHook:
 
         # --- 2. A burst whose consecutive-press window has expired is flushed *now*,
         # so correctness never depends on how quickly the flush timer thread gets scheduled
-        if self._zbuf and self._zlast_down > 0.0 and (now - self._zlast_down) > self.burst_window:
+        if self._zbuf and self._zlast_down > 0.0 and (now - self._zlast_down) > eff_window:
             self._cancel_timer()
             pending, self._zbuf = self._zbuf[:], []
             self._zdown_times.clear()
@@ -1040,10 +1048,10 @@ class KeyHook:
             if not down:
                 return  # stray release
 
-        # --- 4. Rolling triplet burst evaluation (consecutive '0' presses within burst_window)
+        # --- 4. Rolling triplet burst evaluation (consecutive '0' presses within eff_window)
         self._zbuf.append(down)
         if down:
-            if self._zdown_times and (now - self._zdown_times[-1]) > self.burst_window:
+            if self._zdown_times and (now - self._zdown_times[-1]) > eff_window:
                 self._zdown_times.clear()
             self._zdown_times.append(now)
             if len(self._zdown_times) > 3:
@@ -1072,9 +1080,9 @@ class KeyHook:
                     self._start_triple_timer()
                 return
 
-            # 1st or 2nd '0' press: (re)schedule the 50 ms window timer from this press
+            # 1st or 2nd '0' press: (re)schedule the window timer from this press
             self._cancel_timer()
-            self._timer = threading.Timer(self.burst_window, self._flush_zero)
+            self._timer = threading.Timer(eff_window, self._flush_zero)
             self._timer.daemon = True
             self._timer.start()
 

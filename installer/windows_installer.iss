@@ -13,7 +13,7 @@
 ;     the installer (see installer\driver_notice.txt).
 
 #ifndef AppVersion
-  #define AppVersion "1.4.1"
+  #define AppVersion "1.4.2"
 #endif
 #define AppName      "NumpadToMIDI"
 #define AppExeName   "NumpadToMIDI.exe"
@@ -100,11 +100,23 @@ begin
   Result := True;
 end;
 
+procedure RestartDriverDevice;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\pnputil.exe'), '/restart-device "ROOT\MEDIA\0000"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log(Format('pnputil /restart-device returned code: %d', [ResultCode]));
+end;
+
 // Runs for both interactive and silent installs, right before files are copied.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
 begin
   Result := '';
   DriverZip := '';
+  // Ensure any running NumpadToMIDI process (including tray) releases driver handles
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM NumpadToMIDI.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if not WizardIsTaskSelected('installdriver') then
   begin
     Log('Driver task not selected - skipping virtual MIDI driver.');
@@ -113,6 +125,7 @@ begin
   if DriverPresent then
   begin
     Log('teVirtualMIDI driver already present - skipping download.');
+    RestartDriverDevice;
     Exit;
   end;
   try
@@ -179,5 +192,8 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
     InstallDriver;
+    RestartDriverDevice;
+  end;
 end;

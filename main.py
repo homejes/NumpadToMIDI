@@ -163,7 +163,7 @@ class Config:
         "exclusive_mode": True,
         "exclusive_pad_mode": False,
         "triple_zero_detection": True,
-        "burst_window_ms": 50,
+        "burst_window_ms": 60,
     }
 
     def __init__(self, path: Optional[Path] = None) -> None:
@@ -458,6 +458,11 @@ class Controller(QObject):
         self.engine.close()
 
 
+# Win32 session shutdown messages
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
+
+
 class WinAppCommandFilter(QAbstractNativeEventFilter):
     """Application-wide native event filter that traps WM_APPCOMMAND (0x0319) on Windows."""
 
@@ -470,6 +475,9 @@ class WinAppCommandFilter(QAbstractNativeEventFilter):
             try:
                 if b"windows" in bytes(eventType):
                     msg = wintypes.MSG.from_address(int(message))
+                    if msg.message in (WM_QUERYENDSESSION, WM_ENDSESSION):
+                        self.ctrl.shutdown()
+                        return True, 1
                     if msg.message == WM_APPCOMMAND:
                         cmd = get_appcommand_lparam(msg.lParam)
                         if self.ctrl.handle_appcommand(cmd):
@@ -963,19 +971,28 @@ class MainWindow(QMainWindow):
     def _on_port_chosen(self, index: int) -> None:
         name = self.port.itemData(index)
         self.ctrl.panic()
-        if name:
+        if name and name != "__virtual__":
             self.ctrl.engine.open_port_by_name(name)
             self.ctrl.config["port_name"] = name
-        elif self.ctrl.engine.supports_virtual:  # "built-in virtual port" entry
+        else:  # "Virtual port: NumpadToMIDI" entry
             self.ctrl.config["port_name"] = ""
-            self.ctrl.engine.open_auto("")
+            self.ctrl.engine.reinitialize_virtual_port()
+        self.ctrl.config.save()
         self._refresh_status()
+        self.ctrl.log.emit(f"{self.ctrl._ts()}  {self.ctrl.engine.description}")
         self.port.clearFocus()
 
     def _reopen_ports(self) -> None:
         self.ctrl.panic()
-        self.ctrl.engine.open_auto(self.ctrl.config["port_name"])
+        preferred = self.ctrl.config["port_name"]
+        if self.ctrl.engine.mode != "virtual" or not preferred:
+            self.ctrl.config["port_name"] = ""
+            self.ctrl.engine.reinitialize_virtual_port()
+        else:
+            self.ctrl.engine.open_auto(preferred)
+        self.ctrl.config.save()
         self._refresh_status()
+        self.ctrl.log.emit(f"{self.ctrl._ts()}  Refreshed MIDI -> {self.ctrl.engine.description}")
 
     def _on_device_chosen(self, index: int) -> None:
         dev_id = self.device.itemData(index) or ALL_DEVICES_ID
@@ -1026,30 +1043,34 @@ class MainWindow(QMainWindow):
         self.port.clear()
         ports = engine.list_ports()
         if sys.platform == "darwin":  # macOS: always the native virtual source
-            self.port.addItem(f"Virtual: {engine.port_name or engine.CLIENT_NAME}", None)
+            self.port.addItem(f"Virtual: {engine.port_name or engine.CLIENT_NAME}", "__virtual__")
             self.port.setEnabled(False)
         else:
             self.port.setEnabled(True)
-            if engine.supports_virtual:
-                self.port.addItem(f"Virtual port: {engine.CLIENT_NAME} (built-in)", None)
+            # Always make the built-in virtual port available at index 0 on Windows
+            self.port.addItem(f"Virtual port: {engine.CLIENT_NAME}", "__virtual__")
             for name in ports:
                 self.port.addItem(name, name)
-            if engine.mode == "virtual":
+            if engine.mode == "virtual" or not self.ctrl.config["port_name"]:
                 self.port.setCurrentIndex(0)
             elif engine.port_name in ports:
-                self.port.setCurrentIndex(ports.index(engine.port_name) + (1 if engine.supports_virtual else 0))
-            if self.port.count() == 0:
+                self.port.setCurrentIndex(ports.index(engine.port_name) + 1)
+            elif self.port.count() == 0:
                 self.port.addItem("(no MIDI outputs found)", None)
         self.port.blockSignals(False)
 
         if engine.mode == "virtual":
             self.hint.setText(
-                f"Select \u201c{engine.port_name}\u201d as a MIDI input in your DAW."
+                f"Select \u201c{engine.port_name}\u201d as a MIDI input in Ableton Live / your DAW."
+            )
+        elif engine.mode == "loopback":
+            self.hint.setText(
+                f"Using loopback port \u201c{engine.port_name}\u201d. Click Refresh to reconnect built-in virtual port."
             )
         elif sys.platform == "win32":
+            err_msg = engine.error or "Virtual port not connected"
             self.hint.setText(
-                "The virtual MIDI driver is not installed. Re-run the NumpadToMIDI installer "
-                "(it installs the driver), or install loopMIDI, create a port and press Refresh."
+                f"{err_msg}. Click Refresh to re-initialize built-in virtual port, or ensure teVirtualMIDI / loopMIDI is installed."
             )
         else:
             self.hint.setText("")
