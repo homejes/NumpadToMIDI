@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 _version = {}
 exec(open("version.py", encoding="utf-8").read(), _version)
-APP_VERSION = _version.get("VERSION", "1.4.2")
+APP_VERSION = _version.get("VERSION", "1.4.5")
 
 hiddenimports = collect_submodules("rtmidi")
 if sys.platform == "win32":
@@ -74,4 +74,5 @@ else:
         runtime_tmpdir=None,
         console=False,
         icon="assets/icon.ico",
+        uac_admin=True,
     )

@@ -92,7 +92,7 @@ class DebounceTests(unittest.TestCase):
         hook, rec = make()
         hook._dispatch("0", True)
         import time
-        time.sleep(0.08)
+        time.sleep(0.12)
         hook._dispatch("0", False)
         self.assertEqual(rec.events, [("0", True), ("0", False)])
 
@@ -100,7 +100,7 @@ class DebounceTests(unittest.TestCase):
         hook, rec = make()
         import time
         hook._dispatch("0", True)
-        time.sleep(0.08)
+        time.sleep(0.12)
         for _ in range(5):
             hook._dispatch("0", True)
         hook._dispatch("0", False)
@@ -152,9 +152,9 @@ class DebounceTests(unittest.TestCase):
         from unittest.mock import patch
         from key_hook import KeyboardDevice, RI_KEY_BREAK
 
-        # Default burst_window must be 60 ms (0.060 s)
+        # Default burst_window must be 75 ms (0.075 s)
         default_hook, _ = KeyHook(Recorder()), None
-        self.assertAlmostEqual(default_hook.burst_window, 0.060, places=4)
+        self.assertAlmostEqual(default_hook.burst_window, 0.075, places=4)
 
         # 3 consecutive '0' presses spaced 30 ms apart (total span 60 ms > 50 ms,
         # but each consecutive interval is 30 ms < 50 ms) must fire '000' and never '0'
@@ -509,6 +509,47 @@ class StartupSafetyTests(unittest.TestCase):
         res = engine.reinitialize_virtual_port()
         engine.open_auto.assert_called_once_with("")
         self.assertEqual(res, "virtual")
+
+    def test_uac_admin_in_build_spec(self):
+        from pathlib import Path
+
+        spec_text = (Path(__file__).resolve().parents[1] / "build.spec").read_text(encoding="utf-8")
+        self.assertIn("uac_admin=True", spec_text)
+
+    def test_tevirtualmidi_error_5_fallback(self):
+        from unittest.mock import MagicMock, patch
+        from midi_engine import MidiEngine, TeVirtualMidiPort
+
+        engine = MidiEngine()
+        # Mock port creation failure with Error Code 5 (Access Denied)
+        with patch.object(TeVirtualMidiPort, "available", return_value=True):
+            with patch.object(TeVirtualMidiPort, "open", return_value=False):
+                TeVirtualMidiPort.last_error_code = 5
+                TeVirtualMidiPort.last_error_message = "error 5 (Access is denied.)"
+                engine.list_ports = MagicMock(return_value=["loopMIDI Port"])
+                engine._open_index = MagicMock(return_value="loopback")
+                mode = engine.open_auto("")
+                # Verify it does not crash, catches error 5, and falls back to loopMIDI
+                self.assertEqual(mode, "loopback")
+                engine._open_index.assert_called_once_with(0, "loopMIDI Port", "loopback")
+
+    def test_async_queue_000_burst_detection(self):
+        """Worker thread processing items from _win_queue fires '000' on 3 presses."""
+        from key_hook import VK_INSERT, VK_NUMPAD0
+
+        hook, rec = make(burst_window_ms=75)
+        # Simulate pushing 3 rapid strokes into _win_queue
+        for vk in (VK_NUMPAD0, VK_INSERT, VK_NUMPAD0):
+            hook._win_queue.put(("0", True, vk))
+            hook._win_queue.put(("0", False, vk))
+
+        # Process through worker dispatch
+        while not hook._win_queue.empty():
+            item = hook._win_queue.get_nowait()
+            if item:
+                hook._dispatch(item[0], item[1], item[2])
+        hook.stop()
+        self.assertEqual(rec.events, [("000", True), ("000", False)])
 
 
 if __name__ == "__main__":

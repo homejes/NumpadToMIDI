@@ -253,6 +253,37 @@ class TeVirtualMidiPort:
                     err = int(ctypes.windll.kernel32.GetLastError())
                 except Exception:
                     pass
+
+            # Gracefully handle Win32 Error Code 5 (ERROR_ACCESS_DENIED):
+            # Proactively close any existing port handle and retry once
+            if err == 5:
+                logger.warning(
+                    "virtualMIDICreatePortEx2(%r) encountered Win32 Error Code 5 (Access Denied). "
+                    "Closing existing port handles and retrying...",
+                    name,
+                )
+                TeVirtualMidiPort.cleanup_orphaned(name)
+                try:
+                    handle = dll.virtualMIDICreatePortEx2(
+                        name, None, 0, 65535, self.FLAGS_INSTANTIATE_TX_ONLY
+                    )
+                except Exception as exc:
+                    logger.debug("Retry virtualMIDICreatePortEx2(%s) error: %s", name, exc)
+                if not handle and hasattr(dll, "virtualMIDICreatePortEx3"):
+                    try:
+                        handle = dll.virtualMIDICreatePortEx3(
+                            name, None, 0, 65535, self.FLAGS_INSTANTIATE_TX_ONLY, None, None
+                        )
+                    except Exception as exc:
+                        logger.debug("Retry virtualMIDICreatePortEx3(%s) error: %s", name, exc)
+
+        if not handle:
+            err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
+            if not err and hasattr(ctypes, "windll"):
+                try:
+                    err = int(ctypes.windll.kernel32.GetLastError())
+                except Exception:
+                    pass
             err_desc = ""
             if err:
                 try:
@@ -428,22 +459,28 @@ class MidiEngine:
     def _try_te_virtual(self) -> bool:
         if not (IS_WIN and TeVirtualMidiPort.available()):
             return False
-        for attempt in (1, 2):
-            for name in (self.CLIENT_NAME, f"{self.CLIENT_NAME} 2", f"{self.CLIENT_NAME} 3"):
-                port = TeVirtualMidiPort()
-                if port.open(name):
-                    self._te = port
-                    self.mode, self.port_name, self.error = "virtual", name, ""
-                    return True
-            # If all port creation attempts failed with locked driver errors, try recovery once
-            if attempt == 1 and TeVirtualMidiPort.last_error_code in (5, 31, 2, 1167, 183):
-                if TeVirtualMidiPort._try_recover_driver():
-                    continue
-            break
-        err_detail = TeVirtualMidiPort.last_error_message or "could not create virtual port"
-        self.error = f"virtual port creation failed ({err_detail})"
-        logger.warning(self.error)
-        return False
+        try:
+            for attempt in (1, 2):
+                for name in (self.CLIENT_NAME, f"{self.CLIENT_NAME} 2", f"{self.CLIENT_NAME} 3"):
+                    port = TeVirtualMidiPort()
+                    if port.open(name):
+                        self._te = port
+                        self.mode, self.port_name, self.error = "virtual", name, ""
+                        return True
+                # If all port creation attempts failed with locked driver errors, try recovery once
+                if attempt == 1 and TeVirtualMidiPort.last_error_code in (5, 31, 2, 1167, 183):
+                    TeVirtualMidiPort.cleanup_orphaned()
+                    if TeVirtualMidiPort._try_recover_driver():
+                        continue
+                break
+            err_detail = TeVirtualMidiPort.last_error_message or "could not create virtual port"
+            self.error = f"virtual port creation failed ({err_detail})"
+            logger.warning(self.error)
+            return False
+        except Exception as exc:
+            self.error = f"virtual port creation exception: {exc}"
+            logger.error("Exception in _try_te_virtual: %s", exc)
+            return False
 
     def _try_virtual(self) -> bool:
         try:

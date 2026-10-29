@@ -163,7 +163,7 @@ class Config:
         "exclusive_mode": True,
         "exclusive_pad_mode": False,
         "triple_zero_detection": True,
-        "burst_window_ms": 60,
+        "burst_window_ms": 75,
     }
 
     def __init__(self, path: Optional[Path] = None) -> None:

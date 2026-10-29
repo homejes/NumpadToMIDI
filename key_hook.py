@@ -548,7 +548,7 @@ class KeyHook:
         on_key: KeyCallback,
         *,
         detect_triple_zero: bool = True,
-        burst_window_ms: float = 60.0,
+        burst_window_ms: float = 75.0,
         suppress: bool = True,
         target_device: str = ALL_DEVICES_ID,
     ) -> None:
@@ -1006,7 +1006,7 @@ class KeyHook:
             delta_ms,
         )
 
-        eff_window = max(self.burst_window, 0.060)
+        eff_window = max(self.burst_window, 0.075)
         # Slower firmware debounce/scan cadence observed on NumLock-OFF VK_INSERT bursts
         if vk == VK_INSERT or self._zlast_vk == VK_INSERT:
             eff_window = max(eff_window, 0.140)

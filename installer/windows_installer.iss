@@ -13,7 +13,7 @@
 ;     the installer (see installer\driver_notice.txt).
 
 #ifndef AppVersion
-  #define AppVersion "1.4.2"
+  #define AppVersion "1.4.5"
 #endif
 #define AppName      "NumpadToMIDI"
 #define AppExeName   "NumpadToMIDI.exe"
@@ -76,7 +76,7 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 var
