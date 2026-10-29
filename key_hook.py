@@ -179,8 +179,14 @@ MAC_VK: dict[int, str] = {
 }
 
 
-def win_key_name(vk: int, scan: int, extended: bool) -> Optional[str]:
-    """Map a Windows low-level keyboard event to a logical numpad key name."""
+def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = False) -> Optional[str]:
+    """Map a Windows low-level keyboard event to a logical numpad key name.
+
+    ``keypad_verified`` is True when the event is known to come from the selected
+    target USB keypad (Raw Input ``hDevice`` match). Only then are *extended*
+    navigation codes (``E0 52`` Insert / ``E0 53`` Delete) accepted as keypad
+    '0' / '.', so the main keyboard's dedicated Insert/Delete keys stay untouched.
+    """
     if IS_WIN and vk in (0, 0xFF) and scan and not extended:
         try:
             mapped = int(_user32.MapVirtualKeyW(scan, _MAPVK_VSC_TO_VK))
@@ -198,10 +204,19 @@ def win_key_name(vk: int, scan: int, extended: bool) -> Optional[str]:
         return "Calc"
     # NumLock-independent '0' / '000' and '.' (Dot / Del) recognition:
     # * NumLock ON:  VK_NUMPAD0 (0x60) / VK_DECIMAL (0x6E)
-    # * NumLock OFF: VK_INSERT (0x2D) / VK_DELETE (0x2E) or keypad scancodes 0x52 / 0x53
-    if vk in (VK_NUMPAD0, VK_INSERT) or (not extended and scan == 0x52):
+    # * NumLock OFF: VK_INSERT (0x2D) / VK_DELETE (0x2E) with keypad scancode 0x52 / 0x53
+    #   and NO extended flag (the dedicated Insert/Delete keys send E0 52 / E0 53).
+    if vk == VK_NUMPAD0:
         return "0"
-    if vk in (VK_DECIMAL, VK_DELETE) or (not extended and scan == 0x53):
+    if vk == VK_DECIMAL:
+        return "."
+    if vk == VK_INSERT or (vk in (0, 0xFF) and scan == 0x52):
+        return "0" if (not extended or keypad_verified) else None
+    if vk == VK_DELETE or (vk in (0, 0xFF) and scan == 0x53):
+        return "." if (not extended or keypad_verified) else None
+    if not extended and scan == 0x52:
+        return "0"
+    if not extended and scan == 0x53:
         return "."
     if vk == VK_HOME and extended:
         return "Home"
@@ -210,6 +225,17 @@ def win_key_name(vk: int, scan: int, extended: bool) -> Optional[str]:
     if not extended and vk in _WIN_NUMLOCK_OFF_VK_MAP:
         return _WIN_NUMLOCK_OFF_VK_MAP[vk]
     return WIN_VK.get(vk)
+
+
+def zero_vk_label(vk: int) -> str:
+    """Human-readable source label for a physical '0' keystroke (for diagnostics)."""
+    if vk == VK_NUMPAD0:
+        return "VK_NUMPAD0/NumLock-ON"
+    if vk == VK_INSERT:
+        return "VK_INSERT/NumLock-OFF"
+    if vk:
+        return f"VK_0x{vk:02X}"
+    return "KEYPAD0"
 
 
 # --- Win32 Raw Input constants ------------------------------------------------
@@ -537,7 +563,7 @@ class KeyHook:
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
-        # 000-burst detection state (rolling buffer of consecutive VK_NUMPAD0 presses)
+        # 000-burst detection state (rolling buffer of consecutive keypad-0 presses: VK_NUMPAD0 or keypad VK_INSERT)
         self._zbuf: list[bool] = []
         self._zdown_times: list[float] = []
         self._zlast_down = 0.0
@@ -566,7 +592,7 @@ class KeyHook:
         self._win_hook_handle = None
         self._win_raw_hwnd = None
         self._win_proc_ref = None  # prevent GC of ctypes callback
-        self._win_queue: queue.SimpleQueue[Optional[tuple[str, bool]]] = queue.SimpleQueue()
+        self._win_queue: queue.SimpleQueue[Optional[tuple]] = queue.SimpleQueue()
         self._win_ready = threading.Event()
         self.refresh_devices()
 
@@ -640,14 +666,14 @@ class KeyHook:
                     return True
             return False
 
-    def _queue_from_ll(self, name: str, is_down: bool) -> None:
+    def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0) -> None:
         """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
         now = time.perf_counter()
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup if now - item[2] < 0.040
         ]
         self._pending_raw_dedup.append((name, is_down, now))
-        self._win_queue.put_nowait((name, is_down))
+        self._win_queue.put_nowait((name, is_down, vk))
 
     def _process_raw_keyboard(self, h_device: int, vk: int, scan: int, flags: int) -> bool:
         """Filter and dispatch a Win32 RAWKEYBOARD event by its ``hDevice``."""
@@ -663,14 +689,14 @@ class KeyHook:
             return False
         extended = bool(flags & RI_KEY_E0)
         is_down = not bool(flags & RI_KEY_BREAK)
-        name = win_key_name(vk, scan, extended)
+        name = win_key_name(vk, scan, extended, keypad_verified=bool(self._target_device))
         if name is None:
             return False
         for idx, (q_name, q_down, _) in enumerate(self._pending_raw_dedup):
             if q_name == name and q_down == is_down:
                 del self._pending_raw_dedup[idx]
                 return True
-        self._win_queue.put_nowait((name, is_down))
+        self._win_queue.put_nowait((name, is_down, vk))
         return True
 
     def start(self) -> None:
@@ -818,7 +844,13 @@ class KeyHook:
                         if wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN, _WM_KEYUP, _WM_SYSKEYUP):
                             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                             extended = bool(kb.flags & _LLKHF_EXTENDED)
-                            name = win_key_name(int(kb.vkCode), int(kb.scanCode), extended)
+                            vk_code = int(kb.vkCode)
+                            name = win_key_name(
+                                vk_code,
+                                int(kb.scanCode),
+                                extended,
+                                keypad_verified=bool(self._target_device and self._last_raw_matched),
+                            )
                             if name is not None:
                                 is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
                                 if name in _ALWAYS_SUPPRESS_KEYS:
@@ -828,12 +860,14 @@ class KeyHook:
                                     # Consumer Control events that do not emit RIM_TYPEKEYBOARD
                                     # WM_INPUT packets and will launch Chrome/Mail/Calc if
                                     # either key-down or key-up reaches CallNextHookEx.
-                                    self._queue_from_ll(name, is_down)
+                                    self._queue_from_ll(name, is_down, vk_code)
                                     return 1
                                 if not self._target_device:
                                     # "All Connected Keypads (Default)" mode:
-                                    # Dispatch immediately and suppress if Exclusive Mode is on.
-                                    self._queue_from_ll(name, is_down)
+                                    # Dispatch immediately and suppress if Exclusive Mode is on
+                                    # (this also swallows keypad VK_INSERT when NumLock is OFF,
+                                    # so the '000' burst never toggles Insert/Overtype mode).
+                                    self._queue_from_ll(name, is_down, vk_code)
                                     if self._suppress:
                                         return 1
                                 else:
@@ -844,7 +878,7 @@ class KeyHook:
                                     # after verifying hDevice.
                                     if self._last_raw_matched and name not in ("Tab", "Backspace"):
                                         if is_down and self._suppress:
-                                            self._queue_from_ll(name, is_down)
+                                            self._queue_from_ll(name, is_down, vk_code)
                                             return 1
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
@@ -893,9 +927,10 @@ class KeyHook:
             item = self._win_queue.get()
             if item is None:
                 break
-            name, is_down = item
+            name, is_down = item[0], item[1]
+            vk = item[2] if len(item) > 2 else 0
             try:
-                self._dispatch(name, is_down)
+                self._dispatch(name, is_down, vk)
             except Exception:
                 pass
 
@@ -932,10 +967,12 @@ class KeyHook:
         return char if char in KEY_INDEX else None
 
     # ------------------------------------------------------------- debounce core
-    def _dispatch(self, name: str, down: bool) -> None:
+    def _dispatch(self, name: str, down: bool, vk: int = 0) -> None:
         with self._lock:
             if name == "0" and self.detect_triple_zero:
-                self._zero_event(down)
+                # Both VK_NUMPAD0 (NumLock ON) and keypad VK_INSERT (NumLock OFF) arrive
+                # here as "0", so mixed or NumLock-OFF bursts share one triplet detector.
+                self._zero_event(down, vk)
             else:
                 self._emit(name, down)
 
@@ -954,13 +991,15 @@ class KeyHook:
         except Exception:  # a UI/MIDI error must not kill the hook thread
             pass
 
-    def _zero_event(self, down: bool) -> None:
+    def _zero_event(self, down: bool, vk: int = 0) -> None:
         now = time.perf_counter()
         delta_ms = (now - self._last_zero_ts) * 1000.0 if self._last_zero_ts > 0.0 else 0.0
         self._last_zero_ts = now
         event_type = "KEYDOWN" if down else "KEYUP"
+        source = zero_vk_label(vk)
         logger.info(
-            "VK_NUMPAD0 (%s, timestamp=%.6f, delta_ms=%.2f)",
+            "Keypad 0 [%s] (%s, timestamp=%.6f, delta_ms=%.2f)",
+            source,
             event_type,
             now,
             delta_ms,
@@ -1021,7 +1060,8 @@ class KeyHook:
                 self._zdown_times.clear()
                 self._zlast_down = 0.0
                 logger.info(
-                    "VK_NUMPAD0 triplet detected -> firing '000' Note On (MIDI Note 37)"
+                    "Keypad 0 triplet detected [%s] -> firing '000' Note On (MIDI Note 37)",
+                    source,
                 )
                 self._emit("000", True)
                 self._triple_started = now

@@ -24,7 +24,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - macOS: native **virtual MIDI source** called `NumpadToMIDI`.
 - Windows: creates a virtual MIDI port called **`NumpadToMIDI`** directly via the
   [teVirtualMIDI](https://www.tobias-erichsen.de/software/virtualmidi.html) driver
-  (automatically installed by `NumpadToMIDI-Setup-v1.4.0.exe`). If the driver is not
+  (automatically installed by `NumpadToMIDI-Setup-v1.4.1.exe`). If the driver is not
   present, falls back to any existing loopback port (e.g.
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)), then to the first
   available output, or runs silently if none exists.
@@ -56,21 +56,21 @@ Output: `dist/NumpadToMIDI-Windows.exe` (Windows) or `dist/NumpadToMIDI.app` (ma
 To build the platform installers:
 - **Windows (Inno Setup 6.3+):**
   ```powershell
-  ISCC.exe /DAppVersion=1.4.0 installer\windows_installer.iss
+  ISCC.exe /DAppVersion=1.4.1 installer\windows_installer.iss
   ```
-  Produces `dist/NumpadToMIDI-Setup-v1.4.0.exe` (bundles the app, creates Desktop and
+  Produces `dist/NumpadToMIDI-Setup-v1.4.1.exe` (bundles the app, creates Desktop and
   Start Menu shortcuts, elevates to Administrator, and silently downloads + installs
   the `teVirtualMIDI` virtual MIDI driver if missing).
 - **macOS (DMG with `/Applications` link and setup guide):**
   ```bash
-  bash installer/make_dmg.sh 1.4.0
+  bash installer/make_dmg.sh 1.4.1
   ```
-  Produces `dist/NumpadToMIDI-macOS-v1.4.0.dmg`.
+  Produces `dist/NumpadToMIDI-macOS-v1.4.1.dmg`.
 
 ## Releases / CI
 `.github/workflows/build-release.yml` builds both platforms on every `v*` tag (and manual
-`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.4.0.exe` and
-`NumpadToMIDI-macOS-v1.4.0.dmg` to the GitHub Release.
+`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.4.1.exe` and
+`NumpadToMIDI-macOS-v1.4.1.dmg` to the GitHub Release.
 
 ## Notes & limitations
 - **Windows:** works with NumLock on or off. Only the *extended* (numpad) Enter is recognised.

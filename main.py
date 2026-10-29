@@ -251,6 +251,14 @@ class Controller(QObject):
         return self.engine.currently_active_note
 
     # ---- mapping -------------------------------------------------------------
+    TRIPLE_ZERO_VELOCITY = 127
+
+    def _velocity_for(self, name: str) -> int:
+        """'000' always fires at full velocity (127); other pads use the velocity slider."""
+        if name == "000":
+            return self.TRIPLE_ZERO_VELOCITY
+        return int(self.config["velocity"])
+
     def note_for(self, name: str) -> Optional[int]:
         if name == ".":
             return None
@@ -288,7 +296,7 @@ class Controller(QObject):
                 if note is None:
                     self.log.emit(f"{self._ts()}  {name}: note out of range (change octave)")
                     return
-                channel, velocity = self.config["channel"], self.config["velocity"]
+                channel, velocity = self.config["channel"], self._velocity_for(name)
                 prev_key = self._active_choke_key
                 choked, started = self.engine.trigger_exclusive_note(
                     channel, note, velocity, muted=self.muted
@@ -334,7 +342,7 @@ class Controller(QObject):
                 if note is None:
                     self.log.emit(f"{self._ts()}  {name}: note out of range (change octave)")
                     return
-                channel, velocity = self.config["channel"], self.config["velocity"]
+                channel, velocity = self.config["channel"], self._velocity_for(name)
                 self._active[name] = (note, channel)
                 if not self.muted:
                     self.engine.note_on(channel, note, velocity)

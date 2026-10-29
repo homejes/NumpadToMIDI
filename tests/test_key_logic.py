@@ -40,12 +40,17 @@ class LayoutTests(unittest.TestCase):
 
     def test_windows_mapping(self):
         self.assertEqual(win_key_name(96, 0, False), "0")          # VK_NUMPAD0 (NumLock ON)
-        self.assertEqual(win_key_name(0x2D, 0x52, False), "0")     # VK_INSERT (NumLock OFF, scan 0x52)
-        self.assertEqual(win_key_name(0x2D, 0x52, True), "0")      # VK_INSERT (NumLock OFF, extended)
-        self.assertEqual(win_key_name(0x2D, 0, False), "0")        # VK_INSERT (scan 0)
+        self.assertEqual(win_key_name(0x2D, 0x52, False), "0")     # keypad VK_INSERT (NumLock OFF)
+        self.assertEqual(win_key_name(0x2D, 0, False), "0")        # keypad VK_INSERT (scan 0)
+        self.assertEqual(win_key_name(0x00, 0x52, False), "0")     # raw keypad scancode 0x52
+        # Dedicated Insert key on the main keyboard (E0 52) must NOT be hijacked...
+        self.assertIsNone(win_key_name(0x2D, 0x52, True))
+        # ...unless Raw Input verified it came from the selected target USB keypad
+        self.assertEqual(win_key_name(0x2D, 0x52, True, keypad_verified=True), "0")
         self.assertEqual(win_key_name(0x6E, 0x53, False), ".")     # VK_DECIMAL (NumLock ON)
-        self.assertEqual(win_key_name(0x2E, 0x53, False), ".")     # VK_DELETE (NumLock OFF, scan 0x53)
-        self.assertEqual(win_key_name(0x2E, 0, False), ".")        # VK_DELETE (NumLock OFF)
+        self.assertEqual(win_key_name(0x2E, 0x53, False), ".")     # keypad VK_DELETE (NumLock OFF)
+        self.assertEqual(win_key_name(0x2E, 0, False), ".")        # keypad VK_DELETE (scan 0)
+        self.assertIsNone(win_key_name(0x2E, 0x53, True))          # dedicated Delete key ignored
         self.assertEqual(win_key_name(105, 0, False), "9")
         self.assertEqual(win_key_name(13, 0, True), "Enter")
         self.assertIsNone(win_key_name(13, 0, False))  # main Enter is ignored
@@ -310,24 +315,85 @@ class StartupSafetyTests(unittest.TestCase):
         from key_hook import KeyboardDevice, RI_KEY_BREAK, RI_KEY_E0, VK_INSERT
 
         # When NumLock is OFF, the '000' hardware key sends 3 rapid VK_INSERT (0x2D, scan 0x52)
-        # strokes (with or without RI_KEY_E0 / extended flag). Verify it triggers '000' reliably.
+        # strokes. With a verified target keypad, even E0-flagged strokes must trigger '000'.
         for flags_down in (0, RI_KEY_E0):
             hook, rec = make(burst_window_ms=500)
             hook._devices = [KeyboardDevice(r"HID\VID_1C4F&PID_0002", "USB Keypad", "", {3003})]
             hook._device_by_handle = {3003: hook._devices[0]}
             hook.set_target_device(r"HID\VID_1C4F&PID_0002")
             for _ in range(3):
-                name = win_key_name(VK_INSERT, 0x52, bool(flags_down & RI_KEY_E0))
+                name = win_key_name(
+                    VK_INSERT, 0x52, bool(flags_down & RI_KEY_E0), keypad_verified=True
+                )
                 self.assertEqual(name, "0")
-                hook._queue_from_ll(name, True)
+                hook._queue_from_ll(name, True, VK_INSERT)
                 hook._process_raw_keyboard(3003, VK_INSERT, 0x52, flags_down)
                 hook._process_raw_keyboard(3003, VK_INSERT, 0x52, flags_down | RI_KEY_BREAK)
             while not hook._win_queue.empty():
                 item = hook._win_queue.get_nowait()
                 if item:
-                    hook._dispatch(item[0], item[1])
+                    hook._dispatch(*item)
             hook.stop()
             self.assertEqual(rec.events, [("000", True), ("000", False)])
+
+    def test_triple_zero_burst_numlock_on_and_off_identical(self):
+        """3x VK_NUMPAD0 (NumLock ON) and 3x keypad VK_INSERT (NumLock OFF) both yield '000'."""
+        from unittest.mock import patch
+        from key_hook import VK_INSERT, VK_NUMPAD0
+
+        scenarios = {
+            "NumLock ON (3x VK_NUMPAD0)": [VK_NUMPAD0] * 3,
+            "NumLock OFF (3x VK_INSERT)": [VK_INSERT] * 3,
+            "Mixed (NumLock toggled mid-burst)": [VK_NUMPAD0, VK_INSERT, VK_INSERT],
+        }
+        for label, vks in scenarios.items():
+            with self.subTest(label):
+                clock = [500.0]
+                with patch("key_hook.time.perf_counter", side_effect=lambda: clock[0]):
+                    hook, rec = make(burst_window_ms=50)
+                    for vk in vks:
+                        # Real M-Tech timing: ~8 ms between every down/up edge
+                        name = win_key_name(vk, 0x52, False)
+                        self.assertEqual(name, "0")
+                        hook._dispatch(name, True, vk)
+                        clock[0] += 0.008
+                        hook._dispatch(name, False, vk)
+                        clock[0] += 0.008
+                    hook.stop()
+                self.assertEqual(rec.events, [("000", True), ("000", False)], label)
+
+        # A single slow press still yields a plain '0' in both NumLock states
+        for vk in (VK_NUMPAD0, VK_INSERT):
+            with self.subTest(f"single press vk=0x{vk:02X}"):
+                clock = [900.0]
+                with patch("key_hook.time.perf_counter", side_effect=lambda: clock[0]):
+                    hook, rec = make(burst_window_ms=50)
+                    hook._dispatch("0", True, vk)
+                    clock[0] += 0.200
+                    hook._dispatch("0", False, vk)
+                    hook.stop()
+                self.assertEqual(rec.events, [("0", True), ("0", False)])
+
+    def test_triple_zero_fires_note_37_at_velocity_127(self):
+        from PyQt6.QtWidgets import QApplication
+        from main import Config, Controller, MidiEngine
+
+        QApplication.instance() or QApplication([])
+        engine = MidiEngine()
+        sent = []
+        engine.note_on = lambda ch, n, vel=100: sent.append(("ON", n, vel))
+        engine.note_off = lambda ch, n: sent.append(("OFF", n))
+        ctrl = Controller(Config(), engine)
+        orig_excl = ctrl.exclusive_pad_mode
+        try:
+            ctrl.set_exclusive_pad_mode(False)
+            sent.clear()
+            ctrl.handle_key("000", True)
+            ctrl.handle_key("000", False)
+            self.assertEqual(sent, [("ON", 37, 127), ("OFF", 37)])
+        finally:
+            ctrl.set_exclusive_pad_mode(orig_excl)
+            ctrl.shutdown()
 
     def test_exclusive_pad_mode_choke_and_dot_toggle(self):
         from PyQt6.QtWidgets import QApplication
