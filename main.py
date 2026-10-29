@@ -162,7 +162,7 @@ class Config:
         "suppress_keys": True,
         "exclusive_mode": True,
         "triple_zero_detection": True,
-        "burst_window_ms": 35,
+        "burst_window_ms": 50,
     }
 
     def __init__(self, path: Optional[Path] = None) -> None:
@@ -193,7 +193,7 @@ class Config:
         d["octave"] = max(OCTAVE_MIN, min(OCTAVE_MAX, int(d["octave"])))
         d["channel"] = max(1, min(16, int(d["channel"])))
         d["velocity"] = max(1, min(127, int(d["velocity"])))
-        d["burst_window_ms"] = max(5, min(200, float(d["burst_window_ms"])))
+        d["burst_window_ms"] = max(50.0, min(200.0, float(d["burst_window_ms"])))
         d["target_device"] = str(d.get("target_device", "") or "")
         d["exclusive_mode"] = bool(d["exclusive_mode"])
         d["suppress_keys"] = bool(d["suppress_keys"])
@@ -971,8 +971,10 @@ def selftest() -> int:
         assert win.suppress.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert win.monitor.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert ctrl.note_for("0") == 36
+        assert ctrl.note_for("000") == 37
         assert ctrl.note_for("Home") == 55
         assert ctrl.note_for("Calc") == 58
+        assert ctrl.config["burst_window_ms"] >= 50
         assert win.suppress.isChecked() is True
         assert str(ctrl.config.path).endswith("config.json")
         if sys.platform == "win32":

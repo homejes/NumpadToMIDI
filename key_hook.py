@@ -481,7 +481,7 @@ class KeyHook:
         on_key: KeyCallback,
         *,
         detect_triple_zero: bool = True,
-        burst_window_ms: float = 35.0,
+        burst_window_ms: float = 50.0,
         suppress: bool = True,
         target_device: str = ALL_DEVICES_ID,
     ) -> None:
@@ -493,10 +493,13 @@ class KeyHook:
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
-        # 000-burst detection state
+        # 000-burst detection state (rolling buffer of consecutive VK_NUMPAD0 presses)
         self._zbuf: list[bool] = []
-        self._zfirst = 0.0
+        self._zdown_times: list[float] = []
+        self._zlast_down = 0.0
+        self._last_zero_ts = 0.0
         self._timer: Optional[threading.Timer] = None
+        self._triple_timer: Optional[threading.Timer] = None
         self._triple_ups_left = 0
         self._triple_started = 0.0
 
@@ -507,6 +510,7 @@ class KeyHook:
         self._last_raw_hdevice: int = 0
         self._last_raw_matched: bool = True
         self._last_raw_time: float = 0.0
+        self._pending_raw_dedup: list[tuple[str, bool, float]] = []
 
         # Non-Windows pynput listener
         self._listener = None
@@ -592,12 +596,25 @@ class KeyHook:
                     return True
             return False
 
+    def _queue_from_ll(self, name: str, is_down: bool) -> None:
+        """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
+        now = time.perf_counter()
+        self._pending_raw_dedup = [
+            item for item in self._pending_raw_dedup if now - item[2] < 0.040
+        ]
+        self._pending_raw_dedup.append((name, is_down, now))
+        self._win_queue.put_nowait((name, is_down))
+
     def _process_raw_keyboard(self, h_device: int, vk: int, scan: int, flags: int) -> bool:
         """Filter and dispatch a Win32 RAWKEYBOARD event by its ``hDevice``."""
+        now = time.perf_counter()
         matched = self.matches_device(h_device)
         self._last_raw_hdevice = h_device
         self._last_raw_matched = matched
-        self._last_raw_time = time.monotonic()
+        self._last_raw_time = now
+        self._pending_raw_dedup = [
+            item for item in self._pending_raw_dedup if now - item[2] < 0.040
+        ]
         if not matched:
             return False
         extended = bool(flags & RI_KEY_E0)
@@ -605,6 +622,10 @@ class KeyHook:
         name = win_key_name(vk, scan, extended)
         if name is None:
             return False
+        for idx, (q_name, q_down, _) in enumerate(self._pending_raw_dedup):
+            if q_name == name and q_down == is_down:
+                del self._pending_raw_dedup[idx]
+                return True
         self._win_queue.put_nowait((name, is_down))
         return True
 
@@ -642,7 +663,10 @@ class KeyHook:
         if not self._running and self._listener is None:
             with self._lock:
                 self._cancel_timer()
+                self._cancel_triple_timer()
                 self._zbuf.clear()
+                self._zdown_times.clear()
+                self._zlast_down = 0.0
                 self._triple_ups_left = 0
                 for name in list(self._down):
                     self._emit(name, False)
@@ -671,7 +695,10 @@ class KeyHook:
             logger.warning("Error stopping keyboard hook: %s", exc)
         with self._lock:
             self._cancel_timer()
+            self._cancel_triple_timer()
             self._zbuf.clear()
+            self._zdown_times.clear()
+            self._zlast_down = 0.0
             self._triple_ups_left = 0
             for name in list(self._down):
                 self._emit(name, False)
@@ -757,23 +784,23 @@ class KeyHook:
                                     # Consumer Control events that do not emit RIM_TYPEKEYBOARD
                                     # WM_INPUT packets and will launch Chrome/Mail/Calc if
                                     # either key-down or key-up reaches CallNextHookEx.
-                                    self._win_queue.put_nowait((name, is_down))
+                                    self._queue_from_ll(name, is_down)
                                     return 1
                                 if not self._target_device:
                                     # "All Connected Keypads (Default)" mode:
                                     # Dispatch immediately and suppress if Exclusive Mode is on.
-                                    self._win_queue.put_nowait((name, is_down))
+                                    self._queue_from_ll(name, is_down)
                                     if self._suppress:
                                         return 1
                                 else:
                                     # Specific USB keypad selected:
-                                    # Suppress numpad keys when the active Raw Input device
-                                    # matches the selected USB keypad, while allowing WM_KEYUP
-                                    # and non-matching keyboards to reach WM_INPUT so primary
-                                    # keyboard typing is never blocked.
+                                    # Only queue in _ll_proc when suppressing (return 1);
+                                    # non-suppressed events (such as WM_KEYUP) pass through
+                                    # CallNextHookEx and are queued once by _process_raw_keyboard
+                                    # after verifying hDevice.
                                     if self._last_raw_matched and name not in ("Tab", "Backspace"):
-                                        self._win_queue.put_nowait((name, is_down))
                                         if is_down and self._suppress:
+                                            self._queue_from_ll(name, is_down)
                                             return 1
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
@@ -884,48 +911,85 @@ class KeyHook:
             pass
 
     def _zero_event(self, down: bool) -> None:
-        now = time.monotonic()
-        # --- finishing a recognised 000 press (waiting for its releases)
-        if self._triple_ups_left:
-            if down and now - self._triple_started > self.TRIPLE_STALE_SECONDS:
-                # releases were lost; recover and treat this as a new press
-                self._triple_ups_left = 0
-                self._emit("000", False)
+        now = time.perf_counter()
+        delta_ms = (now - self._last_zero_ts) * 1000.0 if self._last_zero_ts > 0.0 else 0.0
+        self._last_zero_ts = now
+        event_type = "KEYDOWN" if down else "KEYUP"
+        logger.info(
+            "VK_NUMPAD0 (%s, timestamp=%.6f, delta_ms=%.2f)",
+            event_type,
+            now,
+            delta_ms,
+        )
+
+        # --- 1. Finishing a recognised '000' press (waiting for its releases)
+        if self._triple_ups_left > 0:
+            if down:
+                if (now - self._triple_started) > max(self.burst_window, 0.050):
+                    # Previous '000' burst has finished; emit Note Off and start fresh
+                    self._cancel_triple_timer()
+                    self._triple_ups_left = 0
+                    self._emit("000", False)
+                else:
+                    return
             else:
-                if not down:
-                    self._triple_ups_left -= 1
-                    if self._triple_ups_left == 0:
-                        self._emit("000", False)
+                self._triple_ups_left = max(0, self._triple_ups_left - 1)
+                if self._triple_ups_left == 0:
+                    self._cancel_triple_timer()
+                    self._emit("000", False)
                 return
-        # --- a burst whose window has expired is flushed *now*, so correctness
-        # never depends on how quickly the flush timer thread gets scheduled
-        if self._zbuf and now - self._zfirst > self.burst_window:
+
+        # --- 2. A burst whose consecutive-press window has expired is flushed *now*,
+        # so correctness never depends on how quickly the flush timer thread gets scheduled
+        if self._zbuf and self._zlast_down > 0.0 and (now - self._zlast_down) > self.burst_window:
             self._cancel_timer()
-            pending, self._zbuf = self._zbuf, []
+            pending, self._zbuf = self._zbuf[:], []
+            self._zdown_times.clear()
+            self._zlast_down = 0.0
             for pending_down in pending:
                 self._emit("0", pending_down)
-        # --- no burst in progress
+
+        # --- 3. No burst in progress
         if not self._zbuf:
             if "0" in self._down:
                 self._emit("0", down)  # auto-repeat is ignored, release passes
                 return
             if not down:
                 return  # stray release
-        if not self._zbuf:
-            self._zfirst = now
+
+        # --- 4. Rolling triplet burst evaluation (consecutive '0' presses within burst_window)
         self._zbuf.append(down)
-        downs = sum(self._zbuf)
-        if downs >= 3:
+        if down:
+            if self._zdown_times and (now - self._zdown_times[-1]) > self.burst_window:
+                self._zdown_times.clear()
+            self._zdown_times.append(now)
+            if len(self._zdown_times) > 3:
+                self._zdown_times = self._zdown_times[-3:]
+            self._zlast_down = now
+
+            if len(self._zdown_times) >= 3:
+                self._cancel_timer()
+                if "0" in self._down:
+                    self._emit("0", False)
+                downs = sum(1 for x in self._zbuf if x)
+                ups = len(self._zbuf) - downs
+                self._zbuf.clear()
+                self._zdown_times.clear()
+                self._zlast_down = 0.0
+                logger.info(
+                    "VK_NUMPAD0 triplet detected -> firing '000' Note On (MIDI Note 37)"
+                )
+                self._emit("000", True)
+                self._triple_started = now
+                self._triple_ups_left = max(0, 3 - ups)
+                if self._triple_ups_left == 0:
+                    self._emit("000", False)
+                else:
+                    self._start_triple_timer()
+                return
+
+            # 1st or 2nd '0' press: (re)schedule the 50 ms window timer from this press
             self._cancel_timer()
-            ups = len(self._zbuf) - downs
-            self._zbuf.clear()
-            self._emit("000", True)
-            self._triple_started = now
-            self._triple_ups_left = 3 - ups
-            if self._triple_ups_left == 0:
-                self._emit("000", False)
-            return
-        if self._timer is None:
             self._timer = threading.Timer(self.burst_window, self._flush_zero)
             self._timer.daemon = True
             self._timer.start()
@@ -935,7 +999,9 @@ class KeyHook:
             if self._timer is not threading.current_thread():
                 return  # cancelled while we were waiting for the lock
             self._timer = None
-            pending, self._zbuf = self._zbuf, []
+            pending, self._zbuf = self._zbuf[:], []
+            self._zdown_times.clear()
+            self._zlast_down = 0.0
             for down in pending:
                 self._emit("0", down)
 
@@ -943,3 +1009,24 @@ class KeyHook:
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
+
+    def _start_triple_timer(self) -> None:
+        self._cancel_triple_timer()
+        delay = max(0.25, self.burst_window * 4.0)
+        self._triple_timer = threading.Timer(delay, self._flush_triple)
+        self._triple_timer.daemon = True
+        self._triple_timer.start()
+
+    def _flush_triple(self) -> None:
+        with self._lock:
+            if self._triple_timer is not threading.current_thread():
+                return
+            self._triple_timer = None
+            if self._triple_ups_left > 0:
+                self._triple_ups_left = 0
+                self._emit("000", False)
+
+    def _cancel_triple_timer(self) -> None:
+        if self._triple_timer is not None:
+            self._triple_timer.cancel()
+            self._triple_timer = None

@@ -8,5 +8,5 @@
   "suppress_keys": true,
   "exclusive_mode": true,
   "triple_zero_detection": true,
-  "burst_window_ms": 35
+  "burst_window_ms": 50
 }
