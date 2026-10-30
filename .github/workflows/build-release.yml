@@ -41,14 +41,26 @@ jobs:
           architecture: ${{ matrix.python_arch }}
 
       - name: Install dependencies
+        shell: bash
+        env:
+          ARCHFLAGS: ${{ matrix.target_arch && format('-arch {0}', matrix.target_arch) || '' }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            arch -${{ matrix.target_arch }} "$pythonLocation/bin/python" -m pip install --upgrade pip
+            arch -${{ matrix.target_arch }} "$pythonLocation/bin/python" -m pip install -r requirements.txt
+          else
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt
+          fi
 
       - name: Resolve version (version.py is the source of truth)
         shell: bash
         run: |
-          VERSION="$(python -c 'from version import VERSION; print(VERSION)')"
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            VERSION="$(arch -${{ matrix.target_arch }} "$pythonLocation/bin/python" -c 'from version import VERSION; print(VERSION)')"
+          else
+            VERSION="$(python -c 'from version import VERSION; print(VERSION)')"
+          fi
           if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match version.py (v$VERSION)"
             exit 1
@@ -57,12 +69,25 @@ jobs:
           echo "Building NumpadToMIDI v$VERSION"
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            arch -${{ matrix.target_arch }} "$pythonLocation/bin/python" -m unittest discover -s tests -v
+          else
+            python -m unittest discover -s tests -v
+          fi
 
       - name: Build with PyInstaller
+        shell: bash
         env:
           TARGET_ARCH: ${{ matrix.target_arch }}
-        run: pyinstaller build.spec --noconfirm
+          ARCHFLAGS: ${{ matrix.target_arch && format('-arch {0}', matrix.target_arch) || '' }}
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            arch -${{ matrix.target_arch }} "$pythonLocation/bin/python" -m PyInstaller build.spec --noconfirm
+          else
+            pyinstaller build.spec --noconfirm
+          fi
 
       # ------------------------------------------------------------ Windows
       - name: Smoke test frozen binary (Windows)
