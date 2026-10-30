@@ -60,13 +60,9 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Build with PyInstaller
-        shell: bash
-        run: |
-          if [[ "${{ runner.os }}" == "macOS" && -n "${{ matrix.target_arch }}" ]]; then
-            pyinstaller build.spec --noconfirm --target-arch "${{ matrix.target_arch }}"
-          else
-            pyinstaller build.spec --noconfirm
-          fi
+        env:
+          TARGET_ARCH: ${{ matrix.target_arch }}
+        run: pyinstaller build.spec --noconfirm
 
       # ------------------------------------------------------------ Windows
       - name: Smoke test frozen binary (Windows)

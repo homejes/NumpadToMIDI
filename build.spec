@@ -2,6 +2,7 @@
 # PyInstaller spec for NumpadToMIDI.
 #   Windows -> dist/NumpadToMIDI-Windows.exe   (single file)
 #   macOS   -> dist/NumpadToMIDI.app           (zipped to NumpadToMIDI-macOS.zip by CI)
+import os
 import sys
 
 from PyInstaller.utils.hooks import collect_submodules
@@ -41,6 +42,7 @@ if sys.platform == "darwin":
         upx=False,
         console=False,
         argv_emulation=False,
+        target_arch=os.environ.get("TARGET_ARCH") or None,
         icon="assets/icon.icns",
     )
     coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="NumpadToMIDI")
