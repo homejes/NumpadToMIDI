@@ -170,11 +170,23 @@ _THREAD_PRIORITY_HIGHEST = 2
 
 # --- macOS key codes (kVK_ANSI_Keypad*) ----------------------------------------
 MAC_VK: dict[int, str] = {
+    # Keypad with NumLock ON (kVK_ANSI_Keypad*)
     82: "0", 83: "1", 84: "2", 85: "3", 86: "4", 87: "5", 88: "6", 89: "7",
     91: "8", 92: "9",
     65: ".", 67: "*", 69: "+", 71: "NumLock",  # keypad Clear == NumLock
-    75: "/", 76: "Enter", 78: "-", 115: "Home",
+    75: "/", 76: "Enter", 78: "-",
     48: "Tab", 51: "Backspace",
+    # Keypad with NumLock OFF (navigation / PC cluster keycodes on USB numpads)
+    114: "0",          # kVK_Help (PC Insert / '0' / '000' burst)
+    117: ".",          # kVK_ForwardDelete (PC Delete / '.')
+    119: "1",          # kVK_End (Numpad 1)
+    125: "2",          # kVK_DownArrow (Numpad 2)
+    121: "3",          # kVK_PageDown (Numpad 3)
+    123: "4",          # kVK_LeftArrow (Numpad 4)
+    124: "6",          # kVK_RightArrow (Numpad 6)
+    126: "8",          # kVK_UpArrow (Numpad 8)
+    116: "9",          # kVK_PageUp (Numpad 9)
+    115: "Home",       # kVK_Home (top-left Home key or Numpad 7)
 }
 
 
@@ -225,9 +237,9 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
 
 def zero_vk_label(vk: int) -> str:
     """Human-readable source label for a physical '0' keystroke (for diagnostics)."""
-    if vk == VK_NUMPAD0:
+    if vk in (VK_NUMPAD0, 82):
         return "VK_NUMPAD0/NumLock-ON"
-    if vk == VK_INSERT:
+    if vk in (VK_INSERT, 114):
         return "VK_INSERT/NumLock-OFF"
     if vk:
         return f"VK_0x{vk:02X}"
@@ -458,8 +470,228 @@ def _query_raw_device_path(h_device: int) -> str:
     return ""
 
 
+def check_macos_accessibility(prompt: bool = True) -> bool:
+    """Check if the process has macOS Accessibility permission.
+
+    If prompt=True and permission is not granted, macOS displays a system dialog
+    directing the user to System Settings > Privacy & Security > Accessibility.
+    """
+    if not IS_MAC:
+        return True
+    try:
+        from ctypes import (
+            POINTER, byref, c_bool, c_char_p, c_long, c_uint32, c_void_p, cdll, util,
+        )
+
+        app_services_path = (
+            util.find_library("ApplicationServices")
+            or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        cf_path = (
+            util.find_library("CoreFoundation")
+            or "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+
+        app_services = cdll.LoadLibrary(app_services_path)
+        cf = cdll.LoadLibrary(cf_path)
+
+        ax_is_trusted = app_services.AXIsProcessTrustedWithOptions
+        ax_is_trusted.argtypes = [c_void_p]
+        ax_is_trusted.restype = c_bool
+
+        if not prompt:
+            return bool(ax_is_trusted(None))
+
+        k_cf_boolean_true = c_void_p.in_dll(cf, "kCFBooleanTrue")
+
+        cf_string_create = cf.CFStringCreateWithCString
+        cf_string_create.argtypes = [c_void_p, c_char_p, c_uint32]
+        cf_string_create.restype = c_void_p
+
+        cf_dictionary_create = cf.CFDictionaryCreate
+        cf_dictionary_create.argtypes = [
+            c_void_p,
+            POINTER(c_void_p),
+            POINTER(c_void_p),
+            c_long,
+            c_void_p,
+            c_void_p,
+        ]
+        cf_dictionary_create.restype = c_void_p
+
+        cf_release = cf.CFRelease
+        cf_release.argtypes = [c_void_p]
+
+        key_str = cf_string_create(None, b"AXTrustedCheckOptionPrompt", 0x08000100)
+        try:
+            keys = (c_void_p * 1)(key_str)
+            values = (c_void_p * 1)(k_cf_boolean_true.value)
+            options = cf_dictionary_create(None, keys, values, 1, None, None)
+            try:
+                trusted = bool(ax_is_trusted(options))
+                return trusted
+            finally:
+                if options:
+                    cf_release(options)
+        finally:
+            if key_str:
+                cf_release(key_str)
+    except Exception as exc:
+        logger.warning("check_macos_accessibility error: %s", exc)
+        return True
+
+
+def list_macos_keyboard_devices() -> list[KeyboardDevice]:
+    """Enumerate connected USB keyboard/keypad devices on macOS via IOKit IOHIDManager."""
+    if not IS_MAC:
+        return []
+    devices: list[KeyboardDevice] = []
+    try:
+        from ctypes import (
+            POINTER, byref, c_bool, c_char_p, c_int32, c_long, c_uint32, c_void_p, cdll,
+            create_string_buffer, util,
+        )
+
+        iokit_path = (
+            util.find_library("IOKit")
+            or "/System/Library/Frameworks/IOKit.framework/IOKit"
+        )
+        cf_path = (
+            util.find_library("CoreFoundation")
+            or "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+
+        iokit = cdll.LoadLibrary(iokit_path)
+        cf = cdll.LoadLibrary(cf_path)
+
+        # CF function declarations
+        cf.CFRelease.argtypes = [c_void_p]
+        cf.CFSetGetCount.argtypes = [c_void_p]
+        cf.CFSetGetCount.restype = c_long
+        cf.CFSetGetValues.argtypes = [c_void_p, POINTER(c_void_p)]
+        cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
+        cf.CFStringCreateWithCString.restype = c_void_p
+        cf.CFStringGetCString.argtypes = [c_void_p, c_char_p, c_long, c_uint32]
+        cf.CFStringGetCString.restype = c_bool
+        cf.CFNumberGetValue.argtypes = [c_void_p, c_int32, c_void_p]
+        cf.CFNumberGetValue.restype = c_bool
+
+        # IOHIDManager function declarations
+        iokit.IOHIDManagerCreate.argtypes = [c_void_p, c_uint32]
+        iokit.IOHIDManagerCreate.restype = c_void_p
+        iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
+        iokit.IOHIDManagerOpen.argtypes = [c_void_p, c_uint32]
+        iokit.IOHIDManagerOpen.restype = c_int32
+        iokit.IOHIDManagerClose.argtypes = [c_void_p, c_uint32]
+        iokit.IOHIDManagerClose.restype = c_int32
+        iokit.IOHIDManagerCopyDevices.argtypes = [c_void_p]
+        iokit.IOHIDManagerCopyDevices.restype = c_void_p
+        iokit.IOHIDDeviceGetProperty.argtypes = [c_void_p, c_void_p]
+        iokit.IOHIDDeviceGetProperty.restype = c_void_p
+
+        manager = iokit.IOHIDManagerCreate(None, 0)
+        if not manager:
+            return []
+
+        try:
+            iokit.IOHIDManagerSetDeviceMatching(manager, None)
+            iokit.IOHIDManagerOpen(manager, 0)
+            dev_set = iokit.IOHIDManagerCopyDevices(manager)
+            if not dev_set:
+                return []
+
+            try:
+                count = int(cf.CFSetGetCount(dev_set))
+                if count <= 0:
+                    return []
+                dev_array = (c_void_p * count)()
+                cf.CFSetGetValues(dev_set, dev_array)
+
+                k_product = cf.CFStringCreateWithCString(None, b"Product", 0x08000100)
+                k_vid = cf.CFStringCreateWithCString(None, b"VendorID", 0x08000100)
+                k_pid = cf.CFStringCreateWithCString(None, b"ProductID", 0x08000100)
+                k_page = cf.CFStringCreateWithCString(None, b"PrimaryUsagePage", 0x08000100)
+                k_usage = cf.CFStringCreateWithCString(None, b"PrimaryUsage", 0x08000100)
+                k_entry_id = cf.CFStringCreateWithCString(None, b"IORegistryEntryID", 0x08000100)
+
+                seen_ids: dict[str, KeyboardDevice] = {}
+
+                for i in range(count):
+                    dev_ref = dev_array[i]
+                    if not dev_ref:
+                        continue
+
+                    usage_page = c_int32(0)
+                    page_prop = iokit.IOHIDDeviceGetProperty(dev_ref, k_page)
+                    if page_prop:
+                        cf.CFNumberGetValue(page_prop, 3, byref(usage_page))
+
+                    usage = c_int32(0)
+                    usage_prop = iokit.IOHIDDeviceGetProperty(dev_ref, k_usage)
+                    if usage_prop:
+                        cf.CFNumberGetValue(usage_prop, 3, byref(usage))
+
+                    if usage_page.value != 0 and usage_page.value != 1:
+                        continue
+                    if usage.value != 0 and usage.value not in (6, 7):
+                        continue
+
+                    vid = c_int32(0)
+                    vid_prop = iokit.IOHIDDeviceGetProperty(dev_ref, k_vid)
+                    if vid_prop:
+                        cf.CFNumberGetValue(vid_prop, 3, byref(vid))
+
+                    pid = c_int32(0)
+                    pid_prop = iokit.IOHIDDeviceGetProperty(dev_ref, k_pid)
+                    if pid_prop:
+                        cf.CFNumberGetValue(pid_prop, 3, byref(pid))
+
+                    product_str = "USB Keypad"
+                    prod_prop = iokit.IOHIDDeviceGetProperty(dev_ref, k_product)
+                    if prod_prop:
+                        buf = create_string_buffer(256)
+                        if cf.CFStringGetCString(prod_prop, buf, 256, 0x08000100):
+                            product_str = buf.value.decode("utf-8", errors="replace")
+
+                    handle_val = int(dev_ref)
+                    entry_prop = iokit.IOHIDDeviceGetProperty(dev_ref, k_entry_id)
+                    if entry_prop:
+                        entry_num = c_long(0)
+                        if cf.CFNumberGetValue(entry_prop, 4, byref(entry_num)):
+                            handle_val = int(entry_num.value)
+
+                    hw_id = f"HID\\VID_{vid.value:04X}&PID_{pid.value:04X}"
+                    label = (
+                        f"{product_str} - USB ({hw_id})"
+                        if "USB" not in product_str.upper()
+                        else f"{product_str} ({hw_id})"
+                    )
+
+                    if hw_id in seen_ids:
+                        seen_ids[hw_id].handles.add(handle_val)
+                    else:
+                        dev = KeyboardDevice(hw_id, label, f"IOHID:{hw_id}", {handle_val})
+                        seen_ids[hw_id] = dev
+                        devices.append(dev)
+
+                for k in (k_product, k_vid, k_pid, k_page, k_usage, k_entry_id):
+                    if k:
+                        cf.CFRelease(k)
+            finally:
+                cf.CFRelease(dev_set)
+        finally:
+            iokit.IOHIDManagerClose(manager, 0)
+            cf.CFRelease(manager)
+    except Exception as exc:
+        logger.warning("list_macos_keyboard_devices failed: %s", exc)
+
+    return devices
+
+
 def list_keyboard_devices() -> list[KeyboardDevice]:
-    """Enumerate connected keyboard/keypad devices via Win32 Raw Input API."""
+    """Enumerate connected keyboard/keypad devices via Win32 Raw Input API or macOS IOKit."""
+    if IS_MAC:
+        return list_macos_keyboard_devices()
     if not IS_WIN:
         return []
     raw_handles: list[int] = []
@@ -874,8 +1106,10 @@ class KeyHook:
                                         return 1
                                 else:
                                     # Specific USB keypad selected:
-                                    # Suppress and dispatch in _ll_proc when matched and Exclusive Mode is on
-                                    if self._last_raw_matched and name not in ("Tab", "Backspace"):
+                                    # Suppress and dispatch in _ll_proc when matched or when it's keypad 0/Insert
+                                    # (non-extended scancode 0x52 or VK_NUMPAD0) so '000' burst is never leaked
+                                    is_keypad_zero = (int(kb.scanCode) == 0x52 and not extended) or (vk_code == VK_NUMPAD0)
+                                    if (self._last_raw_matched or is_keypad_zero) and name not in ("Tab", "Backspace"):
                                         if self._suppress:
                                             self._queue_from_ll(name, is_down, vk_code)
                                             return 1
@@ -945,9 +1179,24 @@ class KeyHook:
             name = MAC_VK.get(int(vk))
             if name is None:
                 return event
-            self._dispatch(name, event_type == Quartz.kCGEventKeyDown)
+
+            # Device filtering on macOS if a specific target device is selected
+            if self._target_device:
+                sender_id = 0
+                try:
+                    # Field 87 is kCGEventSourceUnixEffectiveUID / IORegistryEntryID on macOS
+                    sender_id = Quartz.CGEventGetIntegerValueField(event, 87)
+                except Exception:
+                    pass
+                if sender_id and not self.matches_device(sender_id):
+                    return event
+
+            # Map keycode 114 (kVK_Help / PC Insert) to VK_INSERT for NumLock-OFF burst detection
+            mapped_vk = VK_INSERT if int(vk) == 114 else int(vk)
+            self._dispatch(name, event_type == Quartz.kCGEventKeyDown, mapped_vk)
             return None if (self._suppress or name in _ALWAYS_SUPPRESS_KEYS) else event
-        except Exception:
+        except Exception as exc:
+            logger.debug("mac_intercept error: %s", exc)
             return event
 
     def _generic_press(self, key) -> None:  # pragma: no cover
@@ -1006,7 +1255,7 @@ class KeyHook:
 
         eff_window = max(self.burst_window, 0.100)
         # Slower firmware debounce/scan cadence observed on NumLock-OFF VK_INSERT bursts
-        if vk == VK_INSERT or self._zlast_vk == VK_INSERT:
+        if vk in (VK_INSERT, 114) or self._zlast_vk in (VK_INSERT, 114):
             eff_window = max(eff_window, 0.140)
         if vk:
             self._zlast_vk = vk

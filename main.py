@@ -88,7 +88,7 @@ from PyQt6.QtWidgets import (
 
 from key_hook import (
     ALL_DEVICES_ID, ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
-    KEY_SPAN, KeyHook,
+    KEY_SPAN, KeyHook, check_macos_accessibility,
 )
 from midi_engine import MidiEngine, note_name
 from version import VERSION
@@ -967,10 +967,14 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
     if start_hook:
         ctrl.hook.start()
         if sys.platform == "darwin":
-            ctrl.log.emit(
-                f"{ctrl._ts()}  macOS: if keys are not detected, grant Input Monitoring / "
-                "Accessibility to this app in System Settings > Privacy & Security."
-            )
+            trusted = check_macos_accessibility(prompt=True)
+            if not trusted:
+                ctrl.log.emit(
+                    f"{ctrl._ts()}  macOS: Accessibility permission required to capture & block keypad keys. "
+                    "Please grant NumpadToMIDI in System Settings > Privacy & Security > Accessibility."
+                )
+            else:
+                ctrl.log.emit(f"{ctrl._ts()}  macOS: Accessibility permission verified.")
     return app, ctrl, win
 
 

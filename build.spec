@@ -9,7 +9,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 _version = {}
 exec(open("version.py", encoding="utf-8").read(), _version)
-APP_VERSION = _version.get("VERSION", "1.5.0")
+APP_VERSION = _version.get("VERSION", "1.5.2")
 
 hiddenimports = collect_submodules("rtmidi")
 if sys.platform == "win32":

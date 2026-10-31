@@ -23,7 +23,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - macOS: native **virtual MIDI source** called `NumpadToMIDI` with native builds for both Intel (`x86_64`) and Apple Silicon (`arm64`).
 - Windows: creates a virtual MIDI port called **`NumpadToMIDI`** directly via the
   [teVirtualMIDI](https://www.tobias-erichsen.de/software/virtualmidi.html) driver
-  (automatically installed by `NumpadToMIDI-Setup-v1.5.0.exe`). If the driver is not
+  (automatically installed by `NumpadToMIDI-Setup-v1.5.2.exe`). If the driver is not
   present, falls back to any existing loopback port (e.g.
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)), then to the first
   available output, or runs silently if none exists.
@@ -55,22 +55,22 @@ Output: `dist/NumpadToMIDI-Windows.exe` (Windows) or `dist/NumpadToMIDI.app` (ma
 To build the platform installers:
 - **Windows (Inno Setup 6.3+):**
   ```powershell
-  ISCC.exe /DAppVersion=1.5.0 installer\windows_installer.iss
+  ISCC.exe /DAppVersion=1.5.2 installer\windows_installer.iss
   ```
-  Produces `dist/NumpadToMIDI-Setup-v1.5.0.exe` (bundles the app, creates Desktop and
+  Produces `dist/NumpadToMIDI-Setup-v1.5.2.exe` (bundles the app, creates Desktop and
   Start Menu shortcuts, elevates to Administrator, and silently downloads + installs
   the `teVirtualMIDI` virtual MIDI driver if missing).
 - **macOS (DMG with `/Applications` link and setup guide):**
   ```bash
-  bash installer/make_dmg.sh 1.5.0 Intel         # Intel x86_64 Macs
-  bash installer/make_dmg.sh 1.5.0 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
+  bash installer/make_dmg.sh 1.5.2 Intel         # Intel x86_64 Macs
+  bash installer/make_dmg.sh 1.5.2 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
   ```
-  Produces `dist/NumpadToMIDI-macOS-Intel-v1.5.0.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v1.5.0.dmg` (and `dist/NumpadToMIDI-macOS-v1.5.0.dmg`).
+  Produces `dist/NumpadToMIDI-macOS-Intel-v1.5.2.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v1.5.2.dmg` (and `dist/NumpadToMIDI-macOS-v1.5.2.dmg`).
 
 ## Releases / CI
 `.github/workflows/build-release.yml` builds both platforms on every `v*` tag (and manual
-`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.5.0.exe`,
-`NumpadToMIDI-macOS-Intel-v1.5.0.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v1.5.0.dmg`
+`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.5.2.exe`,
+`NumpadToMIDI-macOS-Intel-v1.5.2.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v1.5.2.dmg`
 to the GitHub Release.
 
 ## Notes & limitations

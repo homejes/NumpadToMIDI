@@ -64,6 +64,29 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(win_key_name(36, 0, False), "7")          # NumLock-off VK_HOME (scan 0)
         self.assertIsNone(win_key_name(65, 0, False))
 
+    def test_macos_mapping(self):
+        from key_hook import MAC_VK
+        # NumLock ON keycodes
+        self.assertEqual(MAC_VK[82], "0")
+        self.assertEqual(MAC_VK[65], ".")
+        self.assertEqual(MAC_VK[71], "NumLock")
+        self.assertEqual(MAC_VK[76], "Enter")
+        # NumLock OFF keycodes
+        self.assertEqual(MAC_VK[114], "0")          # kVK_Help / PC Insert -> '0' / '000'
+        self.assertEqual(MAC_VK[117], ".")          # kVK_ForwardDelete / PC Delete -> '.'
+        self.assertEqual(MAC_VK[119], "1")          # kVK_End
+        self.assertEqual(MAC_VK[125], "2")          # kVK_Down
+        self.assertEqual(MAC_VK[121], "3")          # kVK_PageDown
+        self.assertEqual(MAC_VK[123], "4")          # kVK_Left
+        self.assertEqual(MAC_VK[87], "5")           # 5
+        self.assertEqual(MAC_VK[124], "6")          # kVK_Right
+        self.assertEqual(MAC_VK[89], "7")           # 7
+        self.assertEqual(MAC_VK[126], "8")          # kVK_Up
+        self.assertEqual(MAC_VK[116], "9")          # kVK_PageUp
+        self.assertEqual(MAC_VK[115], "Home")       # kVK_Home
+        self.assertEqual(MAC_VK[48], "Tab")
+        self.assertEqual(MAC_VK[51], "Backspace")
+
     def test_exclusive_mode_default_on(self):
         hook, _ = make()
         self.assertTrue(hook._suppress)
@@ -499,6 +522,34 @@ class StartupSafetyTests(unittest.TestCase):
                 hook._dispatch(item[0], item[1], item[2])
         hook.stop()
         self.assertEqual(rec.events, [("000", True), ("000", False)])
+
+    def test_macos_numlock_off_burst_and_labels(self):
+        """macOS keycode 114 (PC Insert) maps to 0 and rapid triplet fires '000'."""
+        from key_hook import zero_vk_label, VK_NUMPAD0, VK_INSERT
+
+        self.assertEqual(zero_vk_label(VK_NUMPAD0), "VK_NUMPAD0/NumLock-ON")
+        self.assertEqual(zero_vk_label(82), "VK_NUMPAD0/NumLock-ON")
+        self.assertEqual(zero_vk_label(VK_INSERT), "VK_INSERT/NumLock-OFF")
+        self.assertEqual(zero_vk_label(114), "VK_INSERT/NumLock-OFF")
+
+        hook, rec = make(burst_window_ms=75)
+        # 3 rapid strokes of keycode 114
+        for _ in range(3):
+            hook._dispatch("0", True, 114)
+            hook._dispatch("0", False, 114)
+        hook.stop()
+        self.assertEqual(rec.events, [("000", True), ("000", False)])
+
+    def test_check_macos_accessibility(self):
+        from key_hook import check_macos_accessibility
+        # Under Windows/Linux, always returns True
+        self.assertTrue(check_macos_accessibility(prompt=False))
+
+    def test_list_macos_keyboard_devices(self):
+        from key_hook import list_macos_keyboard_devices
+        # On non-macOS, returns empty list
+        devs = list_macos_keyboard_devices()
+        self.assertIsInstance(devs, list)
 
 
 if __name__ == "__main__":
