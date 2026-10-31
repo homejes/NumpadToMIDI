@@ -255,6 +255,21 @@ HID_KEYPAD_USAGE_MAP: dict[int, str] = {
     0x50: "4",          # Keyboard LeftArrow
     0x4F: "6",          # Keyboard RightArrow
     0x49: "0",          # Keyboard Insert
+    # Fallbacks for standard keyboard number row & symbols
+    0x1E: "1",          # Keyboard 1
+    0x1F: "2",          # Keyboard 2
+    0x20: "3",          # Keyboard 3
+    0x21: "4",          # Keyboard 4
+    0x22: "5",          # Keyboard 5
+    0x23: "6",          # Keyboard 6
+    0x24: "7",          # Keyboard 7
+    0x25: "8",          # Keyboard 8
+    0x26: "9",          # Keyboard 9
+    0x27: "0",          # Keyboard 0
+    0x2D: "-",          # Keyboard -
+    0x2E: "+",          # Keyboard = / +
+    0x37: ".",          # Keyboard .
+    0x38: "/",          # Keyboard /
 }
 
 # USB HID Usage Page 0x0C (Consumer Control) Usage IDs to Keypad Names:
@@ -262,6 +277,10 @@ HID_CONSUMER_USAGE_MAP: dict[int, str] = {
     0x0223: "Home",     # AC Home
     0x018A: "Email",    # AL Email Reader
     0x0192: "Calc",     # AL Calculator
+    0x0194: "Home",     # AL Local Machine Browser
+    0x0196: "Calc",     # AL Internet Browser / Calculator variant
+    0x0221: "Home",     # AC Search
+    0x0224: "Home",     # AC Back
 }
 
 
@@ -1013,9 +1032,8 @@ class KeyHook:
         # Non-Windows fallback listener & macOS native CGEventTap / HID state
         self._listener = None
         self._mac_thread: Optional[threading.Thread] = None
-        self._mac_hid_thread: Optional[threading.Thread] = None
-        self._mac_tap_ref = None
-        self._mac_run_loop_ref = None
+        self._mac_iohid_manager = None
+        self._mac_value_cb_ref = None
         # Windows native WH_KEYBOARD_LL + WM_INPUT state
         self._running = False
         self._win_thread: Optional[threading.Thread] = None
@@ -1171,7 +1189,7 @@ class KeyHook:
             self._running = False
 
     def stop(self) -> None:
-        if not self._running and self._listener is None and self._mac_thread is None and self._mac_hid_thread is None:
+        if not self._running and self._listener is None and self._mac_thread is None:
             with self._lock:
                 self._cancel_timer()
                 self._cancel_triple_timer()
@@ -1431,239 +1449,198 @@ class KeyHook:
         return kb_paths, cons_paths
 
     def _mac_start(self) -> None:
-        """Start macOS keyboard intercept (CGEventTap / pynput) and Consumer HID reader."""
+        """Start macOS native IOHIDManager input listener."""
         self._mac_thread = threading.Thread(
-            target=self._mac_run_loop, name="NumpadMacEventTap", daemon=True
+            target=self._mac_iohid_loop, name="NumpadMacIOHIDWorker", daemon=True
         )
         self._mac_thread.start()
 
-        self._mac_hid_thread = threading.Thread(
-            target=self._mac_consumer_loop, name="NumpadMacConsumerHID", daemon=True
-        )
-        self._mac_hid_thread.start()
-
     def _mac_stop(self) -> None:
-        """Stop all macOS worker threads and event taps."""
-        if self._mac_tap_ref is not None:
-            try:
-                import Quartz
-                Quartz.CGEventTapEnable(self._mac_tap_ref, False)
-            except Exception:
-                pass
-            self._mac_tap_ref = None
-        if self._mac_run_loop_ref is not None:
-            try:
-                import Quartz
-                Quartz.CFRunLoopStop(self._mac_run_loop_ref)
-            except Exception:
-                pass
-            self._mac_run_loop_ref = None
+        """Stop macOS native IOHIDManager run loop."""
         if self._mac_thread is not None:
             self._mac_thread.join(timeout=1.0)
             self._mac_thread = None
-        if self._mac_hid_thread is not None:
-            self._mac_hid_thread.join(timeout=1.0)
-            self._mac_hid_thread = None
-        if self._listener is not None:
+
+    def _mac_iohid_loop(self) -> None:
+        """Dedicated background daemon thread running native IOHIDManager with value and report callbacks."""
+        if not IS_MAC:
+            return
+        manager = None
+        current_rl = None
+        k_cf_default_mode = None
+        k_vid = None
+        k_pid = None
+        try:
+            from ctypes import (
+                CFUNCTYPE, POINTER, byref, c_bool, c_char_p, c_double, c_int32, c_long,
+                c_uint8, c_uint32, c_void_p, cdll, util,
+            )
+
+            iokit_path = (
+                util.find_library("IOKit")
+                or "/System/Library/Frameworks/IOKit.framework/IOKit"
+            )
+            cf_path = (
+                util.find_library("CoreFoundation")
+                or "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+            )
+
+            iokit = cdll.LoadLibrary(iokit_path)
+            cf = cdll.LoadLibrary(cf_path)
+
+            cf.CFRelease.argtypes = [c_void_p]
+            cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
+            cf.CFStringCreateWithCString.restype = c_void_p
+            cf.CFNumberGetValue.argtypes = [c_void_p, c_int32, c_void_p]
+            cf.CFNumberGetValue.restype = c_bool
+            cf.CFRunLoopGetCurrent.restype = c_void_p
+            cf.CFRunLoopRunInMode.argtypes = [c_void_p, c_double, c_bool]
+            cf.CFRunLoopRunInMode.restype = c_int32
+
+            iokit.IOHIDManagerCreate.argtypes = [c_void_p, c_uint32]
+            iokit.IOHIDManagerCreate.restype = c_void_p
+            iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
+            iokit.IOHIDManagerSetDeviceMatching.restype = None
+
+            IOHIDValueCallback = CFUNCTYPE(
+                None, c_void_p, c_int32, c_void_p, c_void_p
+            )
+
+            iokit.IOHIDManagerRegisterInputValueCallback.argtypes = [
+                c_void_p, IOHIDValueCallback, c_void_p
+            ]
+            iokit.IOHIDManagerRegisterInputValueCallback.restype = None
+
+            iokit.IOHIDValueGetElement.argtypes = [c_void_p]
+            iokit.IOHIDValueGetElement.restype = c_void_p
+            iokit.IOHIDElementGetUsagePage.argtypes = [c_void_p]
+            iokit.IOHIDElementGetUsagePage.restype = c_uint32
+            iokit.IOHIDElementGetUsage.argtypes = [c_void_p]
+            iokit.IOHIDElementGetUsage.restype = c_uint32
+            iokit.IOHIDValueGetIntegerValue.argtypes = [c_void_p]
+            iokit.IOHIDValueGetIntegerValue.restype = c_long
+
+            iokit.IOHIDManagerScheduleWithRunLoop.argtypes = [c_void_p, c_void_p, c_void_p]
+            iokit.IOHIDManagerScheduleWithRunLoop.restype = None
+            iokit.IOHIDManagerUnscheduleFromRunLoop.argtypes = [c_void_p, c_void_p, c_void_p]
+            iokit.IOHIDManagerUnscheduleFromRunLoop.restype = None
+
+            iokit.IOHIDManagerOpen.argtypes = [c_void_p, c_uint32]
+            iokit.IOHIDManagerOpen.restype = c_int32
+            iokit.IOHIDManagerClose.argtypes = [c_void_p, c_uint32]
+            iokit.IOHIDManagerClose.restype = c_int32
+
+            iokit.IOHIDDeviceGetProperty.argtypes = [c_void_p, c_void_p]
+            iokit.IOHIDDeviceGetProperty.restype = c_void_p
+
+            manager = iokit.IOHIDManagerCreate(None, 0)
+            if not manager:
+                logger.error("IOHIDManagerCreate returned NULL")
+                return
+
+            self._mac_iohid_manager = manager
+
+            # Non-exclusive matching of all devices; filter by target in callbacks
+            iokit.IOHIDManagerSetDeviceMatching(manager, None)
+
+            k_vid = cf.CFStringCreateWithCString(None, b"VendorID", 0x08000100)
+            k_pid = cf.CFStringCreateWithCString(None, b"ProductID", 0x08000100)
+            k_cf_default_mode = cf.CFStringCreateWithCString(None, b"kCFRunLoopDefaultMode", 0x08000100)
+
+            def _is_target_device(sender) -> bool:
+                if not sender:
+                    return False
+                vid_val = c_int32(0)
+                pid_val = c_int32(0)
+                if k_vid:
+                    v_prop = iokit.IOHIDDeviceGetProperty(sender, k_vid)
+                    if v_prop:
+                        cf.CFNumberGetValue(v_prop, 3, byref(vid_val))
+                if k_pid:
+                    p_prop = iokit.IOHIDDeviceGetProperty(sender, k_pid)
+                    if p_prop:
+                        cf.CFNumberGetValue(p_prop, 3, byref(pid_val))
+
+                vid = vid_val.value
+                pid = pid_val.value
+                if vid == 0x05AC and not self._target_device:
+                    return False
+
+                target = self._target_device.upper().replace("/", "\\")
+                if not target:
+                    return True
+                hw_id = f"HID\\VID_{vid:04X}&PID_{pid:04X}"
+                if target == hw_id or target in hw_id or hw_id in target:
+                    return True
+                if f"VID_{vid:04X}" in target and f"PID_{pid:04X}" in target:
+                    return True
+                return False
+
+            def _value_callback(context, result, sender, value_ref):
+                try:
+                    if not value_ref or not _is_target_device(sender):
+                        return
+
+                    elem = iokit.IOHIDValueGetElement(value_ref)
+                    if not elem:
+                        return
+
+                    page = int(iokit.IOHIDElementGetUsagePage(elem))
+                    usage = int(iokit.IOHIDElementGetUsage(elem))
+                    int_val = int(iokit.IOHIDValueGetIntegerValue(value_ref))
+                    is_down = bool(int_val != 0)
+
+                    name = None
+                    if page == 7 or page == 1:
+                        name = HID_KEYPAD_USAGE_MAP.get(usage)
+                    elif page == 0x0C:
+                        name = HID_CONSUMER_USAGE_MAP.get(usage)
+
+                    if name:
+                        self._dispatch(name, is_down, vk=usage)
+                except Exception as exc:
+                    logger.debug("Exception in IOHIDManager value callback: %s", exc)
+
+            self._mac_value_cb_ref = IOHIDValueCallback(_value_callback)
+            iokit.IOHIDManagerRegisterInputValueCallback(
+                manager, self._mac_value_cb_ref, None
+            )
+
+            current_rl = cf.CFRunLoopGetCurrent()
+            iokit.IOHIDManagerScheduleWithRunLoop(
+                manager, current_rl, k_cf_default_mode
+            )
+
+            ret = iokit.IOHIDManagerOpen(manager, 0)
+            logger.info("IOHIDManagerOpen returned %d; starting macOS HID run loop", ret)
+
+            while self._running:
+                cf.CFRunLoopRunInMode(k_cf_default_mode, c_double(0.1), False)
+
+        except Exception as exc:
+            logger.error("macOS IOHIDManager error: %s", exc, exc_info=True)
+        finally:
             try:
-                self._listener.stop()
+                if manager and current_rl and k_cf_default_mode:
+                    iokit.IOHIDManagerUnscheduleFromRunLoop(
+                        manager, current_rl, k_cf_default_mode
+                    )
             except Exception:
                 pass
-            self._listener = None
-
-    def _mac_run_loop(self) -> None:
-        """Dedicated daemon worker thread running the macOS CFRunLoop for CGEventTap."""
-        try:
-            import Quartz
-
-            self._mac_run_loop_ref = Quartz.CFRunLoopGetCurrent()
-
-            def _mac_tap_callback(proxy, event_type, event, refcon):
-                try:
-                    return self._mac_intercept(event_type, event)
-                except Exception as exc:
-                    logger.debug("Exception in CGEventTap callback: %s", exc)
-                    return event
-
-            mask = (
-                (1 << Quartz.kCGEventKeyDown)
-                | (1 << Quartz.kCGEventKeyUp)
-                | (1 << Quartz.kCGEventFlagsChanged)
-            )
-
-            tap = Quartz.CGEventTapCreate(
-                Quartz.kCGHIDEventTap,
-                Quartz.kCGHeadInsertEventTap,
-                Quartz.kCGEventTapOptionDefault,
-                mask,
-                _mac_tap_callback,
-                None,
-            )
-
-            if not tap:
-                logger.warning("CGEventTapCreate returned NULL (permission pending or headless); starting fallback listener")
-                self._mac_fallback_listener()
-                return
-
-            self._mac_tap_ref = tap
-            run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-            if not run_loop_source:
-                logger.warning("CFMachPortCreateRunLoopSource returned NULL; starting fallback listener")
-                self._mac_fallback_listener()
-                return
-
-            Quartz.CFRunLoopAddSource(
-                self._mac_run_loop_ref, run_loop_source, Quartz.kCFRunLoopCommonModes
-            )
-            Quartz.CGEventTapEnable(tap, True)
-            logger.info("macOS CGEventTap successfully initialized on daemon thread")
-
-            while self._running:
-                Quartz.CFRunLoopRun()
-        except Exception as exc:
-            logger.error("macOS event tap run loop error: %s", exc, exc_info=True)
-            self._mac_fallback_listener()
-        finally:
-            self._mac_tap_ref = None
-            self._mac_run_loop_ref = None
-
-    def _mac_fallback_listener(self) -> None:
-        """Fallback to pynput.keyboard.Listener when CGEventTap is unavailable."""
-        if self._listener is None and self._running:
             try:
-                kwargs: dict = {
-                    "on_press": self._generic_press,
-                    "on_release": self._generic_release,
-                }
-                self._listener = keyboard.Listener(**kwargs)
-                self._listener.daemon = True
-                self._listener.start()
-                logger.info("macOS pynput keyboard.Listener fallback started")
-            except Exception as exc:
-                logger.warning("Could not start pynput listener: %s", exc)
-
-    def _mac_intercept(self, event_type, event):
-        """macOS CGEventTap intercept. Returns None to block the event from the OS."""
-        try:
-            import Quartz
-
-            if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
-                return event
-            vk = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
-            name = MAC_VK.get(int(vk))
-            if name is None:
-                return event
-
-            # Target device filtering on macOS if a specific target device is selected
-            if self._target_device:
-                sender_id = 0
-                try:
-                    # Field 87 is kCGEventSourceUnixEffectiveUID / IORegistryEntryID on macOS
-                    sender_id = Quartz.CGEventGetIntegerValueField(event, 87)
-                except Exception:
-                    pass
-                if sender_id and self._target_handles and sender_id not in self._target_handles:
-                    return event
-
-            # Map keycode 114 (kVK_Help / PC Insert) to VK_INSERT for NumLock-OFF burst detection
-            mapped_vk = VK_INSERT if int(vk) == 114 else int(vk)
-            self._dispatch(name, event_type == Quartz.kCGEventKeyDown, mapped_vk)
-            return None if (self._suppress or name in _ALWAYS_SUPPRESS_KEYS) else event
-        except Exception as exc:
-            logger.debug("mac_intercept error: %s", exc)
-            return event
-
-    def _mac_consumer_loop(self) -> None:
-        """Dedicated daemon worker thread reading Consumer Control reports (Home, Email, Calc) via hidapi."""
-        if not HAS_HID:
-            return
-
-        opened_devices: list[tuple[Any, str, bytes]] = []  # (dev_handle, hw_id, path_bytes)
-        last_scan = 0.0
-
-        try:
-            while self._running:
-                now = time.perf_counter()
-                if now - last_scan > 2.0 or not opened_devices:
-                    last_scan = now
+                if manager:
+                    iokit.IOHIDManagerClose(manager, 0)
+                    cf.CFRelease(manager)
+            except Exception:
+                pass
+            for ref in (k_vid, k_pid, k_cf_default_mode):
+                if ref:
                     try:
-                        raw_list = hid.enumerate()
+                        cf.CFRelease(ref)
                     except Exception:
-                        raw_list = []
-
-                    target = self._target_device.upper()
-                    for d in raw_list:
-                        usage_page = d.get("usage_page", 0)
-                        usage = d.get("usage", 0)
-                        is_consumer = (usage_page == 0x0C or d.get("interface_number") == 1)
-                        is_kb = (usage_page == 1 and usage in (6, 7))
-                        if not (is_consumer or is_kb):
-                            continue
-
-                        vid = d.get("vendor_id", 0)
-                        pid = d.get("product_id", 0)
-                        if vid == 0x05AC and not target:
-                            continue
-                        hw_id = f"HID\\VID_{vid:04X}&PID_{pid:04X}"
-                        if target and target != hw_id.upper() and target not in hw_id.upper():
-                            continue
-
-                        raw_path = d.get("path")
-                        if not raw_path:
-                            continue
-                        p_bytes = raw_path if isinstance(raw_path, bytes) else str(raw_path).encode("utf-8")
-
-                        if any(item[2] == p_bytes for item in opened_devices):
-                            continue
-
-                        try:
-                            h = hid.device()
-                            h.open_path(p_bytes)
-                            h.set_nonblocking(True)
-                            opened_devices.append((h, hw_id, p_bytes))
-                            logger.info("Opened macOS HID interface (%s): %s", hw_id, p_bytes)
-                        except Exception as exc:
-                            logger.debug("Could not open HID path %s: %s", p_bytes, exc)
-
-                if not opened_devices:
-                    time.sleep(0.1)
-                    continue
-
-                any_data = False
-                target = self._target_device.upper()
-                for item in list(opened_devices):
-                    dev_h, dev_id, dev_path = item
-                    if target and target != dev_id.upper() and target not in dev_id.upper():
-                        continue
-                    try:
-                        data = dev_h.read(64)
-                        if not data:
-                            continue
-                        any_data = True
-                        if len(data) in (2, 3, 4):
-                            events, _ = parse_hid_consumer_report(data, set())
-                            for name, is_down, usage in events:
-                                self._dispatch(name, is_down, vk=usage)
-                        elif len(data) >= 8:
-                            events, _ = parse_hid_keyboard_report(data, set())
-                            for name, is_down, usage in events:
-                                self._dispatch(name, is_down, vk=usage)
-                    except Exception:
-                        try:
-                            dev_h.close()
-                        except Exception:
-                            pass
-                        if item in opened_devices:
-                            opened_devices.remove(item)
-
-                if not any_data:
-                    time.sleep(0.005)
-        finally:
-            for item in opened_devices:
-                try:
-                    item[0].close()
-                except Exception:
-                    pass
+                        pass
+            self._mac_iohid_manager = None
+            self._mac_value_cb_ref = None
 
     def _generic_press(self, key) -> None:  # pragma: no cover
         name = self._generic_name(key)

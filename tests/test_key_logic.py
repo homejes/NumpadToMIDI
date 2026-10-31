@@ -769,46 +769,29 @@ class StartupSafetyTests(unittest.TestCase):
         self.assertEqual(hook.target_device, "")
         self.assertTrue(hook._running)
 
-        # Test _mac_intercept simulation
-        class MockEvent:
-            pass
+        # Verify HID_KEYPAD_USAGE_MAP coverage
+        from key_hook import HID_KEYPAD_USAGE_MAP, HID_CONSUMER_USAGE_MAP
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x59], "1")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x62], "0")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x63], ".")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x58], "Enter")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x57], "+")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x56], "-")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x55], "*")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x54], "/")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x53], "NumLock")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x1E], "1")
+        self.assertEqual(HID_KEYPAD_USAGE_MAP[0x27], "0")
+        self.assertEqual(HID_CONSUMER_USAGE_MAP[0x0223], "Home")
+        self.assertEqual(HID_CONSUMER_USAGE_MAP[0x018A], "Email")
+        self.assertEqual(HID_CONSUMER_USAGE_MAP[0x0192], "Calc")
 
-        class MockQuartz:
-            kCGEventKeyDown = 1
-            kCGEventKeyUp = 2
-            kCGKeyboardEventKeycode = 0
-
-            @staticmethod
-            def CGEventGetIntegerValueField(evt, field):
-                if field == 0:
-                    return getattr(evt, "keycode", 0)
-                if field == 87:
-                    return getattr(evt, "sender_id", 0)
-                return 0
-
-        # Simulate keycode 83 (Keypad 1) down
-        evt = MockEvent()
-        evt.keycode = 83
-        evt.sender_id = 0
-
-        from unittest.mock import patch
-        with patch.dict("sys.modules", {"Quartz": MockQuartz}):
-            res = hook._mac_intercept(MockQuartz.kCGEventKeyDown, evt)
-            # Default suppress is True, so intercept returns None (swallows)
-            self.assertIsNone(res)
-            self.assertEqual(rec.events[-1], ("1", True))
-
-            # Simulate keycode 76 (Keypad Enter) down
-            evt.keycode = 76
-            res2 = hook._mac_intercept(MockQuartz.kCGEventKeyDown, evt)
-            self.assertIsNone(res2)
-            self.assertEqual(rec.events[-1], ("Enter", True))
-
-            # Simulate keycode 65 (Keypad .) down
-            evt.keycode = 65
-            res3 = hook._mac_intercept(MockQuartz.kCGEventKeyDown, evt)
-            self.assertIsNone(res3)
-            self.assertEqual(rec.events[-1], (".", True))
+        # Verify dispatch of keyboard and consumer keys
+        hook._dispatch(HID_KEYPAD_USAGE_MAP[0x59], True, vk=0x59)
+        hook._dispatch(HID_KEYPAD_USAGE_MAP[0x59], False, vk=0x59)
+        hook._dispatch(HID_CONSUMER_USAGE_MAP[0x0223], True, vk=0x0223)
+        hook._dispatch(HID_CONSUMER_USAGE_MAP[0x0223], False, vk=0x0223)
+        self.assertEqual(rec.events, [("1", True), ("1", False), ("Home", True), ("Home", False)])
 
         hook.stop()
 
