@@ -696,6 +696,61 @@ class StartupSafetyTests(unittest.TestCase):
         devs = list_macos_hid_devices()
         self.assertIsInstance(devs, list)
 
+    def test_mac_multi_interface_separation_and_dispatch(self):
+        """_find_mac_device_interfaces separates keyboard and consumer endpoints on composite USB numpads."""
+        from unittest.mock import patch
+        import key_hook
+
+        mock_devices = [
+            # Interface 0: Generic Desktop Keyboard (Digits 0-9, ., Enter, etc.)
+            {
+                "vendor_id": 0x1234,
+                "product_id": 0x5678,
+                "path": b"/dev/hidraw_kb",
+                "usage_page": 1,
+                "usage": 6,
+                "interface_number": 0,
+            },
+            # Interface 1: Consumer Control (Home, Email, Calc)
+            {
+                "vendor_id": 0x1234,
+                "product_id": 0x5678,
+                "path": b"/dev/hidraw_consumer",
+                "usage_page": 0x0C,
+                "usage": 1,
+                "interface_number": 1,
+            },
+        ]
+
+        hook, rec = make()
+        with patch.object(key_hook, "HAS_HID", True):
+            if hasattr(key_hook, "hid"):
+                with patch.object(key_hook.hid, "enumerate", return_value=mock_devices):
+                    # Test unassigned target device finds both interfaces
+                    kb_paths, cons_paths = hook._find_mac_device_interfaces()
+                    self.assertIn(b"/dev/hidraw_kb", kb_paths)
+                    self.assertIn(b"/dev/hidraw_consumer", cons_paths)
+
+                    # Test target matching VID/PID
+                    hook.set_target_device("HID\\VID_1234&PID_5678")
+                    kb_paths, cons_paths = hook._find_mac_device_interfaces()
+                    self.assertEqual(kb_paths, [b"/dev/hidraw_kb"])
+                    self.assertEqual(cons_paths, [b"/dev/hidraw_consumer"])
+
+                    # Test non-matching target filters out
+                    hook.set_target_device("HID\\VID_9999&PID_9999")
+                    kb_paths, cons_paths = hook._find_mac_device_interfaces()
+                    self.assertEqual(kb_paths, [])
+                    self.assertEqual(cons_paths, [])
+
+        # Verify dual-interface report dispatching: keyboard key + consumer key
+        hook._dispatch("1", True)
+        hook._dispatch("1", False)
+        hook._dispatch("Home", True)
+        hook._dispatch("Home", False)
+        self.assertEqual(rec.events, [("1", True), ("1", False), ("Home", True), ("Home", False)])
+        hook.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
