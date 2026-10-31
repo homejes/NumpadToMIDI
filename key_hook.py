@@ -29,15 +29,22 @@ import re
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("NumpadToMIDI.hook")
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
+try:
+    import hid
+    HAS_HID = True
+except ImportError:
+    HAS_HID = False
+    hid = None
+
 if not IS_WIN:
-    from pynput import keyboard  # used on macOS / non-Windows platforms
+    from pynput import keyboard  # fallback on non-Windows platforms if hid unavailable
 else:
     from ctypes import wintypes
     import winreg
@@ -134,13 +141,43 @@ WIN_VK: dict[int, str] = {
     VK_LAUNCH_APP2: "Calc",    # 0xB7 (183)
 }
 
-# Hardware numpad scan codes when NumLock is OFF (non-extended, so dedicated
-# arrow/navigation cluster keys - which carry LLKHF_EXTENDED - are unaffected).
-_WIN_NUMPAD_SCANCODES: dict[int, str] = {
-    0x52: "0", 0x4F: "1", 0x50: "2", 0x51: "3", 0x4B: "4",
-    0x4C: "5", 0x4D: "6", 0x47: "7", 0x48: "8", 0x49: "9",
-    0x53: ".",
+# Hardware OEM Scan Codes -> Keypad key names (independent of NumLock state)
+# Non-extended scan codes (standard numpad digits & navigation cluster on keypad):
+_WIN_OEM_SCANCODES_NON_EXTENDED: dict[int, str] = {
+    0x52: "0",          # Numpad 0 / Insert
+    0x4F: "1",          # Numpad 1 / End
+    0x50: "2",          # Numpad 2 / Down
+    0x51: "3",          # Numpad 3 / PgDn
+    0x4B: "4",          # Numpad 4 / Left
+    0x4C: "5",          # Numpad 5 / Clear
+    0x4D: "6",          # Numpad 6 / Right
+    0x47: "7",          # Numpad 7 / Home
+    0x48: "8",          # Numpad 8 / Up
+    0x49: "9",          # Numpad 9 / PgUp
+    0x53: ".",          # Numpad . / Del
+    0x4E: "+",          # Numpad +
+    0x4A: "-",          # Numpad -
+    0x37: "*",          # Numpad *
+    0x45: "NumLock",    # NumLock
+    0x0E: "Backspace",  # Backspace
+    0x0F: "Tab",        # Tab
 }
+
+_WIN_SCAN_BROWSER_HOME = 0x32
+_WIN_SCAN_LAUNCH_MAIL = 0x6C
+_WIN_SCAN_LAUNCH_CALC = 0x21
+
+# Extended scan codes:
+_WIN_OEM_SCANCODES_EXTENDED: dict[int, str] = {
+    0x35: "/",          # Numpad /
+    0x1C: "Enter",      # Numpad Enter
+    _WIN_SCAN_BROWSER_HOME: "Home", # 0x32
+    _WIN_SCAN_LAUNCH_MAIL: "Email", # 0x6C
+    _WIN_SCAN_LAUNCH_CALC: "Calc",  # 0x21
+}
+
+_WIN_NUMPAD_SCANCODES: dict[int, str] = dict(_WIN_OEM_SCANCODES_NON_EXTENDED)
+
 _WIN_NUMLOCK_OFF_VK_MAP: dict[int, str] = {
     VK_INSERT: "0",
     VK_END: "1",
@@ -156,9 +193,6 @@ _WIN_NUMLOCK_OFF_VK_MAP: dict[int, str] = {
 }
 _WIN_NUMLOCK_OFF_VKS = frozenset(_WIN_NUMLOCK_OFF_VK_MAP.keys())
 _MAPVK_VSC_TO_VK = 1
-_WIN_SCAN_BROWSER_HOME = 0x32
-_WIN_SCAN_LAUNCH_MAIL = 0x6C
-_WIN_SCAN_LAUNCH_CALC = 0x21
 _ALWAYS_SUPPRESS_KEYS = frozenset({"Home", "Email", "Calc"})
 
 _WH_KEYBOARD_LL = 13
@@ -189,12 +223,107 @@ MAC_VK: dict[int, str] = {
     115: "Home",       # kVK_Home (top-left Home key or Numpad 7)
 }
 
+# USB HID Usage Page 0x07 (Keyboard/Keypad) Usage IDs to Keypad Names:
+HID_KEYPAD_USAGE_MAP: dict[int, str] = {
+    0x62: "0",          # Keypad 0 and Insert
+    0x59: "1",          # Keypad 1 and End
+    0x5A: "2",          # Keypad 2 and Down Arrow
+    0x5B: "3",          # Keypad 3 and PageDown
+    0x5C: "4",          # Keypad 4 and Left Arrow
+    0x5D: "5",          # Keypad 5
+    0x5E: "6",          # Keypad 6 and Right Arrow
+    0x5F: "7",          # Keypad 7 and Home
+    0x60: "8",          # Keypad 8 and Up Arrow
+    0x61: "9",          # Keypad 9 and PageUp
+    0x63: ".",          # Keypad . and Delete
+    0x58: "Enter",      # Keypad Enter
+    0x57: "+",          # Keypad +
+    0x56: "-",          # Keypad -
+    0x55: "*",          # Keypad *
+    0x54: "/",          # Keypad /
+    0x53: "NumLock",    # Keypad NumLock and Clear
+    0x2A: "Backspace",  # Keyboard Delete (Backspace)
+    0x2B: "Tab",        # Keyboard Tab
+    0x4A: "Home",       # Keyboard Home
+    0x28: "Enter",      # Keyboard Return
+    0x4C: ".",          # Keyboard Delete
+    0x4D: "1",          # Keyboard End
+    0x4E: "3",          # Keyboard PageDown
+    0x4B: "9",          # Keyboard PageUp
+    0x51: "2",          # Keyboard DownArrow
+    0x52: "8",          # Keyboard UpArrow
+    0x50: "4",          # Keyboard LeftArrow
+    0x4F: "6",          # Keyboard RightArrow
+    0x49: "0",          # Keyboard Insert
+}
+
+# USB HID Usage Page 0x0C (Consumer Control) Usage IDs to Keypad Names:
+HID_CONSUMER_USAGE_MAP: dict[int, str] = {
+    0x0223: "Home",     # AC Home
+    0x018A: "Email",    # AL Email Reader
+    0x0192: "Calc",     # AL Calculator
+}
+
+
+def parse_hid_keyboard_report(
+    data: list[int] | bytes,
+    prev_keys: set[int],
+) -> tuple[list[tuple[str, bool, int]], set[int]]:
+    """Parse standard USB HID keyboard report [modifiers, reserved, key1..key6]."""
+    if len(data) < 8:
+        return [], set(prev_keys)
+
+    offset = 3 if len(data) >= 9 and data[2] == 0 else 2
+    raw_keys = set(k for k in data[offset:offset + 6] if k != 0)
+
+    events: list[tuple[str, bool, int]] = []
+    for usage in sorted(raw_keys - prev_keys):
+        name = HID_KEYPAD_USAGE_MAP.get(usage)
+        if name:
+            events.append((name, True, usage))
+
+    for usage in sorted(prev_keys - raw_keys):
+        name = HID_KEYPAD_USAGE_MAP.get(usage)
+        if name:
+            events.append((name, False, usage))
+
+    return events, raw_keys
+
+
+def parse_hid_consumer_report(
+    data: list[int] | bytes,
+    prev_keys: set[int],
+) -> tuple[list[tuple[str, bool, int]], set[int]]:
+    """Parse USB HID Consumer Control report (Page 0x0C) for Home, Email, Calc."""
+    if len(data) < 2:
+        return [], set(prev_keys)
+    if len(data) >= 3:
+        code = data[1] | (data[2] << 8)
+    else:
+        code = data[0] | (data[1] << 8)
+
+    events: list[tuple[str, bool, int]] = []
+    current_keys = {code} if code != 0 else set()
+
+    for c in current_keys - prev_keys:
+        name = HID_CONSUMER_USAGE_MAP.get(c)
+        if name:
+            events.append((name, True, c))
+    for c in prev_keys - current_keys:
+        name = HID_CONSUMER_USAGE_MAP.get(c)
+        if name:
+            events.append((name, False, c))
+
+    return events, current_keys
+
 
 def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = False) -> Optional[str]:
     """Map a Windows low-level keyboard event to a logical numpad key name.
 
-    Both VK_NUMPAD0 (NumLock ON) and keypad VK_INSERT (NumLock OFF) map to "0"
-    so '000' burst detection works identically regardless of NumLock state.
+    Scancode-First Mapping:
+    Bypasses Windows NumLock state by checking OEM hardware scancodes first.
+    Physical '0' (scancode 0x52) always maps to "0" whether NumLock is ON or OFF.
+    Physical '.' (scancode 0x53) always maps to "." whether NumLock is ON or OFF.
     """
     if IS_WIN and vk in (0, 0xFF) and scan and not extended:
         try:
@@ -203,7 +332,23 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
                 vk = mapped
         except Exception:
             pass
-    if vk == VK_RETURN:  # only the *extended* Enter is the numpad one
+
+    # 1. Check non-extended OEM scancodes directly (digits 0-9, dot, operators, NumLock, Backspace, Tab)
+    if not extended and scan in _WIN_OEM_SCANCODES_NON_EXTENDED:
+        return _WIN_OEM_SCANCODES_NON_EXTENDED[scan]
+
+    # 2. Check extended OEM scancodes directly (/, Enter, Home, Email, Calc)
+    if extended and scan in _WIN_OEM_SCANCODES_EXTENDED:
+        return _WIN_OEM_SCANCODES_EXTENDED[scan]
+
+    # 3. Special handling for 0/Insert and ./Del when scancode is 0x52 / 0x53 or vk matches
+    if scan == 0x52 or vk == VK_INSERT:
+        return "0"
+    if scan == 0x53 or vk == VK_DELETE:
+        return "." if (not extended or keypad_verified) else None
+
+    # 4. Multimedia & special keys fallback by VK or extended scan
+    if vk == VK_RETURN:
         return "Enter" if extended else None
     if vk in (VK_BROWSER_HOME, VK_BROWSER_SEARCH) or (scan == _WIN_SCAN_BROWSER_HOME and extended):
         return "Home"
@@ -211,35 +356,25 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
         return "Email"
     if vk in (VK_LAUNCH_APP1, VK_LAUNCH_APP2) or (scan == _WIN_SCAN_LAUNCH_CALC and extended):
         return "Calc"
-    # NumLock-independent '0' / '000' and '.' (Dot / Del) recognition:
-    # * NumLock ON:  VK_NUMPAD0 (0x60) / VK_DECIMAL (0x6E)
-    # * NumLock OFF: VK_INSERT (0x2D) / VK_DELETE (0x2E) with keypad scancode 0x52 / 0x53
-    if vk == VK_NUMPAD0:
-        return "0"
-    if vk == VK_DECIMAL:
-        return "."
-    if vk == VK_INSERT or (vk in (0, 0xFF) and scan == 0x52):
-        return "0"
-    if vk == VK_DELETE or (vk in (0, 0xFF) and scan == 0x53):
-        return "." if (not extended or keypad_verified) else None
-    if scan == 0x52:
-        return "0"
-    if scan == 0x53 and not extended:
-        return "."
     if vk == VK_HOME and extended:
         return "Home"
-    if not extended and scan in _WIN_NUMPAD_SCANCODES:
-        return _WIN_NUMPAD_SCANCODES[scan]
+
+    # 5. NumLock VK check
+    if vk == VK_NUMLOCK:
+        return "NumLock"
+
+    # 6. VK fallbacks if scan was 0 or unmapped
     if not extended and vk in _WIN_NUMLOCK_OFF_VK_MAP:
         return _WIN_NUMLOCK_OFF_VK_MAP[vk]
+
     return WIN_VK.get(vk)
 
 
 def zero_vk_label(vk: int) -> str:
     """Human-readable source label for a physical '0' keystroke (for diagnostics)."""
-    if vk in (VK_NUMPAD0, 82):
+    if vk in (VK_NUMPAD0, 82, 0x62):
         return "VK_NUMPAD0/NumLock-ON"
-    if vk in (VK_INSERT, 114):
+    if vk in (VK_INSERT, 114, 0x49):
         return "VK_INSERT/NumLock-OFF"
     if vk:
         return f"VK_0x{vk:02X}"
@@ -542,35 +677,56 @@ def check_macos_accessibility(prompt: bool = True) -> bool:
 
 
 def check_macos_permissions(prompt: bool = True) -> bool:
-    """Check both Input Monitoring (CGPreflightListenEventAccess) and Accessibility (AXIsProcessTrusted)."""
-    if not IS_MAC:
-        return True
+    """Check macOS permissions.
+
+    With direct HID report capture via hidapi, fragile CGEventTap and
+    Accessibility permissions are no longer required for basic keypad operation.
+    """
+    return True
+
+
+def list_macos_hid_devices() -> list[KeyboardDevice]:
+    """Enumerate connected USB keyboard/keypad devices on macOS via hidapi."""
+    devices: list[KeyboardDevice] = []
+    if not HAS_HID:
+        return devices
     try:
-        from ctypes import c_bool, c_void_p, cdll, util
-
-        # 1. Check Input Monitoring via CoreGraphics
-        cg_path = (
-            util.find_library("CoreGraphics")
-            or "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
-        cg = cdll.LoadLibrary(cg_path)
-        has_listen_access = True
-        if hasattr(cg, "CGPreflightListenEventAccess"):
-            cg.CGPreflightListenEventAccess.restype = c_bool
-            cg.CGPreflightListenEventAccess.argtypes = []
-            has_listen_access = bool(cg.CGPreflightListenEventAccess())
-            if not has_listen_access and prompt and hasattr(cg, "CGRequestListenEventAccess"):
-                cg.CGRequestListenEventAccess.restype = c_bool
-                cg.CGRequestListenEventAccess.argtypes = []
-                cg.CGRequestListenEventAccess()
-
-        # 2. Check Accessibility via ApplicationServices (AXIsProcessTrustedWithOptions)
-        has_ax_access = check_macos_accessibility(prompt=prompt)
-
-        return has_listen_access and has_ax_access
+        raw_list = hid.enumerate()
     except Exception as exc:
-        logger.warning("check_macos_permissions error: %s", exc)
-        return True
+        logger.warning("hid.enumerate failed on macOS: %s", exc)
+        return devices
+
+    seen: dict[str, KeyboardDevice] = {}
+    for d in raw_list:
+        usage_page = d.get("usage_page", 0)
+        usage = d.get("usage", 0)
+        is_kb = (usage_page == 1 and usage in (6, 7))
+        is_consumer = (usage_page == 0x0C)
+        if not (is_kb or is_consumer or usage_page in (0, 1)):
+            continue
+
+        raw_path = d.get("path")
+        if not raw_path:
+            continue
+        path_str = raw_path.decode("utf-8", errors="replace") if isinstance(raw_path, bytes) else str(raw_path)
+
+        vid = d.get("vendor_id", 0)
+        pid = d.get("product_id", 0)
+        prod = d.get("product_string") or "USB Keypad"
+        hw_id = f"HID\\VID_{vid:04X}&PID_{pid:04X}"
+        label = f"{prod} - USB ({hw_id})" if "USB" not in prod.upper() else f"{prod} ({hw_id})"
+
+        h_val = abs(hash(path_str)) & 0x7FFFFFFF
+        if hw_id in seen:
+            seen[hw_id].handles.add(h_val)
+            if path_str not in seen[hw_id].raw_path:
+                seen[hw_id].raw_path = f"{seen[hw_id].raw_path};{path_str}"
+        else:
+            dev = KeyboardDevice(device_id=hw_id, label=label, raw_path=path_str, handles={h_val})
+            seen[hw_id] = dev
+            devices.append(dev)
+
+    return devices
 
 
 def list_macos_keyboard_devices() -> list[KeyboardDevice]:
@@ -723,6 +879,9 @@ def list_macos_keyboard_devices() -> list[KeyboardDevice]:
 def list_keyboard_devices() -> list[KeyboardDevice]:
     """Enumerate connected keyboard/keypad devices via Win32 Raw Input API or macOS IOKit."""
     if IS_MAC:
+        hid_devs = list_macos_hid_devices()
+        if hid_devs:
+            return hid_devs
         return list_macos_keyboard_devices()
     if not IS_WIN:
         return []
@@ -987,12 +1146,8 @@ class KeyHook:
                 return
 
             if IS_MAC:
-                if not check_macos_permissions(prompt=True):
-                    logger.warning("macOS permissions not granted; skipping event tap")
-                    self._running = False
-                    return
                 self._mac_thread = threading.Thread(
-                    target=self._mac_run_loop, name="NumpadMacEventTap", daemon=True
+                    target=self._mac_hid_worker, name="NumpadMacHIDWorker", daemon=True
                 )
                 self._mac_thread.start()
                 return
@@ -1037,20 +1192,6 @@ class KeyHook:
                     self._win_worker.join(timeout=1.5)
                     self._win_worker = None
             elif IS_MAC:
-                if self._mac_tap_ref is not None:
-                    try:
-                        import Quartz
-                        Quartz.CGEventTapEnable(self._mac_tap_ref, False)
-                    except Exception:
-                        pass
-                    self._mac_tap_ref = None
-                if self._mac_run_loop_ref is not None:
-                    try:
-                        import Quartz
-                        Quartz.CFRunLoopStop(self._mac_run_loop_ref)
-                    except Exception:
-                        pass
-                    self._mac_run_loop_ref = None
                 if self._mac_thread is not None:
                     self._mac_thread.join(timeout=1.0)
                     self._mac_thread = None
@@ -1159,6 +1300,17 @@ class KeyHook:
                                     # either key-down or key-up reaches CallNextHookEx.
                                     self._queue_from_ll(name, is_down, vk_code)
                                     return 1
+
+                                # Immediate Suppression of VK_NUMLOCK from USB Keypad:
+                                # When an event arrives from the selected USB Keypad and vkCode == 0x90 (VK_NUMLOCK):
+                                # Instantly swallow it (return 1) in WH_KEYBOARD_LL. Never pass it to CallNextHookEx.
+                                # Do NOT let the physical button toggle the hardware into navigation mode.
+                                is_numlock = (vk_code == VK_NUMLOCK) or (name == "NumLock") or (int(kb.scanCode) == 0x45 and not extended)
+                                if is_numlock:
+                                    if not self._target_device or self._last_raw_matched:
+                                        self._queue_from_ll("NumLock", is_down, vk_code)
+                                        return 1
+
                                 if not self._target_device:
                                     # "All Connected Keypads (Default)" mode:
                                     # Dispatch immediately and suppress if Exclusive Mode is on
@@ -1171,12 +1323,10 @@ class KeyHook:
                                     # Specific USB keypad selected:
                                     # Suppress and dispatch in _ll_proc when matched or when it's keypad 0/Insert
                                     # (non-extended scancode 0x52 or VK_NUMPAD0) so '000' burst is never leaked.
-                                    # Suppress NumLock only when from the selected keypad, leaving primary
-                                    # laptop/desktop keyboard NumLock unaffected.
                                     is_keypad_zero = (int(kb.scanCode) == 0x52 and not extended) or (vk_code == VK_NUMPAD0)
                                     if (self._last_raw_matched or is_keypad_zero) and name not in ("Tab", "Backspace"):
-                                        if self._suppress or name == "NumLock":
-                                            self._queue_from_ll(name, is_down, vk_code)
+                                        self._queue_from_ll(name, is_down, vk_code)
+                                        if self._suppress:
                                             return 1
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
@@ -1232,93 +1382,85 @@ class KeyHook:
             except Exception:
                 pass
 
-    # ----------------------------------------------------- macOS / generic sources
-    def _mac_run_loop(self) -> None:
-        """Dedicated daemon worker thread running the macOS CFRunLoop for CGEventTap."""
-        try:
-            import Quartz
+    # ----------------------------------------------------- macOS direct HID worker
+    def _mac_hid_worker(self) -> None:
+        """Dedicated background worker thread reading raw USB HID reports on macOS."""
+        if not HAS_HID:
+            logger.warning("hidapi not available; macOS direct HID capture disabled")
+            return
 
-            self._mac_run_loop_ref = Quartz.CFRunLoopGetCurrent()
+        while self._running:
+            target_paths: list[bytes] = []
+            with self._lock:
+                target = self._target_device.upper()
+                if target:
+                    for dev in self._devices:
+                        if (
+                            target == dev.device_id.upper()
+                            or target in dev.device_id.upper()
+                            or target in dev.label.upper()
+                        ):
+                            for p in dev.raw_path.split(";"):
+                                if p:
+                                    target_paths.append(p.encode("utf-8") if isinstance(p, str) else p)
+                else:
+                    for dev in self._devices:
+                        for p in dev.raw_path.split(";"):
+                            if p:
+                                target_paths.append(p.encode("utf-8") if isinstance(p, str) else p)
 
-            def _mac_tap_callback(proxy, event_type, event, refcon):
+            if not target_paths:
+                time.sleep(0.5)
+                continue
+
+            opened: list[tuple[Any, set[int], set[int]]] = []
+            for path in target_paths:
                 try:
-                    return self._mac_intercept(event_type, event)
+                    h = hid.device()
+                    h.open_path(path)
+                    h.set_nonblocking(True)
+                    opened.append((h, set(), set()))
                 except Exception as exc:
-                    logger.debug("Exception in CGEventTap callback: %s", exc)
-                    return event
+                    logger.debug("Could not open HID device path %s: %s", path, exc)
 
-            mask = (
-                (1 << Quartz.kCGEventKeyDown)
-                | (1 << Quartz.kCGEventKeyUp)
-                | (1 << Quartz.kCGEventFlagsChanged)
-            )
+            if not opened:
+                time.sleep(1.0)
+                continue
 
-            tap = Quartz.CGEventTapCreate(
-                Quartz.kCGHIDEventTap,
-                Quartz.kCGHeadInsertEventTap,
-                Quartz.kCGEventTapOptionDefault,
-                mask,
-                _mac_tap_callback,
-                None,
-            )
+            logger.info("macOS direct HID worker listening on %d device path(s)", len(opened))
+            try:
+                while self._running:
+                    any_data = False
+                    for item in opened:
+                        dev_handle, prev_kb, prev_cons = item[0], item[1], item[2]
+                        try:
+                            data = dev_handle.read(64)
+                            if not data:
+                                continue
+                            any_data = True
+                            if len(data) >= 8:
+                                events, new_kb = parse_hid_keyboard_report(data, prev_kb)
+                                prev_kb.clear()
+                                prev_kb.update(new_kb)
+                                for name, is_down, usage in events:
+                                    self._dispatch(name, is_down, vk=usage)
+                            elif len(data) in (2, 3, 4):
+                                events, new_cons = parse_hid_consumer_report(data, prev_cons)
+                                prev_cons.clear()
+                                prev_cons.update(new_cons)
+                                for name, is_down, usage in events:
+                                    self._dispatch(name, is_down, vk=usage)
+                        except Exception as exc:
+                            logger.debug("Error reading HID report: %s", exc)
 
-            if not tap:
-                logger.warning("CGEventTapCreate returned NULL (permission not granted or tap failed)")
-                self._running = False
-                return
-
-            self._mac_tap_ref = tap
-            run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-            if not run_loop_source:
-                logger.warning("CFMachPortCreateRunLoopSource returned NULL")
-                self._running = False
-                return
-
-            Quartz.CFRunLoopAddSource(
-                self._mac_run_loop_ref, run_loop_source, Quartz.kCFRunLoopCommonModes
-            )
-            Quartz.CGEventTapEnable(tap, True)
-            logger.info("macOS CGEventTap successfully initialized on daemon thread")
-
-            while self._running:
-                Quartz.CFRunLoopRun()
-        except Exception as exc:
-            logger.error("macOS event tap run loop error: %s", exc, exc_info=True)
-        finally:
-            self._running = False
-            self._mac_tap_ref = None
-            self._mac_run_loop_ref = None
-
-    def _mac_intercept(self, event_type, event):
-        """pynput CGEventTap intercept. Returns None to block the event."""
-        try:
-            import Quartz  # provided by pyobjc (pynput dependency on macOS)
-
-            if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
-                return event
-            vk = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
-            name = MAC_VK.get(int(vk))
-            if name is None:
-                return event
-
-            # Device filtering on macOS if a specific target device is selected
-            if self._target_device:
-                sender_id = 0
-                try:
-                    # Field 87 is kCGEventSourceUnixEffectiveUID / IORegistryEntryID on macOS
-                    sender_id = Quartz.CGEventGetIntegerValueField(event, 87)
-                except Exception:
-                    pass
-                if sender_id and not self.matches_device(sender_id):
-                    return event
-
-            # Map keycode 114 (kVK_Help / PC Insert) to VK_INSERT for NumLock-OFF burst detection
-            mapped_vk = VK_INSERT if int(vk) == 114 else int(vk)
-            self._dispatch(name, event_type == Quartz.kCGEventKeyDown, mapped_vk)
-            return None if (self._suppress or name in _ALWAYS_SUPPRESS_KEYS) else event
-        except Exception as exc:
-            logger.debug("mac_intercept error: %s", exc)
-            return event
+                    if not any_data:
+                        time.sleep(0.005)
+            finally:
+                for item in opened:
+                    try:
+                        item[0].close()
+                    except Exception:
+                        pass
 
     def _generic_press(self, key) -> None:  # pragma: no cover
         name = self._generic_name(key)
@@ -1374,10 +1516,10 @@ class KeyHook:
             delta_ms,
         )
 
-        eff_window = max(self.burst_window, 0.100)
+        eff_window = max(self.burst_window, 0.080)
         # Slower firmware debounce/scan cadence observed on NumLock-OFF VK_INSERT bursts
         if vk in (VK_INSERT, 114) or self._zlast_vk in (VK_INSERT, 114):
-            eff_window = max(eff_window, 0.140)
+            eff_window = max(eff_window, 0.120)
         if vk:
             self._zlast_vk = vk
 

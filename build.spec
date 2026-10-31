@@ -9,9 +9,10 @@ from PyInstaller.utils.hooks import collect_submodules
 
 _version = {}
 exec(open("version.py", encoding="utf-8").read(), _version)
-APP_VERSION = _version.get("VERSION", "1.5.4")
+APP_VERSION = _version.get("VERSION", "1.5.5")
 
 hiddenimports = collect_submodules("rtmidi")
+hiddenimports += ["hid"]
 if sys.platform == "win32":
     hiddenimports += ["pynput.keyboard._win32", "pynput.mouse._win32"]
 elif sys.platform == "darwin":

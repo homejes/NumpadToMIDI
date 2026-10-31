@@ -564,6 +564,138 @@ class StartupSafetyTests(unittest.TestCase):
         devs = list_macos_keyboard_devices()
         self.assertIsInstance(devs, list)
 
+    def test_scancode_first_mapping_all_23_keys(self):
+        """Scancode-First Mapping maps hardware OEM scancodes directly to correct pads."""
+        from key_hook import win_key_name, VK_NUMLOCK
+
+        # Non-extended numpad keys (independent of NumLock state)
+        self.assertEqual(win_key_name(0, 0x52, False), "0")
+        self.assertEqual(win_key_name(0x2D, 0x52, False), "0")     # VK_INSERT
+        self.assertEqual(win_key_name(0x60, 0x52, False), "0")     # VK_NUMPAD0
+        self.assertEqual(win_key_name(0x23, 0x4F, False), "1")     # VK_END
+        self.assertEqual(win_key_name(0x61, 0x4F, False), "1")     # VK_NUMPAD1
+        self.assertEqual(win_key_name(0x28, 0x50, False), "2")     # VK_DOWN
+        self.assertEqual(win_key_name(0x62, 0x50, False), "2")     # VK_NUMPAD2
+        self.assertEqual(win_key_name(0x22, 0x51, False), "3")     # VK_NEXT
+        self.assertEqual(win_key_name(0x63, 0x51, False), "3")     # VK_NUMPAD3
+        self.assertEqual(win_key_name(0x25, 0x4B, False), "4")     # VK_LEFT
+        self.assertEqual(win_key_name(0x64, 0x4B, False), "4")     # VK_NUMPAD4
+        self.assertEqual(win_key_name(0x0C, 0x4C, False), "5")     # VK_CLEAR
+        self.assertEqual(win_key_name(0x65, 0x4C, False), "5")     # VK_NUMPAD5
+        self.assertEqual(win_key_name(0x27, 0x4D, False), "6")     # VK_RIGHT
+        self.assertEqual(win_key_name(0x66, 0x4D, False), "6")     # VK_NUMPAD6
+        self.assertEqual(win_key_name(0x24, 0x47, False), "7")     # VK_HOME
+        self.assertEqual(win_key_name(0x67, 0x47, False), "7")     # VK_NUMPAD7
+        self.assertEqual(win_key_name(0x26, 0x48, False), "8")     # VK_UP
+        self.assertEqual(win_key_name(0x68, 0x48, False), "8")     # VK_NUMPAD8
+        self.assertEqual(win_key_name(0x21, 0x49, False), "9")     # VK_PRIOR
+        self.assertEqual(win_key_name(0x69, 0x49, False), "9")     # VK_NUMPAD9
+        self.assertEqual(win_key_name(0x2E, 0x53, False), ".")     # VK_DELETE
+        self.assertEqual(win_key_name(0x6E, 0x53, False), ".")     # VK_DECIMAL
+        self.assertEqual(win_key_name(0x6B, 0x4E, False), "+")     # VK_ADD
+        self.assertEqual(win_key_name(0x6D, 0x4A, False), "-")     # VK_SUBTRACT
+        self.assertEqual(win_key_name(0x6A, 0x37, False), "*")     # VK_MULTIPLY
+        self.assertEqual(win_key_name(VK_NUMLOCK, 0x45, False), "NumLock")
+        self.assertEqual(win_key_name(0x08, 0x0E, False), "Backspace")
+        self.assertEqual(win_key_name(0x09, 0x0F, False), "Tab")
+
+        # Extended numpad keys
+        self.assertEqual(win_key_name(0x6F, 0x35, True), "/")      # Numpad /
+        self.assertEqual(win_key_name(0x0D, 0x1C, True), "Enter")  # Numpad Enter
+        self.assertEqual(win_key_name(0xAC, 0x32, True), "Home")   # Browser Home
+        self.assertEqual(win_key_name(0xB4, 0x6C, True), "Email")  # Launch Mail
+        self.assertEqual(win_key_name(0xB7, 0x21, True), "Calc")   # Launch Calc
+
+    def test_triplet_burst_by_scancode_0x52(self):
+        """3 rapid presses of Scancode 0x52 (<80ms) cleanly fire '000' (MIDI Note 37)."""
+        from key_hook import win_key_name
+
+        hook, rec = make(burst_window_ms=75)
+        # Verify win_key_name maps 0x52 to "0" across different VKs
+        for vk in (0x2D, 0x60, 0x00):
+            self.assertEqual(win_key_name(vk, 0x52, False), "0")
+            hook._dispatch("0", True, vk)
+            hook._dispatch("0", False, vk)
+        hook.stop()
+        self.assertEqual(rec.events, [("000", True), ("000", False)])
+
+    def test_parse_hid_keyboard_report(self):
+        """parse_hid_keyboard_report correctly extracts Key Down / Key Up from USB HID reports."""
+        from key_hook import parse_hid_keyboard_report
+
+        # Initial press of Keypad 1 (usage 0x59)
+        report1 = [0, 0, 0x59, 0, 0, 0, 0, 0]
+        events1, held1 = parse_hid_keyboard_report(report1, set())
+        self.assertEqual(events1, [("1", True, 0x59)])
+        self.assertEqual(held1, {0x59})
+
+        # Add Keypad 2 (usage 0x5A) while holding Keypad 1
+        report2 = [0, 0, 0x59, 0x5A, 0, 0, 0, 0]
+        events2, held2 = parse_hid_keyboard_report(report2, held1)
+        self.assertEqual(events2, [("2", True, 0x5A)])
+        self.assertEqual(held2, {0x59, 0x5A})
+
+        # Release both
+        report_empty = [0, 0, 0, 0, 0, 0, 0, 0]
+        events3, held3 = parse_hid_keyboard_report(report_empty, held2)
+        self.assertEqual(events3, [("1", False, 0x59), ("2", False, 0x5A)])
+        self.assertEqual(held3, set())
+
+        # Test 9-byte report with report ID for Keypad 0 (usage 0x62)
+        report_id = [1, 0, 0, 0x62, 0, 0, 0, 0, 0]
+        events4, held4 = parse_hid_keyboard_report(report_id, set())
+        self.assertEqual(events4, [("0", True, 0x62)])
+        self.assertEqual(held4, {0x62})
+
+    def test_parse_hid_consumer_report(self):
+        """parse_hid_consumer_report translates Consumer Usage IDs (Page 0x0C)."""
+        from key_hook import parse_hid_consumer_report
+
+        # AC Home (usage 0x0223)
+        report_home = [0x23, 0x02]
+        events1, held1 = parse_hid_consumer_report(report_home, set())
+        self.assertEqual(events1, [("Home", True, 0x0223)])
+        self.assertEqual(held1, {0x0223})
+
+        # Release
+        events_rel, held_rel = parse_hid_consumer_report([0, 0], held1)
+        self.assertEqual(events_rel, [("Home", False, 0x0223)])
+        self.assertEqual(held_rel, set())
+
+        # AL Email (0x018A) with report ID (3-byte)
+        report_email = [2, 0x8A, 0x01]
+        events2, held2 = parse_hid_consumer_report(report_email, set())
+        self.assertEqual(events2, [("Email", True, 0x018A)])
+
+        # AL Calculator (0x0192)
+        report_calc = [2, 0x92, 0x01]
+        events3, held3 = parse_hid_consumer_report(report_calc, set())
+        self.assertEqual(events3, [("Calc", True, 0x0192)])
+
+    def test_direct_hid_000_triplet_burst(self):
+        """Direct HID 8-byte reports of usage 0x62 trigger '000' (MIDI Note 37)."""
+        from key_hook import parse_hid_keyboard_report
+
+        hook, rec = make(burst_window_ms=75)
+        held = set()
+        for _ in range(3):
+            # Press usage 0x62 (Keypad 0)
+            events_down, held = parse_hid_keyboard_report([0, 0, 0x62, 0, 0, 0, 0, 0], held)
+            for name, is_down, usage in events_down:
+                hook._dispatch(name, is_down, usage)
+            # Release
+            events_up, held = parse_hid_keyboard_report([0, 0, 0, 0, 0, 0, 0, 0], held)
+            for name, is_down, usage in events_up:
+                hook._dispatch(name, is_down, usage)
+
+        hook.stop()
+        self.assertEqual(rec.events, [("000", True), ("000", False)])
+
+    def test_list_macos_hid_devices(self):
+        from key_hook import list_macos_hid_devices
+        devs = list_macos_hid_devices()
+        self.assertIsInstance(devs, list)
+
 
 if __name__ == "__main__":
     unittest.main()
