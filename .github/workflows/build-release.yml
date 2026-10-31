@@ -20,12 +20,12 @@ jobs:
           - os: windows-latest
             python_arch: "x64"
             artifact_name: windows-installer
-          - os: macos-14
+          - os: macos-15
             arch: "Intel"
             python_arch: "x64"
             target_arch: "x86_64"
             artifact_name: macos-intel-dmg
-          - os: macos-14
+          - os: macos-15
             arch: "AppleSilicon"
             python_arch: "arm64"
             target_arch: "arm64"
