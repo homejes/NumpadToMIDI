@@ -485,7 +485,17 @@ class StartupSafetyTests(unittest.TestCase):
         from pathlib import Path
 
         spec_text = (Path(__file__).resolve().parents[1] / "build.spec").read_text(encoding="utf-8")
-        self.assertIn("uac_admin=True", spec_text)
+        self.assertIn("uac_admin=False", spec_text)
+        self.assertIn("NSAccessibilityUsageDescription", spec_text)
+        self.assertIn("NSAppleEventsUsageDescription", spec_text)
+        self.assertIn("LSUIElement", spec_text)
+
+    def test_numlock_always_on_and_suppression(self):
+        from key_hook import _ALWAYS_SUPPRESS_KEYS, KEY_DISPLAY, is_numlock_on, ensure_numlock_on
+        self.assertIn("NumLock", _ALWAYS_SUPPRESS_KEYS)
+        self.assertIn("Always ON", KEY_DISPLAY.get("NumLock", ""))
+        self.assertIsInstance(is_numlock_on(), bool)
+        self.assertTrue(ensure_numlock_on())
 
     def test_tevirtualmidi_error_5_fallback(self):
         from unittest.mock import MagicMock, patch

@@ -9,7 +9,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 _version = {}
 exec(open("version.py", encoding="utf-8").read(), _version)
-APP_VERSION = _version.get("VERSION", "1.5.2")
+APP_VERSION = _version.get("VERSION", "1.5.3")
 
 hiddenimports = collect_submodules("rtmidi")
 if sys.platform == "win32":
@@ -59,6 +59,11 @@ if sys.platform == "darwin":
             "NSHighResolutionCapable": True,
             "NSInputMonitoringUsageDescription":
                 "NumpadToMIDI listens to your numpad to send MIDI notes.",
+            "NSAppleEventsUsageDescription":
+                "NumpadToMIDI requires event monitoring to map keypad inputs to MIDI signals.",
+            "NSAccessibilityUsageDescription":
+                "NumpadToMIDI requires accessibility permissions to capture external numpad keystrokes.",
+            "LSUIElement": False,
         },
     )
 else:
@@ -76,5 +81,5 @@ else:
         runtime_tmpdir=None,
         console=False,
         icon="assets/icon.ico",
-        uac_admin=True,
+        uac_admin=False,
     )

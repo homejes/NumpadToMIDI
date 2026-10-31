@@ -88,7 +88,7 @@ from PyQt6.QtWidgets import (
 
 from key_hook import (
     ALL_DEVICES_ID, ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
-    KEY_SPAN, KeyHook, check_macos_accessibility,
+    KEY_SPAN, KeyHook, check_macos_accessibility, ensure_numlock_on, is_numlock_on,
 )
 from midi_engine import MidiEngine, note_name
 from version import VERSION
@@ -964,8 +964,9 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
     app.installNativeEventFilter(win._native_filter)
     app.aboutToQuit.connect(ctrl.shutdown)
     ctrl.log.emit(f"{ctrl._ts()}  {engine.description}")
+    if sys.platform == "win32":
+        ensure_numlock_on()
     if start_hook:
-        ctrl.hook.start()
         if sys.platform == "darwin":
             trusted = check_macos_accessibility(prompt=True)
             if not trusted:
@@ -973,8 +974,20 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
                     f"{ctrl._ts()}  macOS: Accessibility permission required to capture & block keypad keys. "
                     "Please grant NumpadToMIDI in System Settings > Privacy & Security > Accessibility."
                 )
+                if "--selftest" not in sys.argv:
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        win,
+                        "Accessibility Permission Required",
+                        "Accessibility permission is required.\n\n"
+                        "Please enable NumpadToMIDI in System Settings > Privacy & Security > Accessibility, "
+                        "then restart the app.",
+                    )
             else:
                 ctrl.log.emit(f"{ctrl._ts()}  macOS: Accessibility permission verified.")
+                ctrl.hook.start()
+        else:
+            ctrl.hook.start()
     return app, ctrl, win
 
 

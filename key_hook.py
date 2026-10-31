@@ -89,6 +89,7 @@ KEY_SPAN: dict[str, tuple[int, int]] = {
 KEY_DISPLAY: dict[str, str] = {
     "Home": "\u2302 Home",
     "Backspace": "Backspace \u2190",
+    "NumLock": "NumLock\nAlways ON",
 }
 KEY_NAMES: list[str] = [k[0] for k in KEY_LAYOUT]
 KEY_INDEX: dict[str, int] = {name: i for i, name in enumerate(KEY_NAMES)}
@@ -159,7 +160,7 @@ _MAPVK_VSC_TO_VK = 1
 _WIN_SCAN_BROWSER_HOME = 0x32
 _WIN_SCAN_LAUNCH_MAIL = 0x6C
 _WIN_SCAN_LAUNCH_CALC = 0x21
-_ALWAYS_SUPPRESS_KEYS = frozenset({"Home", "Email", "Calc"})
+_ALWAYS_SUPPRESS_KEYS = frozenset({"Home", "Email", "Calc", "NumLock"})
 
 _WH_KEYBOARD_LL = 13
 _HC_ACTION = 0
@@ -387,10 +388,49 @@ if IS_WIN:
     ]
     _user32.MapVirtualKeyW.restype = wintypes.UINT
     _user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    _user32.GetKeyState.restype = wintypes.SHORT
+    _user32.GetKeyState.argtypes = [ctypes.c_int]
+    _user32.keybd_event.restype = None
+    _user32.keybd_event.argtypes = [
+        ctypes.c_byte, ctypes.c_byte, wintypes.DWORD, ctypes.c_size_t
+    ]
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     _kernel32.GetCurrentThread.restype = wintypes.HANDLE
     _kernel32.SetThreadPriority.restype = wintypes.BOOL
     _kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+
+
+def is_numlock_on() -> bool:
+    """Return True if NumLock is currently active/toggled ON."""
+    if not IS_WIN:
+        return True
+    try:
+        return bool(_user32.GetKeyState(VK_NUMLOCK) & 1)
+    except Exception:
+        return True
+
+
+def ensure_numlock_on() -> bool:
+    """Ensure NumLock is forced to ON. If currently OFF, simulate toggle to activate it."""
+    if not IS_WIN:
+        return True
+    try:
+        if not is_numlock_on():
+            logger.info("NumLock is OFF. Simulating keybd_event to force NumLock ON...")
+            KEYEVENTF_EXTENDEDKEY = 0x0001
+            KEYEVENTF_KEYUP = 0x0002
+            # Scan code 0x45 is the standard hardware scan code for NumLock
+            _user32.keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY, 0)
+            time.sleep(0.01)
+            _user32.keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+            time.sleep(0.01)
+            state_after = is_numlock_on()
+            logger.info("NumLock state after programmatic toggle: %s", "ON" if state_after else "OFF")
+            return state_after
+        return True
+    except Exception as exc:
+        logger.warning("ensure_numlock_on error: %s", exc)
+        return False
 
 
 def _lookup_pnp_friendly_name(pnp_id: str, hw_id: str) -> str:
@@ -939,6 +979,7 @@ class KeyHook:
         self._running = True
         try:
             if IS_WIN:
+                ensure_numlock_on()
                 self._win_ready.clear()
                 self._win_worker = threading.Thread(
                     target=self._win_dispatch_loop, name="NumpadDispatchWorker", daemon=True
@@ -953,15 +994,26 @@ class KeyHook:
 
             kwargs: dict = {"on_press": lambda key: None, "on_release": lambda key: None}
             if IS_MAC:
+                # Defensive check: verify Accessibility before creating CGEventTap
+                if not check_macos_accessibility(prompt=True):
+                    logger.warning("macOS Accessibility permission not granted; skipping event tap")
+                    self._running = False
+                    return
                 kwargs["darwin_intercept"] = self._mac_intercept
             else:  # pragma: no cover - Linux is not a supported target
                 kwargs["on_press"] = self._generic_press
                 kwargs["on_release"] = self._generic_release
-            self._listener = keyboard.Listener(**kwargs)
-            self._listener.daemon = True
-            self._listener.start()
+            try:
+                self._listener = keyboard.Listener(**kwargs)
+                self._listener.daemon = True
+                self._listener.start()
+            except Exception as exc:
+                logger.error("Failed to start keyboard.Listener: %s", exc)
+                self._listener = None
+                self._running = False
         except Exception as exc:
             logger.error("Failed to start keyboard hook: %s", exc, exc_info=True)
+            self._running = False
 
     def stop(self) -> None:
         if not self._running and self._listener is None:
@@ -1078,7 +1130,12 @@ class KeyHook:
                         if wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN, _WM_KEYUP, _WM_SYSKEYUP):
                             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                             extended = bool(kb.flags & _LLKHF_EXTENDED)
+                            injected = bool(kb.flags & 0x10)  # LLKHF_INJECTED
                             vk_code = int(kb.vkCode)
+
+                            # Programmatic NumLock toggle from ensure_numlock_on() must pass through to OS
+                            if vk_code == VK_NUMLOCK and injected:
+                                return int(_user32.CallNextHookEx(self._win_hook_handle, nCode, wParam, lParam))
                             name = win_key_name(
                                 vk_code,
                                 int(kb.scanCode),
@@ -1216,6 +1273,8 @@ class KeyHook:
 
     # ------------------------------------------------------------- debounce core
     def _dispatch(self, name: str, down: bool, vk: int = 0) -> None:
+        if IS_WIN and down and not is_numlock_on():
+            ensure_numlock_on()
         with self._lock:
             if name == "0" and self.detect_triple_zero:
                 # Both VK_NUMPAD0 (NumLock ON) and keypad VK_INSERT (NumLock OFF) arrive
