@@ -7,7 +7,7 @@
 #   e.g. installer/make_dmg.sh 1.5.0 AppleSilicon
 set -euo pipefail
 
-VERSION="${1:-1.5.3}"
+VERSION="${1:-1.5.4}"
 ARCH="${2:-}"
 APP_NAME="NumpadToMIDI"
 APP_PATH="dist/${APP_NAME}.app"
@@ -22,7 +22,7 @@ STAGE="$(mktemp -d)/dmg-root"
 [ -d "$APP_PATH" ] || { echo "error: $APP_PATH not found - run pyinstaller first" >&2; exit 1; }
 
 echo "==> Ad-hoc signing the app bundle"
-codesign --force --deep --sign - "$APP_PATH"
+codesign --force --deep --preserve-metadata=entitlements -s - "$APP_PATH"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
 echo "==> Staging DMG contents"

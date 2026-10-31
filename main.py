@@ -88,7 +88,7 @@ from PyQt6.QtWidgets import (
 
 from key_hook import (
     ALL_DEVICES_ID, ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
-    KEY_SPAN, KeyHook, check_macos_accessibility, ensure_numlock_on, is_numlock_on,
+    KEY_SPAN, KeyHook, check_macos_permissions,
 )
 from midi_engine import MidiEngine, note_name
 from version import VERSION
@@ -625,6 +625,28 @@ class MainWindow(QMainWindow):
         head.addWidget(self.status)
         outer.addLayout(head)
 
+        # macOS permissions warning banner
+        self.perm_banner = QFrame()
+        self.perm_banner.setObjectName("perm_banner")
+        self.perm_banner.setStyleSheet(
+            "QFrame#perm_banner { background: #3a2416; border: 1px solid #7c4819; border-radius: 8px; }"
+        )
+        banner_lay = QHBoxLayout(self.perm_banner)
+        banner_lay.setContentsMargins(12, 8, 12, 8)
+        self.perm_label = QLabel(
+            "\u26a0\ufe0f macOS Input Monitoring & Accessibility permissions required to capture numpad keys. "
+            "Please open System Settings > Privacy & Security to enable NumpadToMIDI."
+        )
+        self.perm_label.setStyleSheet("color: #ffb454; font-weight: 600;")
+        banner_lay.addWidget(self.perm_label)
+        banner_lay.addStretch(1)
+        btn_open_settings = QPushButton("Open Settings")
+        btn_open_settings.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_open_settings.clicked.connect(self._open_mac_settings)
+        banner_lay.addWidget(btn_open_settings)
+        outer.addWidget(self.perm_banner)
+        self.perm_banner.hide()
+
         body = QHBoxLayout()
         body.setSpacing(14)
         outer.addLayout(body, 1)
@@ -814,6 +836,20 @@ class MainWindow(QMainWindow):
             return
         event.accept()
 
+    def _open_mac_settings(self) -> None:
+        if sys.platform == "darwin":
+            try:
+                import subprocess
+                subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
+            except Exception:
+                pass
+
+    def show_permission_warning(self, show: bool) -> None:
+        if show:
+            self.perm_banner.show()
+        else:
+            self.perm_banner.hide()
+
     # ---- behaviour -----------------------------------------------------------
     def _shift_octave(self, delta: int) -> None:
         self.ctrl.panic()  # avoid hanging notes when the mapping moves
@@ -964,27 +1000,18 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
     app.installNativeEventFilter(win._native_filter)
     app.aboutToQuit.connect(ctrl.shutdown)
     ctrl.log.emit(f"{ctrl._ts()}  {engine.description}")
-    if sys.platform == "win32":
-        ensure_numlock_on()
     if start_hook:
         if sys.platform == "darwin":
-            trusted = check_macos_accessibility(prompt=True)
-            if not trusted:
+            has_perm = check_macos_permissions(prompt=True)
+            if not has_perm:
+                win.show_permission_warning(True)
                 ctrl.log.emit(
-                    f"{ctrl._ts()}  macOS: Accessibility permission required to capture & block keypad keys. "
-                    "Please grant NumpadToMIDI in System Settings > Privacy & Security > Accessibility."
+                    f"{ctrl._ts()}  macOS: Input Monitoring & Accessibility permissions required to capture numpad keys. "
+                    "Please grant NumpadToMIDI in System Settings > Privacy & Security."
                 )
-                if "--selftest" not in sys.argv:
-                    from PyQt6.QtWidgets import QMessageBox
-                    QMessageBox.warning(
-                        win,
-                        "Accessibility Permission Required",
-                        "Accessibility permission is required.\n\n"
-                        "Please enable NumpadToMIDI in System Settings > Privacy & Security > Accessibility, "
-                        "then restart the app.",
-                    )
             else:
-                ctrl.log.emit(f"{ctrl._ts()}  macOS: Accessibility permission verified.")
+                win.show_permission_warning(False)
+                ctrl.log.emit(f"{ctrl._ts()}  macOS: Event permissions verified.")
                 ctrl.hook.start()
         else:
             ctrl.hook.start()

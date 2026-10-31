@@ -192,7 +192,7 @@ jobs:
       - name: Ad-hoc codesign app bundle (macOS)
         if: runner.os == 'macOS'
         run: |
-          codesign --force --deep --sign - dist/NumpadToMIDI.app
+          codesign --force --deep --preserve-metadata=entitlements -s - dist/NumpadToMIDI.app
           codesign --verify --deep --strict --verbose=2 dist/NumpadToMIDI.app
 
       - name: Smoke test frozen binary (macOS)

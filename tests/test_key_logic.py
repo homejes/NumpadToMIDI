@@ -490,12 +490,15 @@ class StartupSafetyTests(unittest.TestCase):
         self.assertIn("NSAppleEventsUsageDescription", spec_text)
         self.assertIn("LSUIElement", spec_text)
 
-    def test_numlock_always_on_and_suppression(self):
-        from key_hook import _ALWAYS_SUPPRESS_KEYS, KEY_DISPLAY, is_numlock_on, ensure_numlock_on
-        self.assertIn("NumLock", _ALWAYS_SUPPRESS_KEYS)
-        self.assertIn("Always ON", KEY_DISPLAY.get("NumLock", ""))
-        self.assertIsInstance(is_numlock_on(), bool)
-        self.assertTrue(ensure_numlock_on())
+    def test_device_specific_numlock_suppression(self):
+        from key_hook import _ALWAYS_SUPPRESS_KEYS, win_key_name, VK_NUMLOCK
+        # NumLock is NOT globally in _ALWAYS_SUPPRESS_KEYS so primary keyboard is unaffected
+        self.assertNotIn("NumLock", _ALWAYS_SUPPRESS_KEYS)
+        self.assertEqual(win_key_name(VK_NUMLOCK, 0x45, False), "NumLock")
+
+    def test_check_macos_permissions(self):
+        from key_hook import check_macos_permissions
+        self.assertTrue(check_macos_permissions(prompt=False))
 
     def test_tevirtualmidi_error_5_fallback(self):
         from unittest.mock import MagicMock, patch
