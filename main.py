@@ -1012,7 +1012,7 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
             else:
                 win.show_permission_warning(False)
                 ctrl.log.emit(f"{ctrl._ts()}  macOS: Event permissions verified.")
-                ctrl.hook.start()
+            ctrl.hook.start()
         else:
             ctrl.hook.start()
     return app, ctrl, win

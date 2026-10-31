@@ -751,6 +751,67 @@ class StartupSafetyTests(unittest.TestCase):
         self.assertEqual(rec.events, [("1", True), ("1", False), ("Home", True), ("Home", False)])
         hook.stop()
 
+    def test_mac_target_device_switch_safe_and_intercept(self):
+        """Selecting another target device does not crash or restart threads while running."""
+        import key_hook
+        from key_hook import MAC_VK, VK_INSERT
+
+        hook, rec = make()
+        hook._running = True
+
+        # Switching target device while running must not call _mac_stop / _mac_start
+        # and must update cleanly without crashing
+        hook.set_target_device("HID\\VID_04D9&PID_1203")
+        self.assertEqual(hook.target_device, "HID\\VID_04D9&PID_1203")
+        self.assertTrue(hook._running)
+
+        hook.set_target_device("")
+        self.assertEqual(hook.target_device, "")
+        self.assertTrue(hook._running)
+
+        # Test _mac_intercept simulation
+        class MockEvent:
+            pass
+
+        class MockQuartz:
+            kCGEventKeyDown = 1
+            kCGEventKeyUp = 2
+            kCGKeyboardEventKeycode = 0
+
+            @staticmethod
+            def CGEventGetIntegerValueField(evt, field):
+                if field == 0:
+                    return getattr(evt, "keycode", 0)
+                if field == 87:
+                    return getattr(evt, "sender_id", 0)
+                return 0
+
+        # Simulate keycode 83 (Keypad 1) down
+        evt = MockEvent()
+        evt.keycode = 83
+        evt.sender_id = 0
+
+        from unittest.mock import patch
+        with patch.dict("sys.modules", {"Quartz": MockQuartz}):
+            res = hook._mac_intercept(MockQuartz.kCGEventKeyDown, evt)
+            # Default suppress is True, so intercept returns None (swallows)
+            self.assertIsNone(res)
+            self.assertEqual(rec.events[-1], ("1", True))
+
+            # Simulate keycode 76 (Keypad Enter) down
+            evt.keycode = 76
+            res2 = hook._mac_intercept(MockQuartz.kCGEventKeyDown, evt)
+            self.assertIsNone(res2)
+            self.assertEqual(rec.events[-1], ("Enter", True))
+
+            # Simulate keycode 65 (Keypad .) down
+            evt.keycode = 65
+            res3 = hook._mac_intercept(MockQuartz.kCGEventKeyDown, evt)
+            self.assertIsNone(res3)
+            self.assertEqual(rec.events[-1], (".", True))
+
+        hook.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
