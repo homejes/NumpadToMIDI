@@ -7,7 +7,7 @@
 #   e.g. installer/make_dmg.sh 1.5.0 AppleSilicon
 set -euo pipefail
 
-VERSION="${1:-1.5.8}"
+VERSION="${1:-1.6.0}"
 ARCH="${2:-}"
 APP_NAME="NumpadToMIDI2"
 APP_PATH="dist/${APP_NAME}.app"
