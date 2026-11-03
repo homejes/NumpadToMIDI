@@ -1,10 +1,10 @@
-"""MIDI output engine for NumpadToMIDI.
+"""MIDI output engine for NumpadToMIDI2.
 
 * macOS:   creates a native *virtual MIDI source* (python-rtmidi
            ``open_virtual_port``) that shows up as an input in any DAW.
 * Windows: WinMM cannot create virtual ports. If the teVirtualMIDI driver is
            installed (the Windows installer sets it up for you) the app creates
-           its own port called "NumpadToMIDI" through ``teVirtualMIDI64.dll``,
+           its own port called "NumpadToMIDI2" through ``teVirtualMIDI64.dll``,
            which is loaded dynamically from the system - nothing of it is
            bundled with the app. Without the driver we fall back to an existing
            loopback port (loopMIDI, ...), then to the first available output,
@@ -22,7 +22,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger("NumpadToMIDI.midi")
+logger = logging.getLogger("NumpadToMIDI2.midi")
 
 try:
     import rtmidi
@@ -347,7 +347,7 @@ atexit.register(TeVirtualMidiPort.close_all)
 
 
 class MidiEngine:
-    CLIENT_NAME = "NumpadToMIDI"
+    CLIENT_NAME = "NumpadToMIDI2"
     LOOPBACK_HINTS = ("loopmidi", "numpadtomidi", "loopback", "virtual", "iac driver", "iac bus")
     LAST_RESORT_HINTS = ("microsoft gs wavetable",)
 
@@ -395,7 +395,7 @@ class MidiEngine:
         if IS_WIN:
             if TeVirtualMidiPort.last_error_message:
                 return f"Virtual MIDI driver error: {TeVirtualMidiPort.last_error_message}"
-            return "No virtual MIDI driver - reinstall NumpadToMIDI or install loopMIDI"
+            return "No virtual MIDI driver - reinstall NumpadToMIDI2 or install loopMIDI"
         return "No MIDI output"
 
     # ------------------------------------------------------------------- opening

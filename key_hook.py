@@ -1,4 +1,4 @@
-"""Global numpad key hook for NumpadToMIDI.
+"""Global numpad key hook for NumpadToMIDI2.
 
 Translates raw OS keyboard events into logical numpad key names and guarantees
 *exactly one* "down" and one "up" per physical press:
@@ -16,6 +16,17 @@ Translates raw OS keyboard events into logical numpad key names and guarantees
 * Stray releases are ignored.
 * The "000" key of financial numpads, which hardware-wise just emits three quick
   ``0`` presses, is recognised as a burst and reported as a single ``000`` key.
+  The triplet detector is NumLock-independent: it tracks the hardware OEM
+  scancode ``0x52`` (physical '0'/'Insert' key) and explicitly both
+  ``VK_NUMPAD0`` (NumLock ON) and ``VK_INSERT`` (NumLock OFF) received from the
+  selected USB keypad device, suppresses all three OS strokes, and emits a
+  single '000' key (MIDI Note 37 / C#1).
+* On macOS the composite USB keypad exposes two HID interfaces: the numeric
+  keys live on the GenericDesktop Keyboard/Keypad page (0x01 - usages 6/7)
+  while Home/Email/Calc live on the Consumer Control page (0x0C). Native
+  ``IOHIDManager`` listeners are attached to BOTH interfaces simultaneously
+  (``IOHIDManagerSetDeviceMatchingMultiple``), and a ``CGEventTap`` swallows
+  the keypad codes so they do not type numbers into the macOS UI.
 
 The module is pure logic on top of ``_dispatch`` so it can be unit-tested
 without a keyboard (see ``tests/test_key_logic.py``).
@@ -31,7 +42,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-logger = logging.getLogger("NumpadToMIDI.hook")
+logger = logging.getLogger("NumpadToMIDI2.hook")
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -166,6 +177,14 @@ _WIN_OEM_SCANCODES_NON_EXTENDED: dict[int, str] = {
 _WIN_SCAN_BROWSER_HOME = 0x32
 _WIN_SCAN_LAUNCH_MAIL = 0x6C
 _WIN_SCAN_LAUNCH_CALC = 0x21
+# OEM hardware scancode of the physical numpad '0' / 'Insert' key. This is the
+# hardware-level identity of the M-Tech '000' key triplet (the '000' key sends a
+# rapid 3-stroke burst of this key), completely independent of NumLock state.
+_WIN_SCAN_KEYPAD_ZERO = 0x52
+# Burst window floor (seconds): the triplet detector must recognize 3 rapid
+# strokes of scancode 0x52 arriving within 80 ms of each other, per the M-Tech
+# hardware timing spec.
+_BURST_WINDOW_FLOOR = 0.080
 
 # Extended scan codes:
 _WIN_OEM_SCANCODES_EXTENDED: dict[int, str] = {
@@ -283,6 +302,56 @@ HID_CONSUMER_USAGE_MAP: dict[int, str] = {
     0x0224: "Home",     # AC Back
 }
 
+# --- macOS HID usage pages -----------------------------------------------------
+# The composite USB keypad exposes two HID interfaces on macOS:
+#   * Generic Desktop page 0x01 - PrimaryUsage 6 (Keyboard) / 7 (Keypad) carries
+#     the numeric keys (element Usage IDs live on the Keyboard/Keypad page 0x07,
+#     e.g. 0x59-0x62 for keypad 1..0) plus operators and navigation codes.
+#   * Consumer Control page 0x0C carries Home / Email / Calc.
+# Both interfaces must be opened together or the numeric keys are never seen.
+HID_PAGE_GENERIC_DESKTOP = 0x01
+HID_PAGE_KEYBOARD = 0x07
+HID_PAGE_CONSUMER = 0x0C
+
+# IOHIDManager matching dictionaries (kIOHIDDeviceUsagePageKey / kIOHIDDeviceUsageKey):
+_MAC_MATCHING_DICTS: tuple[tuple[int, int], ...] = (
+    (HID_PAGE_GENERIC_DESKTOP, 6),   # GenericDesktop / Keyboard interface
+    (HID_PAGE_GENERIC_DESKTOP, 7),   # GenericDesktop / Keypad interface
+    (HID_PAGE_CONSUMER, 1),          # Consumer Control / Consumer interface
+)
+
+# macOS kVK keycodes that are ONLY ever produced by an external keypad plus the
+# PC navigation cluster codes sent when NumLock is OFF. Tab (48) and Backspace
+# (51) are shared with the internal keyboard and are never tapped. The numpad
+# cluster (kVK_ANSI_Keypad*) is always safe to swallow; the PC navigation
+# cluster (114/115/116/117/119/121/123..126) also exists on internal keyboards,
+# so it is only suppressed when a specific external keypad is targeted.
+_MAC_SHARED_KEYCODES = frozenset({48, 51})
+_MAC_NAV_KEYCODES = frozenset({114, 115, 116, 117, 119, 121, 123, 124, 125, 126})
+_MAC_TAP_NUMPAD_CODES = frozenset(
+    code for code in MAC_VK
+    if code not in _MAC_SHARED_KEYCODES and code not in _MAC_NAV_KEYCODES
+)
+_MAC_TAP_NAV_CODES = frozenset(MAC_VK.keys()) & _MAC_NAV_KEYCODES
+# CGEventTap event mask: KeyDown (10), KeyUp (11), FlagsChanged (12)
+_MAC_EVENT_MASK = (1 << 10) | (1 << 11) | (1 << 12)
+# kCGKeyboardEventKeycode field index
+_MAC_FIELD_KEYCODE = 9
+
+
+def mac_usage_name(page: int, usage: int) -> Optional[str]:
+    """Map an IOHID element (usage page, usage) to a logical numpad key name.
+
+    The Keyboard interface reports elements on the Keyboard/Keypad page 0x07
+    (with the device's GenericDesktop 0x01 primary page in some stacks), and the
+    Consumer interface reports elements on the Consumer page 0x0C.
+    """
+    if page in (HID_PAGE_GENERIC_DESKTOP, HID_PAGE_KEYBOARD):
+        return HID_KEYPAD_USAGE_MAP.get(usage)
+    if page == HID_PAGE_CONSUMER:
+        return HID_CONSUMER_USAGE_MAP.get(usage)
+    return None
+
 
 def parse_hid_keyboard_report(
     data: list[int] | bytes,
@@ -389,15 +458,19 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
     return WIN_VK.get(vk)
 
 
-def zero_vk_label(vk: int) -> str:
+def zero_vk_label(vk: int = 0, scan: int = 0) -> str:
     """Human-readable source label for a physical '0' keystroke (for diagnostics)."""
     if vk in (VK_NUMPAD0, 82, 0x62):
-        return "VK_NUMPAD0/NumLock-ON"
-    if vk in (VK_INSERT, 114, 0x49):
-        return "VK_INSERT/NumLock-OFF"
-    if vk:
-        return f"VK_0x{vk:02X}"
-    return "KEYPAD0"
+        base = "VK_NUMPAD0/NumLock-ON"
+    elif vk in (VK_INSERT, 114, 0x49):
+        base = "VK_INSERT/NumLock-OFF"
+    elif vk:
+        base = f"VK_0x{vk:02X}"
+    else:
+        base = "KEYPAD0"
+    if scan == _WIN_SCAN_KEYPAD_ZERO:
+        base = f"{base} [Scancode 0x52]"
+    return base
 
 
 # --- Win32 Raw Input constants ------------------------------------------------
@@ -695,13 +768,21 @@ def check_macos_accessibility(prompt: bool = True) -> bool:
         return True
 
 
-def check_macos_permissions(prompt: bool = True) -> bool:
-    """Check macOS permissions.
+def check_macos_permissions(prompt: bool = True, suppress: bool = False) -> bool:
+    """Check macOS permissions required by the currently configured capture strategy.
 
-    With direct HID report capture via hidapi, fragile CGEventTap and
-    Accessibility permissions are no longer required for basic keypad operation.
+    Raw HID capture (IOHIDManager listening on both composite interfaces, or
+    hidapi) requires no macOS permission. Swallowing keypad keys ("Exclusive
+    Mode") requires a CGEventTap, which needs the *Accessibility* permission
+    (System Settings > Privacy & Security). When ``suppress`` is False the
+    check passes unconditionally, so permissionless environments (e.g. CI) are
+    never blocked.
     """
-    return True
+    if not IS_MAC:
+        return True
+    if not suppress:
+        return True
+    return check_macos_accessibility(prompt=prompt)
 
 
 def list_macos_hid_devices() -> list[KeyboardDevice]:
@@ -838,9 +919,13 @@ def list_macos_keyboard_devices() -> list[KeyboardDevice]:
                     if usage_prop:
                         cf.CFNumberGetValue(usage_prop, 3, byref(usage))
 
-                    if usage_page.value != 0 and usage_page.value != 1:
-                        continue
-                    if usage.value != 0 and usage.value not in (6, 7):
+                    is_keyboard = (
+                        usage_page.value in (0, HID_PAGE_GENERIC_DESKTOP)
+                        and usage.value in (0, 6, 7)
+                    )
+                    is_consumer = usage_page.value == HID_PAGE_CONSUMER
+                    if not (is_keyboard or is_consumer):
+                        # Skip joysticks, mice, digitizers, vendor-defined, ...
                         continue
 
                     vid = c_int32(0)
@@ -1029,11 +1114,16 @@ class KeyHook:
         self._last_raw_time: float = 0.0
         self._pending_raw_dedup: list[tuple[str, bool, float]] = []
 
-        # Non-Windows fallback listener & macOS native CGEventTap / HID state
+        # Non-Windows fallback listener & macOS native IOHIDManager / CGEventTap state
         self._listener = None
         self._mac_thread: Optional[threading.Thread] = None
         self._mac_iohid_manager = None
         self._mac_value_cb_ref = None
+        self._mac_tap_thread: Optional[threading.Thread] = None
+        self._mac_tap_ref = None          # CFMachPortRef of the CGEventTap
+        self._mac_tap_cb_ref = None       # keep the ctypes callback alive
+        self._mac_tap_src_ref = None      # CFRunLoopSourceRef of the tap
+        self._mac_tap_granted = False     # tap successfully created (Accessibility)
         # Windows native WH_KEYBOARD_LL + WM_INPUT state
         self._running = False
         self._win_thread: Optional[threading.Thread] = None
@@ -1116,7 +1206,7 @@ class KeyHook:
                     return True
             return False
 
-    def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0) -> None:
+    def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
         """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
         now = time.perf_counter()
         # 50 ms dedup window, clearing opposite edge for this key to prevent dedup cross-stroke bleed
@@ -1125,7 +1215,7 @@ class KeyHook:
             if (now - item[2] < 0.050 and item[0] != name)
         ]
         self._pending_raw_dedup.append((name, is_down, now))
-        self._win_queue.put_nowait((name, is_down, vk))
+        self._win_queue.put_nowait((name, is_down, vk, scan))
 
     def _process_raw_keyboard(self, h_device: int, vk: int, scan: int, flags: int) -> bool:
         """Filter and dispatch a Win32 RAWKEYBOARD event by its ``hDevice``."""
@@ -1152,7 +1242,7 @@ class KeyHook:
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup if item[0] != name or item[1] == is_down
         ]
-        self._win_queue.put_nowait((name, is_down, vk))
+        self._win_queue.put_nowait((name, is_down, vk, scan))
         return True
 
     def start(self) -> None:
@@ -1189,7 +1279,12 @@ class KeyHook:
             self._running = False
 
     def stop(self) -> None:
-        if not self._running and self._listener is None and self._mac_thread is None:
+        if (
+            not self._running
+            and self._listener is None
+            and self._mac_thread is None
+            and self._mac_tap_thread is None
+        ):
             with self._lock:
                 self._cancel_timer()
                 self._cancel_triple_timer()
@@ -1279,7 +1374,7 @@ class KeyHook:
             # Register hidden message-only window for Raw Input (WM_INPUT)
             try:
                 self._win_raw_hwnd = _user32.CreateWindowExW(
-                    0, "Static", "NumpadToMIDIRawInputSink", 0,
+                    0, "Static", "NumpadToMIDI2RawInputSink", 0,
                     0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
                 )
                 if self._win_raw_hwnd:
@@ -1321,7 +1416,7 @@ class KeyHook:
                                     # Consumer Control events that do not emit RIM_TYPEKEYBOARD
                                     # WM_INPUT packets and will launch Chrome/Mail/Calc if
                                     # either key-down or key-up reaches CallNextHookEx.
-                                    self._queue_from_ll(name, is_down, vk_code)
+                                    self._queue_from_ll(name, is_down, vk_code, int(kb.scanCode))
                                     return 1
 
                                 # Immediate Suppression of VK_NUMLOCK from USB Keypad:
@@ -1331,7 +1426,7 @@ class KeyHook:
                                 is_numlock = (vk_code == VK_NUMLOCK) or (name == "NumLock") or (int(kb.scanCode) == 0x45 and not extended)
                                 if is_numlock:
                                     if not self._target_device or self._last_raw_matched:
-                                        self._queue_from_ll("NumLock", is_down, vk_code)
+                                        self._queue_from_ll("NumLock", is_down, vk_code, int(kb.scanCode))
                                         return 1
 
                                 if not self._target_device:
@@ -1339,7 +1434,7 @@ class KeyHook:
                                     # Dispatch immediately and suppress if Exclusive Mode is on
                                     # (this also swallows keypad VK_INSERT when NumLock is OFF,
                                     # so the '000' burst never toggles Insert/Overtype mode).
-                                    self._queue_from_ll(name, is_down, vk_code)
+                                    self._queue_from_ll(name, is_down, vk_code, int(kb.scanCode))
                                     if self._suppress:
                                         return 1
                                 else:
@@ -1348,7 +1443,7 @@ class KeyHook:
                                     # (non-extended scancode 0x52 or VK_NUMPAD0) so '000' burst is never leaked.
                                     is_keypad_zero = (int(kb.scanCode) == 0x52 and not extended) or (vk_code == VK_NUMPAD0)
                                     if (self._last_raw_matched or is_keypad_zero) and name not in ("Tab", "Backspace"):
-                                        self._queue_from_ll(name, is_down, vk_code)
+                                        self._queue_from_ll(name, is_down, vk_code, int(kb.scanCode))
                                         if self._suppress:
                                             return 1
                 except Exception as exc:
@@ -1400,8 +1495,9 @@ class KeyHook:
                 break
             name, is_down = item[0], item[1]
             vk = item[2] if len(item) > 2 else 0
+            scan = item[3] if len(item) > 3 else 0
             try:
-                self._dispatch(name, is_down, vk)
+                self._dispatch(name, is_down, vk, scan)
             except Exception:
                 pass
 
@@ -1449,20 +1545,39 @@ class KeyHook:
         return kb_paths, cons_paths
 
     def _mac_start(self) -> None:
-        """Start macOS native IOHIDManager input listener."""
+        """Start BOTH macOS native listeners:
+        the IOHIDManager input pipeline (both composite HID interfaces) and the
+        CGEventTap that swallows keypad codes when Exclusive Mode is enabled
+        (the tap runs passive pass-through while suppression is off, so
+        toggling Exclusive Mode takes effect without a restart)."""
         self._mac_thread = threading.Thread(
             target=self._mac_iohid_loop, name="NumpadMacIOHIDWorker", daemon=True
         )
         self._mac_thread.start()
+        self._mac_tap_thread = threading.Thread(
+            target=self._mac_tap_loop, name="NumpadMacTapWorker", daemon=True
+        )
+        self._mac_tap_thread.start()
 
     def _mac_stop(self) -> None:
-        """Stop macOS native IOHIDManager run loop."""
-        if self._mac_thread is not None:
-            self._mac_thread.join(timeout=1.0)
-            self._mac_thread = None
+        """Stop the macOS IOHIDManager run loop and the CGEventTap."""
+        for thread in (self._mac_thread, self._mac_tap_thread):
+            if thread is not None:
+                thread.join(timeout=1.0)
+        self._mac_thread = None
+        self._mac_tap_thread = None
+        self._mac_tap_ref, self._mac_tap_cb_ref, self._mac_tap_src_ref = None, None, None
 
     def _mac_iohid_loop(self) -> None:
-        """Dedicated background daemon thread running native IOHIDManager with value and report callbacks."""
+        """Dedicated daemon thread running the native IOHIDManager input pipeline.
+
+        The composite USB keypad exposes two HID interfaces: the numeric keys on
+        the GenericDesktop Keyboard/Keypad interface (usage page 0x01, usages
+        6/7) and Home/Email/Calc on the Consumer Control interface (page 0x0C).
+        ``IOHIDManagerSetDeviceMatchingMultiple`` binds to BOTH interfaces of
+        the composite device simultaneously, which fixes numeric keys not being
+        seen when only the Consumer interface was previously bound.
+        """
         if not IS_MAC:
             return
         manager = None
@@ -1493,12 +1608,24 @@ class KeyHook:
             cf.CFStringCreateWithCString.restype = c_void_p
             cf.CFNumberGetValue.argtypes = [c_void_p, c_int32, c_void_p]
             cf.CFNumberGetValue.restype = c_bool
+            cf.CFNumberCreate.argtypes = [c_void_p, c_int32, POINTER(c_int32)]
+            cf.CFNumberCreate.restype = c_void_p
+            cf.CFArrayCreateMutable.argtypes = [c_void_p, c_long, c_void_p]
+            cf.CFArrayCreateMutable.restype = c_void_p
+            cf.CFArrayAppendValue.argtypes = [c_void_p, c_void_p]
+            cf.CFArrayAppendValue.restype = None
+            cf.CFDictionaryCreateMutable.argtypes = [c_void_p, c_long, c_void_p, c_void_p]
+            cf.CFDictionaryCreateMutable.restype = c_void_p
+            cf.CFDictionarySetValue.argtypes = [c_void_p, c_void_p, c_void_p]
+            cf.CFDictionarySetValue.restype = None
             cf.CFRunLoopGetCurrent.restype = c_void_p
             cf.CFRunLoopRunInMode.argtypes = [c_void_p, c_double, c_bool]
             cf.CFRunLoopRunInMode.restype = c_int32
 
             iokit.IOHIDManagerCreate.argtypes = [c_void_p, c_uint32]
             iokit.IOHIDManagerCreate.restype = c_void_p
+            iokit.IOHIDManagerSetDeviceMatchingMultiple.argtypes = [c_void_p, c_void_p]
+            iokit.IOHIDManagerSetDeviceMatchingMultiple.restype = None
             iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
             iokit.IOHIDManagerSetDeviceMatching.restype = None
 
@@ -1540,8 +1667,62 @@ class KeyHook:
 
             self._mac_iohid_manager = manager
 
-            # Non-exclusive matching of all devices; filter by target in callbacks
-            iokit.IOHIDManagerSetDeviceMatching(manager, None)
+            # Build an array of matching dictionaries so BOTH composite
+            # interfaces bind: GenericDesktop Keyboard (0x01/6), GenericDesktop
+            # Keypad (0x01/7) and Consumer Control (0x0C/1).
+            matching_array = cf.CFArrayCreateMutable(None, c_long(0), None)
+            dict_refs: list = []
+            if matching_array:
+                page_key = cf.CFStringCreateWithCString(
+                    None, b"DeviceUsagePage", 0x08000100
+                )
+                usage_key = cf.CFStringCreateWithCString(
+                    None, b"DeviceUsage", 0x08000100
+                )
+                for page_value, usage_value in _MAC_MATCHING_DICTS:
+                    try:
+                        page_ref = c_int32(page_value)
+                        usage_ref = c_int32(usage_value)
+                        page_num = cf.CFNumberCreate(None, 3, byref(page_ref))
+                        usage_num = cf.CFNumberCreate(None, 3, byref(usage_ref))
+                        device_dict = cf.CFDictionaryCreateMutable(None, c_long(0), None, None)
+                        cf.CFDictionarySetValue(device_dict, page_key, page_num)
+                        cf.CFDictionarySetValue(device_dict, usage_key, usage_num)
+                        cf.CFArrayAppendValue(matching_array, device_dict)
+                        # The dicts use NULL callbacks (no inherent retention), so all
+                        # refs must outlive the SetDeviceMatchingMultiple call below.
+                        dict_refs.append((page_num, usage_num, device_dict))
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not build IOHID matching dict %s: %s",
+                            (page_value, usage_value), exc,
+                        )
+
+            if matching_array:
+                iokit.IOHIDManagerSetDeviceMatchingMultiple(manager, matching_array)
+                logger.info(
+                    "IOHIDManager bound to BOTH composite interfaces via "
+                    "SetDeviceMatchingMultiple (matching dicts: %d)",
+                    len(dict_refs),
+                )
+                for ref_tuple in dict_refs:
+                    for ref in ref_tuple:  # release after the manager copies what it needs
+                        try:
+                            cf.CFRelease(ref)
+                        except Exception:
+                            pass
+                cf.CFRelease(matching_array)
+                if page_key:
+                    cf.CFRelease(page_key)
+                if usage_key:
+                    cf.CFRelease(usage_key)
+            else:
+                # Fallback: unconstrained matching (superset of all dicts).
+                logger.warning(
+                    "IOHIDManagerSetDeviceMatchingMultiple dictionaries unavailable; "
+                    "falling back to unconstrained matching"
+                )
+                iokit.IOHIDManagerSetDeviceMatching(manager, None)
 
             k_vid = cf.CFStringCreateWithCString(None, b"VendorID", 0x08000100)
             k_pid = cf.CFStringCreateWithCString(None, b"ProductID", 0x08000100)
@@ -1590,11 +1771,7 @@ class KeyHook:
                     int_val = int(iokit.IOHIDValueGetIntegerValue(value_ref))
                     is_down = bool(int_val != 0)
 
-                    name = None
-                    if page == 7 or page == 1:
-                        name = HID_KEYPAD_USAGE_MAP.get(usage)
-                    elif page == 0x0C:
-                        name = HID_CONSUMER_USAGE_MAP.get(usage)
+                    name = mac_usage_name(int(page), int(usage))
 
                     if name:
                         self._dispatch(name, is_down, vk=usage)
@@ -1642,6 +1819,143 @@ class KeyHook:
             self._mac_iohid_manager = None
             self._mac_value_cb_ref = None
 
+    # ---------------------------------------------------------------- macOS CGEventTap swallow
+    def _mac_tap_loop(self) -> None:
+        """Dedicated daemon thread hosting a CGEventTap that swallows keypad codes.
+
+        Raw IOHID capture cannot withhold events the macOS window system has
+        already delivered to the focused application; a *modifying* CGEventTap
+        (``kCGEventTapOptionDefault``) is the userland way to swallow the
+        external keypad's codes so they do not type numbers into the macOS UI
+        (requires the Accessibility permission). Codes are the kVK_ANSI keypad
+        cluster (always safe: internal MacBook keyboards never emit them) plus
+        the PC-navigation cluster only when a specific external keypad is
+        targeted, because those codes are shared with the internal keyboard.
+        """
+        if not IS_MAC:
+            return
+        cg = None
+        cf = None
+        tap = None
+        source = None
+        mode_ref = None
+        try:
+            from ctypes import (
+                CFUNCTYPE, byref, c_bool, c_char_p, c_double, c_int32, c_longlong,
+                c_uint32, c_uint64, c_void_p, cdll, util,
+            )
+
+            cg_path = (
+                util.find_library("CoreGraphics")
+                or "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+            )
+            cf_path = (
+                util.find_library("CoreFoundation")
+                or "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+            )
+            cg = cdll.LoadLibrary(cg_path)
+            cf = cdll.LoadLibrary(cf_path)
+
+            cf.CFRelease.argtypes = [c_void_p]
+            cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
+            cf.CFStringCreateWithCString.restype = c_void_p
+            cf.CFRunLoopGetCurrent.restype = c_void_p
+            cf.CFRunLoopRunInMode.argtypes = [c_void_p, c_double, c_bool]
+            cf.CFRunLoopRunInMode.restype = c_int32
+            cf.CFRunLoopAddSource.argtypes = [c_void_p, c_void_p, c_void_p]
+            cf.CFRunLoopAddSource.restype = None
+
+            CGEventTapCallback = CFUNCTYPE(c_void_p, c_void_p, c_uint32, c_void_p, c_void_p)
+
+            cg.CGEventTapCreate.argtypes = [
+                c_uint32, c_uint32, c_uint32, c_uint64, CGEventTapCallback, c_void_p
+            ]
+            cg.CGEventTapCreate.restype = c_void_p
+            cg.CGEventTapGetRunLoopSource.argtypes = [c_void_p]
+            cg.CGEventTapGetRunLoopSource.restype = c_void_p
+            cg.CGEventTapEnable.argtypes = [c_void_p, c_bool]
+            cg.CGEventTapEnable.restype = None
+            cg.CGEventTapIsEnabled.argtypes = [c_void_p]
+            cg.CGEventTapIsEnabled.restype = c_bool
+            cg.CGEventGetIntegerValueField.argtypes = [c_void_p, c_uint32]
+            cg.CGEventGetIntegerValueField.restype = c_longlong
+
+            tap_codes = set(_MAC_TAP_NUMPAD_CODES)
+            with self._lock:
+                targeted = bool(self._target_device)
+            if targeted:
+                tap_codes |= _MAC_TAP_NAV_CODES
+            tap_codes = frozenset(tap_codes)
+
+            def _tap_callback(proxy, ev_type, event_ref, refcon) -> int:
+                try:
+                    if event_ref:
+                        # macOS disables taps that stall; re-enable and pass through.
+                        if ev_type in (254, 255):  # disabled by user input / timeout
+                            cg.CGEventTapEnable(tap, True)
+                            return event_ref
+                        keycode = int(
+                            cg.CGEventGetIntegerValueField(event_ref, _MAC_FIELD_KEYCODE)
+                        )
+                        if keycode in tap_codes and self._suppress:
+                            return 0  # NULL CGEventRef -> the OS event is swallowed
+                    return event_ref
+                except Exception as exc:
+                    logger.debug("CGEventTap callback error: %s", exc)
+                    return event_ref or 0
+
+            self._mac_tap_cb_ref = CGEventTapCallback(_tap_callback)
+            # kCGSessionEventTap (1), kCGHeadInsertEventTap (0), kCGEventTapOptionDefault (0)
+            tap = cg.CGEventTapCreate(
+                1, 0, 0, c_uint64(_MAC_EVENT_MASK), self._mac_tap_cb_ref, None
+            )
+            if not tap:
+                logger.warning(
+                    "CGEventTapCreate failed - keypad keys will not be blocked from the "
+                    "macOS UI. Grant NumpadToMIDI2 Accessibility in System Settings > "
+                    "Privacy & Security (raw HID capture keeps working without it)."
+                )
+                return
+            self._mac_tap_ref = tap
+            self._mac_tap_granted = True
+            source = cg.CGEventTapGetRunLoopSource(tap)
+            self._mac_tap_src_ref = source
+
+            current_rl = cf.CFRunLoopGetCurrent()
+            mode_ref = cf.CFStringCreateWithCString(
+                None, b"kCFRunLoopDefaultMode", 0x08000100
+            )
+            cf.CFRunLoopAddSource(current_rl, source, mode_ref)
+            cg.CGEventTapEnable(tap, True)
+            logger.info(
+                "CGEventTap installed - swallowing %d keypad keycodes (Exclusive Mode %s)",
+                len(tap_codes),
+                "on" if self._suppress else "off (tap is passive)",
+            )
+
+            while self._running:
+                cf.CFRunLoopRunInMode(mode_ref, c_double(0.1), False)
+        except Exception as exc:
+            logger.warning("macOS CGEventTap error: %s", exc)
+        finally:
+            try:
+                if cg is not None and tap:
+                    cg.CGEventTapEnable(
+                        self._mac_tap_ref if self._mac_tap_ref == tap else tap, False
+                    )
+            except Exception:
+                pass
+            for ref in (source, tap, mode_ref):
+                try:
+                    if ref:
+                        cf.CFRelease(ref)
+                except Exception:
+                    pass
+            if tap:
+                self._mac_tap_ref = None
+            self._mac_tap_src_ref = None
+            self._mac_tap_granted = False
+
     def _generic_press(self, key) -> None:  # pragma: no cover
         name = self._generic_name(key)
         if name:
@@ -1658,12 +1972,14 @@ class KeyHook:
         return char if char in KEY_INDEX else None
 
     # ------------------------------------------------------------- debounce core
-    def _dispatch(self, name: str, down: bool, vk: int = 0) -> None:
+    def _dispatch(self, name: str, down: bool, vk: int = 0, scan: int = 0) -> None:
         with self._lock:
             if name == "0" and self.detect_triple_zero:
                 # Both VK_NUMPAD0 (NumLock ON) and keypad VK_INSERT (NumLock OFF) arrive
                 # here as "0", so mixed or NumLock-OFF bursts share one triplet detector.
-                self._zero_event(down, vk)
+                # ``scan`` is the hardware OEM scancode (0x52 = physical keypad 0), used
+                # for scancode-first burst tracking and diagnostics.
+                self._zero_event(down, vk, scan)
             else:
                 self._emit(name, down)
 
@@ -1682,12 +1998,12 @@ class KeyHook:
         except Exception:  # a UI/MIDI error must not kill the hook thread
             pass
 
-    def _zero_event(self, down: bool, vk: int = 0) -> None:
+    def _zero_event(self, down: bool, vk: int = 0, scan: int = 0) -> None:
         now = time.perf_counter()
         delta_ms = (now - self._last_zero_ts) * 1000.0 if self._last_zero_ts > 0.0 else 0.0
         self._last_zero_ts = now
         event_type = "KEYDOWN" if down else "KEYUP"
-        source = zero_vk_label(vk)
+        source = zero_vk_label(vk, scan)
         logger.info(
             "Keypad 0 [%s] (%s, timestamp=%.6f, delta_ms=%.2f)",
             source,
@@ -1696,7 +2012,7 @@ class KeyHook:
             delta_ms,
         )
 
-        eff_window = max(self.burst_window, 0.080)
+        eff_window = max(self.burst_window, _BURST_WINDOW_FLOOR)
         # Slower firmware debounce/scan cadence observed on NumLock-OFF VK_INSERT bursts
         if vk in (VK_INSERT, 114) or self._zlast_vk in (VK_INSERT, 114):
             eff_window = max(eff_window, 0.120)

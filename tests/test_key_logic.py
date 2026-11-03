@@ -553,6 +553,114 @@ class StartupSafetyTests(unittest.TestCase):
         hook.stop()
         self.assertEqual(rec.events, [("000", True), ("000", False)])
 
+    def test_zero_vk_label_reports_scancode_0x52(self):
+        """Scancode-tracked '0' strokes are labelled with the hardware scancode."""
+        from key_hook import zero_vk_label, VK_NUMPAD0, VK_INSERT
+
+        self.assertEqual(
+            zero_vk_label(VK_NUMPAD0, 0x52), "VK_NUMPAD0/NumLock-ON [Scancode 0x52]"
+        )
+        self.assertEqual(
+            zero_vk_label(VK_INSERT, 0x52), "VK_INSERT/NumLock-OFF [Scancode 0x52]"
+        )
+        self.assertEqual(zero_vk_label(0, 0x52), "KEYPAD0 [Scancode 0x52]")
+        self.assertEqual(zero_vk_label(VK_NUMPAD0), "VK_NUMPAD0/NumLock-ON")
+
+    def test_scancode_threaded_triplet_burst(self):
+        """Queue items carry the hardware scancode; 3 rapid 0x52 strokes fire '000'.
+
+        This is the exact tuple shape produced by WH_KEYBOARD_LL (_queue_from_ll)
+        and Win32 Raw Input (_process_raw_keyboard): (name, is_down, vk, scan).
+        """
+        from unittest.mock import patch
+        from key_hook import VK_NUMPAD0, VK_INSERT
+
+        scenarios = {
+            "NumLock ON (3x VK_NUMPAD0, scan 0x52)": [VK_NUMPAD0] * 3,
+            "NumLock OFF (3x VK_INSERT, scan 0x52)": [VK_INSERT] * 3,
+            "Mixed with scancode 0x52": [VK_NUMPAD0, VK_INSERT, VK_NUMPAD0],
+        }
+        for label, vks in scenarios.items():
+            with self.subTest(label):
+                clock = [10.0]
+                with patch("key_hook.time.perf_counter", side_effect=lambda: clock[0]):
+                    hook, rec = make(burst_window_ms=75)
+                    for vk in vks:
+                        hook._win_queue.put(("0", True, vk, 0x52))
+                        clock[0] += 0.008
+                        hook._win_queue.put(("0", False, vk, 0x52))
+                        clock[0] += 0.008
+                    while not hook._win_queue.empty():
+                        item = hook._win_queue.get_nowait()
+                        if item:
+                            hook._dispatch(*item)
+                    hook.stop()
+                self.assertEqual(rec.events, [("000", True), ("000", False)], label)
+
+        # A single slow scancode-0x52 press still yields a plain '0'
+        with self.subTest("single slow press (scan 0x52)"):
+            hook, rec = make(burst_window_ms=75)
+            hook._win_queue.put(("0", True, VK_NUMPAD0, 0x52))
+            hook._dispatch(*hook._win_queue.get_nowait())
+            import time
+
+            time.sleep(0.12)
+            hook._win_queue.put(("0", False, VK_NUMPAD0, 0x52))
+            hook._dispatch(*hook._win_queue.get_nowait())
+            hook.stop()
+            self.assertEqual(rec.events, [("0", True), ("0", False)])
+
+    def test_mac_usage_name_maps_both_interfaces(self):
+        """mac_usage_name routes GenericDesktop/Keyboard/Consumer pages correctly."""
+        from key_hook import (
+            HID_PAGE_CONSUMER,
+            HID_PAGE_GENERIC_DESKTOP,
+            HID_PAGE_KEYBOARD,
+            mac_usage_name,
+        )
+
+        # Keyboard interface: keypad digits usages 0x59..0x62
+        self.assertEqual(mac_usage_name(HID_PAGE_KEYBOARD, 0x59), "1")
+        self.assertEqual(mac_usage_name(HID_PAGE_KEYBOARD, 0x62), "0")
+        self.assertEqual(mac_usage_name(HID_PAGE_KEYBOARD, 0x63), ".")
+        self.assertEqual(mac_usage_name(HID_PAGE_KEYBOARD, 0x58), "Enter")
+        # GenericDesktop primary page also routes to the keypad map
+        self.assertEqual(mac_usage_name(HID_PAGE_GENERIC_DESKTOP, 0x5A), "2")
+        # Consumer interface: Home / Email / Calc
+        self.assertEqual(mac_usage_name(HID_PAGE_CONSUMER, 0x0223), "Home")
+        self.assertEqual(mac_usage_name(HID_PAGE_CONSUMER, 0x018A), "Email")
+        self.assertEqual(mac_usage_name(HID_PAGE_CONSUMER, 0x0192), "Calc")
+        # Unmapped page (e.g. digitizer 0x0D) is ignored
+        self.assertIsNone(mac_usage_name(0x0D, 0x01))
+
+    def test_hid_keypad_usages_route_to_midi_notes(self):
+        """Usages 0x59 (keypad 1) .. 0x62 (keypad 0) resolve to MIDI notes ≧ 36."""
+        from key_hook import HID_KEYPAD_USAGE_MAP, KEY_INDEX
+
+        for usage in range(0x59, 0x63):  # keypad 1..0, per the task spec
+            name = HID_KEYPAD_USAGE_MAP[usage]
+            note = 36 + KEY_INDEX[name] if name != "000" else 37
+            self.assertTrue(36 <= note <= 127, f"usage 0x{usage:02X} -> note {note}")
+
+    def test_mac_tap_code_sets(self):
+        """CGEventTap code sets: keypad cluster swallowed; shared keys protected."""
+        from key_hook import _MAC_TAP_NAV_CODES, _MAC_TAP_NUMPAD_CODES
+
+        # Tab (48) / Backspace (51) are shared with the internal keyboard
+        self.assertNotIn(48, _MAC_TAP_NUMPAD_CODES)
+        self.assertNotIn(51, _MAC_TAP_NUMPAD_CODES)
+        # The full kVK_ANSI keypad cluster is always swallow-eligible
+        for code in (65, 67, 69, 71, 75, 76, 78,
+                     82, 83, 84, 85, 86, 87, 88, 89, 91, 92):
+            self.assertIn(code, _MAC_TAP_NUMPAD_CODES)
+        self.assertEqual(len(_MAC_TAP_NUMPAD_CODES), 17)
+        # The PC-navigation cluster never overlaps the always-safe set
+        self.assertTrue(_MAC_TAP_NUMPAD_CODES.isdisjoint(_MAC_TAP_NAV_CODES))
+        self.assertEqual(
+            _MAC_TAP_NAV_CODES,
+            frozenset({114, 115, 116, 117, 119, 121, 123, 124, 125, 126}),
+        )
+
     def test_check_macos_accessibility(self):
         from key_hook import check_macos_accessibility
         # Under Windows/Linux, always returns True

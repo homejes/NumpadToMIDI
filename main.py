@@ -1,4 +1,4 @@
-"""NumpadToMIDI - turn a 23-key USB numpad into a (virtual) MIDI controller."""
+"""NumpadToMIDI2 - turn a 23-key USB numpad into a (virtual) MIDI controller."""
 from __future__ import annotations
 
 import ctypes
@@ -13,8 +13,8 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-APP_NAME = "NumpadToMIDI"
-LOG_FILE_TEMP = os.path.join(tempfile.gettempdir(), "NumpadToMIDI.log")
+APP_NAME = "NumpadToMIDI2"
+LOG_FILE_TEMP = os.path.join(tempfile.gettempdir(), "NumpadToMIDI2.log")
 LOG_FILE_APPDATA = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME, "debug.log"
 )
@@ -572,7 +572,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.ctrl = ctrl
         self._quitting = False
-        self.setWindowTitle(f"NumpadToMIDI {VERSION}")
+        self.setWindowTitle(f"NumpadToMIDI2 {VERSION}")
         self.setWindowIcon(make_app_icon())
         self.resize(1040, 700)
         self.setMinimumSize(880, 620)
@@ -613,7 +613,7 @@ class MainWindow(QMainWindow):
         # header
         head = QHBoxLayout()
         titles = QVBoxLayout()
-        title = QLabel("NumpadToMIDI")
+        title = QLabel("NumpadToMIDI2")
         title.setObjectName("title")
         sub = QLabel("23-key M-Tech USB numpad  \u2192  MIDI  (Chromatic Drum Rack layout, C1 = 36)")
         sub.setObjectName("subtitle")
@@ -634,8 +634,9 @@ class MainWindow(QMainWindow):
         banner_lay = QHBoxLayout(self.perm_banner)
         banner_lay.setContentsMargins(12, 8, 12, 8)
         self.perm_label = QLabel(
-            "\u26a0\ufe0f macOS Input Monitoring & Accessibility permissions required to capture numpad keys. "
-            "Please open System Settings > Privacy & Security to enable NumpadToMIDI."
+            "\u26a0\ufe0f macOS Accessibility permission needed for Exclusive Mode (blocking "
+            "numpad keys from typing into apps). Raw keypad capture works without it. "
+            "Please open System Settings > Privacy & Security to enable NumpadToMIDI2."
         )
         self.perm_label.setStyleSheet("color: #ffb454; font-weight: 600;")
         banner_lay.addWidget(self.perm_label)
@@ -782,7 +783,7 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(f"{APP_NAME} {VERSION}")
 
         self.tray_menu = QMenu(self)
-        self.action_open = QAction("Open NumpadToMIDI", self)
+        self.action_open = QAction("Open NumpadToMIDI2", self)
         self.action_open.triggered.connect(self.restore_from_tray)
         self.tray_menu.addAction(self.action_open)
 
@@ -794,7 +795,7 @@ class MainWindow(QMainWindow):
 
         self.tray_menu.addSeparator()
 
-        self.action_quit = QAction("Quit NumpadToMIDI", self)
+        self.action_quit = QAction("Quit NumpadToMIDI2", self)
         self.action_quit.triggered.connect(self.quit_app)
         self.tray_menu.addAction(self.action_quit)
 
@@ -829,7 +830,7 @@ class MainWindow(QMainWindow):
             self.hide()
             self.tray.showMessage(
                 APP_NAME,
-                "NumpadToMIDI is running in the system tray",
+                "NumpadToMIDI2 is running in the system tray",
                 QSystemTrayIcon.MessageIcon.Information,
                 3000,
             )
@@ -866,7 +867,7 @@ class MainWindow(QMainWindow):
         if name and name != "__virtual__":
             self.ctrl.engine.open_port_by_name(name)
             self.ctrl.config["port_name"] = name
-        else:  # "Virtual port: NumpadToMIDI" entry
+        else:  # "Virtual port: NumpadToMIDI2" entry
             self.ctrl.config["port_name"] = ""
             self.ctrl.engine.reinitialize_virtual_port()
         self.ctrl.config.save()
@@ -1002,12 +1003,15 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
     ctrl.log.emit(f"{ctrl._ts()}  {engine.description}")
     if start_hook:
         if sys.platform == "darwin":
-            has_perm = check_macos_permissions(prompt=True)
+            has_perm = check_macos_permissions(
+                prompt=True, suppress=bool(config["suppress_keys"])
+            )
             if not has_perm:
                 win.show_permission_warning(True)
                 ctrl.log.emit(
-                    f"{ctrl._ts()}  macOS: Input Monitoring & Accessibility permissions required to capture numpad keys. "
-                    "Please grant NumpadToMIDI in System Settings > Privacy & Security."
+                    f"{ctrl._ts()}  macOS: Accessibility permission required for Exclusive "
+                    "Mode (blocking keypad keys from typing). Please grant NumpadToMIDI2 in "
+                    "System Settings > Privacy & Security; capture keeps working meanwhile."
                 )
             else:
                 win.show_permission_warning(False)
@@ -1068,9 +1072,9 @@ def selftest() -> int:
         if sys.platform == "win32":
             assert APP_NAME in str(ctrl.config.path)
         assert [a.text() for a in win.tray_menu.actions() if not a.isSeparator()] == [
-            "Open NumpadToMIDI",
+            "Open NumpadToMIDI2",
             "Mute MIDI",
-            "Quit NumpadToMIDI",
+            "Quit NumpadToMIDI2",
         ]
         win.hide()
         lines.append(f"SELFTEST OK ({ctrl.engine.description})")
@@ -1083,7 +1087,7 @@ def selftest() -> int:
     payload = "\n".join(lines)
     targets = [
         Path("selftest.log"),
-        Path(os.path.join(tempfile.gettempdir(), "NumpadToMIDI-selftest.log")),
+        Path(os.path.join(tempfile.gettempdir(), "NumpadToMIDI2-selftest.log")),
     ]
     env_target = os.environ.get("SELFTEST_LOG")
     if env_target:
