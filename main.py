@@ -82,13 +82,13 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMainWindow, QMenu, QPlainTextEdit, QPushButton, QSizePolicy, QSlider,
-    QSystemTrayIcon, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
+    QSlider, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from key_hook import (
     ALL_DEVICES_ID, ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
-    KEY_SPAN, KeyHook, check_macos_permissions,
+    KEY_SPAN, KeyHook, check_macos_accessibility,
 )
 from midi_engine import MidiEngine, note_name
 from version import VERSION
@@ -120,6 +120,24 @@ APPCOMMAND_TO_KEY: dict[int, str] = {
 def get_appcommand_lparam(lparam: int) -> int:
     """Win32 GET_APPCOMMAND_LPARAM(lParam) macro."""
     return (int(lparam) >> 16) & 0xFFF
+
+
+def show_accessibility_dialog() -> None:
+    """Native PyQt warning when the macOS CGEventTap cannot be created.
+
+    Shown from the GUI thread via ``build_app`` on macOS whenever Accessibility
+    is not granted for the process: the crash-safe tap guard in ``key_hook``
+    refuses to create/attach the ``CGEventTap``, so the user is told how to
+    unlock Exclusive Mode (keystroke swallowing for DAWs like Logic Pro).
+    """
+    if "--selftest" in sys.argv:
+        return
+    QMessageBox.warning(
+        None,
+        f"{APP_NAME} - Accessibility permissions required",
+        "Accessibility permissions required. Please enable NumpadToMIDI2 in "
+        "System Settings > Privacy & Security > Accessibility, then restart the app.",
+    )
 
 
 # =============================================================================
@@ -1003,19 +1021,30 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
     ctrl.log.emit(f"{ctrl._ts()}  {engine.description}")
     if start_hook:
         if sys.platform == "darwin":
-            has_perm = check_macos_permissions(
-                prompt=True, suppress=bool(config["suppress_keys"])
-            )
-            if not has_perm:
+            # Crash-safe CGEventTap initialization: verify Accessibility BEFORE the
+            # tap is attempted (the tap thread re-verifies and refuses to attach
+            # the run loop without permission). Without the permission the app
+            # runs safely without keystroke swallowing - raw HID capture (both
+            # composite interfaces) keeps working.
+            trusted = check_macos_accessibility(prompt=False)
+            if not trusted:
+                show_accessibility_dialog()
                 win.show_permission_warning(True)
+                with ctrl.hook._lock:
+                    ctrl.hook._mac_tap_granted = False
+                    ctrl.hook._mac_tap_block_reason = "accessibility"
                 ctrl.log.emit(
-                    f"{ctrl._ts()}  macOS: Accessibility permission required for Exclusive "
-                    "Mode (blocking keypad keys from typing). Please grant NumpadToMIDI2 in "
-                    "System Settings > Privacy & Security; capture keeps working meanwhile."
+                    f"{ctrl._ts()}  macOS: Accessibility permissions required. Please "
+                    "enable NumpadToMIDI2 in System Settings > Privacy & Security > "
+                    "Accessibility, then restart the app. Raw keypad capture keeps "
+                    "working meanwhile (keystrokes are not blocked without the tap)."
                 )
             else:
                 win.show_permission_warning(False)
-                ctrl.log.emit(f"{ctrl._ts()}  macOS: Event permissions verified.")
+                ctrl.log.emit(
+                    f"{ctrl._ts()}  macOS: Accessibility verified - CGEventTap "
+                    "will swallow numpad keystrokes (Exclusive Mode)."
+                )
             ctrl.hook.start()
         else:
             ctrl.hook.start()
