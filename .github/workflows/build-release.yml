@@ -66,7 +66,7 @@ jobs:
             exit 1
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "Building NumpadToMIDI2 v$VERSION"
+          echo "Building NumpadToMIDI v$VERSION"
 
       - name: Run unit tests
         shell: bash
@@ -95,9 +95,9 @@ jobs:
         shell: pwsh
         run: |
           $env:SELFTEST_LOG = "$PWD\selftest.log"
-          $p = Start-Process -FilePath "dist/NumpadToMIDI2-Windows.exe" -ArgumentList "--selftest" -Wait -PassThru
+          $p = Start-Process -FilePath "dist/NumpadToMIDI-Windows.exe" -ArgumentList "--selftest" -Wait -PassThru
           if (Test-Path selftest.log) { Get-Content selftest.log }
-          if (Test-Path "$env:TEMP\NumpadToMIDI2.log") { Get-Content "$env:TEMP\NumpadToMIDI2.log" }
+          if (Test-Path "$env:TEMP\NumpadToMIDI.log") { Get-Content "$env:TEMP\NumpadToMIDI.log" }
           if ($p.ExitCode -ne 0) { throw "Selftest failed with exit code $($p.ExitCode)" }
 
       - name: Install Inno Setup
@@ -123,7 +123,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $setup = "dist\NumpadToMIDI2-Setup-v$env:VERSION.exe"
+          $setup = "dist\NumpadToMIDI-Setup-v$env:VERSION.exe"
           if (-not (Test-Path $setup)) { throw "$setup was not produced" }
           $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
@@ -131,10 +131,10 @@ jobs:
           Write-Host "Installer exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { throw "Installer failed with exit code $($p.ExitCode)" }
           $checks = @{
-            "app exe"       = "$env:ProgramFiles\NumpadToMIDI2\NumpadToMIDI2.exe"
-            "app icon"      = "$env:ProgramFiles\NumpadToMIDI2\icon.ico"
-            "start menu"    = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\NumpadToMIDI2\NumpadToMIDI2.lnk"
-            "desktop"       = "$env:PUBLIC\Desktop\NumpadToMIDI2.lnk"
+            "app exe"       = "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe"
+            "app icon"      = "$env:ProgramFiles\NumpadToMIDI\icon.ico"
+            "start menu"    = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\NumpadToMIDI\NumpadToMIDI.lnk"
+            "desktop"       = "$env:PUBLIC\Desktop\NumpadToMIDI.lnk"
             "midi driver"   = "$env:SystemRoot\System32\teVirtualMIDI64.dll"
           }
           $failed = $false
@@ -156,7 +156,7 @@ jobs:
         run: |
           Remove-Item selftest.log -ErrorAction SilentlyContinue
           $env:SELFTEST_LOG = "$PWD\selftest.log"
-          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI2\NumpadToMIDI2.exe" -WorkingDirectory "$env:ProgramFiles\NumpadToMIDI2" -ArgumentList "--selftest" -Wait -PassThru
+          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe" -WorkingDirectory "$env:ProgramFiles\NumpadToMIDI" -ArgumentList "--selftest" -Wait -PassThru
           Get-Content selftest.log
           if ($p.ExitCode -ne 0) { throw "Installed app selftest failed ($($p.ExitCode))" }
           if (-not (Select-String -Path selftest.log -Pattern "Virtual MIDI source")) {
@@ -171,34 +171,34 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI2\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          $p = Start-Process -FilePath "$env:ProgramFiles\NumpadToMIDI\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "Uninstaller failed ($($p.ExitCode))" }
           Start-Sleep -Seconds 2
-          if (Test-Path "$env:ProgramFiles\NumpadToMIDI2\NumpadToMIDI2.exe") { throw "App was not removed" }
+          if (Test-Path "$env:ProgramFiles\NumpadToMIDI\NumpadToMIDI.exe") { throw "App was not removed" }
 
       - name: Upload Windows installer
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: dist/NumpadToMIDI2-Setup-v${{ env.VERSION }}.exe
+          path: dist/NumpadToMIDI-Setup-v${{ env.VERSION }}.exe
           if-no-files-found: error
 
       # -------------------------------------------------------------- macOS
       - name: Verify binary architecture (macOS)
         if: runner.os == 'macOS'
-        run: lipo -info dist/NumpadToMIDI2.app/Contents/MacOS/NumpadToMIDI2
+        run: lipo -info dist/NumpadToMIDI.app/Contents/MacOS/NumpadToMIDI
 
       - name: Ad-hoc codesign app bundle (macOS)
         if: runner.os == 'macOS'
         run: |
-          codesign --force --deep --preserve-metadata=entitlements -s - dist/NumpadToMIDI2.app
-          codesign --verify --deep --strict --verbose=2 dist/NumpadToMIDI2.app
+          codesign --force --deep --preserve-metadata=entitlements -s - dist/NumpadToMIDI.app
+          codesign --verify --deep --strict --verbose=2 dist/NumpadToMIDI.app
 
       - name: Smoke test frozen binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          QT_QPA_PLATFORM=offscreen arch -${{ matrix.target_arch }} dist/NumpadToMIDI2.app/Contents/MacOS/NumpadToMIDI2 --selftest
+          QT_QPA_PLATFORM=offscreen arch -${{ matrix.target_arch }} dist/NumpadToMIDI.app/Contents/MacOS/NumpadToMIDI --selftest
           cat selftest.log
 
       - name: Create DMG
@@ -210,7 +210,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/NumpadToMIDI2-macOS-*.dmg
+          path: dist/NumpadToMIDI-macOS-*.dmg
           if-no-files-found: error
 
   release:
@@ -229,15 +229,15 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ls -lh release-assets
-          test -f "release-assets/NumpadToMIDI2-Setup-v${VERSION}.exe"
-          test -f "release-assets/NumpadToMIDI2-macOS-Intel-v${VERSION}.dmg"
-          test -f "release-assets/NumpadToMIDI2-macOS-AppleSilicon-v${VERSION}.dmg"
-          test -f "release-assets/NumpadToMIDI2-macOS-v${VERSION}.dmg"
+          test -f "release-assets/NumpadToMIDI-Setup-v${VERSION}.exe"
+          test -f "release-assets/NumpadToMIDI-macOS-Intel-v${VERSION}.dmg"
+          test -f "release-assets/NumpadToMIDI-macOS-AppleSilicon-v${VERSION}.dmg"
+          test -f "release-assets/NumpadToMIDI-macOS-v${VERSION}.dmg"
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/NumpadToMIDI2-Setup-v*.exe
-            release-assets/NumpadToMIDI2-macOS-*.dmg
+            release-assets/NumpadToMIDI-Setup-v*.exe
+            release-assets/NumpadToMIDI-macOS-*.dmg
           generate_release_notes: true

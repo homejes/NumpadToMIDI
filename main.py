@@ -1,4 +1,7 @@
-"""NumpadToMIDI2 - turn a 23-key USB numpad into a (virtual) MIDI controller."""
+"""NumpadToMIDI - turn a 23-key USB numpad into a (virtual) MIDI controller.
+
+Created by Ryan Dharmawan.
+"""
 from __future__ import annotations
 
 import ctypes
@@ -13,8 +16,8 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-APP_NAME = "NumpadToMIDI2"
-LOG_FILE_TEMP = os.path.join(tempfile.gettempdir(), "NumpadToMIDI2.log")
+APP_NAME = "NumpadToMIDI"
+LOG_FILE_TEMP = os.path.join(tempfile.gettempdir(), "NumpadToMIDI.log")
 LOG_FILE_APPDATA = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME, "debug.log"
 )
@@ -122,6 +125,17 @@ def get_appcommand_lparam(lparam: int) -> int:
     return (int(lparam) >> 16) & 0xFFF
 
 
+#: Once-per-process guard: the Accessibility warning dialog must appear at most
+#: once per launch, no matter how many times the guard path is hit.
+_accessibility_dialog_shown = False
+
+#: Wording shown both in the native dialog and asserted by the selftest/tests.
+ACCESSIBILITY_MESSAGE = (
+    "Accessibility permissions required. Please enable NumpadToMIDI in "
+    "System Settings > Privacy & Security > Accessibility, then restart the app."
+)
+
+
 def show_accessibility_dialog() -> None:
     """Native PyQt warning when the macOS CGEventTap cannot be created.
 
@@ -129,14 +143,21 @@ def show_accessibility_dialog() -> None:
     is not granted for the process: the crash-safe tap guard in ``key_hook``
     refuses to create/attach the ``CGEventTap``, so the user is told how to
     unlock Exclusive Mode (keystroke swallowing for DAWs like Logic Pro).
+
+    The dialog is shown **exactly once per process** (``_accessibility_dialog_shown``
+    guard) and NEVER blocks the application: the MIDI engine keeps running
+    without keystroke swallowing.
     """
+    global _accessibility_dialog_shown
     if "--selftest" in sys.argv:
         return
+    if _accessibility_dialog_shown:
+        return
+    _accessibility_dialog_shown = True
     QMessageBox.warning(
         None,
         f"{APP_NAME} - Accessibility permissions required",
-        "Accessibility permissions required. Please enable NumpadToMIDI2 in "
-        "System Settings > Privacy & Security > Accessibility, then restart the app.",
+        ACCESSIBILITY_MESSAGE,
     )
 
 
@@ -409,6 +430,7 @@ QLabel#title { font-size: 22px; font-weight: 700; color: #ffffff; }
 QLabel#subtitle { color: #6b7592; }
 QLabel#section { color: #6b7592; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
 QLabel#value { color: #ffffff; font-weight: 600; min-width: 90px; }
+QLabel#credits { color: #6b7592; font-size: 11px; }
 QFrame#card { background: #161a24; border: 1px solid #232938; border-radius: 12px; }
 QPushButton { background: #232938; color: #e6ebf5; border: 1px solid #2d3447;
               border-radius: 8px; padding: 6px 14px; }
@@ -590,7 +612,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.ctrl = ctrl
         self._quitting = False
-        self.setWindowTitle(f"NumpadToMIDI2 {VERSION}")
+        self.setWindowTitle(f"NumpadToMIDI {VERSION}")
         self.setWindowIcon(make_app_icon())
         self.resize(1040, 700)
         self.setMinimumSize(880, 620)
@@ -631,7 +653,7 @@ class MainWindow(QMainWindow):
         # header
         head = QHBoxLayout()
         titles = QVBoxLayout()
-        title = QLabel("NumpadToMIDI2")
+        title = QLabel("NumpadToMIDI")
         title.setObjectName("title")
         sub = QLabel("23-key M-Tech USB numpad  \u2192  MIDI  (Chromatic Drum Rack layout, C1 = 36)")
         sub.setObjectName("subtitle")
@@ -642,6 +664,12 @@ class MainWindow(QMainWindow):
         self.status = QLabel()
         head.addWidget(self.status)
         outer.addLayout(head)
+
+        # Creator credits (visible in the header, next to the app title)
+        self.credits = QLabel("Created by Ryan Dharmawan | IG: @ryan.dharmawan")
+        self.credits.setObjectName("credits")
+        self.credits.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        outer.addWidget(self.credits)
 
         # macOS permissions warning banner
         self.perm_banner = QFrame()
@@ -654,7 +682,7 @@ class MainWindow(QMainWindow):
         self.perm_label = QLabel(
             "\u26a0\ufe0f macOS Accessibility permission needed for Exclusive Mode (blocking "
             "numpad keys from typing into apps). Raw keypad capture works without it. "
-            "Please open System Settings > Privacy & Security to enable NumpadToMIDI2."
+            "Please open System Settings > Privacy & Security to enable NumpadToMIDI."
         )
         self.perm_label.setStyleSheet("color: #ffb454; font-weight: 600;")
         banner_lay.addWidget(self.perm_label)
@@ -801,7 +829,7 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(f"{APP_NAME} {VERSION}")
 
         self.tray_menu = QMenu(self)
-        self.action_open = QAction("Open NumpadToMIDI2", self)
+        self.action_open = QAction("Open NumpadToMIDI", self)
         self.action_open.triggered.connect(self.restore_from_tray)
         self.tray_menu.addAction(self.action_open)
 
@@ -813,7 +841,7 @@ class MainWindow(QMainWindow):
 
         self.tray_menu.addSeparator()
 
-        self.action_quit = QAction("Quit NumpadToMIDI2", self)
+        self.action_quit = QAction("Quit NumpadToMIDI", self)
         self.action_quit.triggered.connect(self.quit_app)
         self.tray_menu.addAction(self.action_quit)
 
@@ -848,7 +876,7 @@ class MainWindow(QMainWindow):
             self.hide()
             self.tray.showMessage(
                 APP_NAME,
-                "NumpadToMIDI2 is running in the system tray",
+                "NumpadToMIDI is running in the system tray",
                 QSystemTrayIcon.MessageIcon.Information,
                 3000,
             )
@@ -885,7 +913,7 @@ class MainWindow(QMainWindow):
         if name and name != "__virtual__":
             self.ctrl.engine.open_port_by_name(name)
             self.ctrl.config["port_name"] = name
-        else:  # "Virtual port: NumpadToMIDI2" entry
+        else:  # "Virtual port: NumpadToMIDI" entry
             self.ctrl.config["port_name"] = ""
             self.ctrl.engine.reinitialize_virtual_port()
         self.ctrl.config.save()
@@ -1021,21 +1049,22 @@ def build_app(start_hook: bool = True) -> tuple[QApplication, Controller, MainWi
     ctrl.log.emit(f"{ctrl._ts()}  {engine.description}")
     if start_hook:
         if sys.platform == "darwin":
-            # Crash-safe CGEventTap initialization: verify Accessibility BEFORE the
-            # tap is attempted (the tap thread re-verifies and refuses to attach
-            # the run loop without permission). Without the permission the app
-            # runs safely without keystroke swallowing - raw HID capture (both
-            # composite interfaces) keeps working.
+            # Crash-safe CGEventTap initialization: the Accessibility verdict is
+            # taken EXACTLY ONCE (plain non-prompting AXIsProcessTrusted) and
+            # handed to the hook before it starts - the tap thread consumes the
+            # verdict and NEVER re-queries the OS. When the permission is
+            # missing we warn exactly once and keep running: the app does NOT
+            # block, and the raw HID capture of both composite interfaces keeps
+            # working (keystrokes bleed through to the OS until the user grants
+            # Accessibility and restarts).
             trusted = check_macos_accessibility(prompt=False)
+            ctrl.hook.macos_ax_trusted = trusted  # computed ONCE; the tap thread consumes this
             if not trusted:
                 show_accessibility_dialog()
                 win.show_permission_warning(True)
-                with ctrl.hook._lock:
-                    ctrl.hook._mac_tap_granted = False
-                    ctrl.hook._mac_tap_block_reason = "accessibility"
                 ctrl.log.emit(
                     f"{ctrl._ts()}  macOS: Accessibility permissions required. Please "
-                    "enable NumpadToMIDI2 in System Settings > Privacy & Security > "
+                    "enable NumpadToMIDI in System Settings > Privacy & Security > "
                     "Accessibility, then restart the app. Raw keypad capture keeps "
                     "working meanwhile (keystrokes are not blocked without the tap)."
                 )
@@ -1100,10 +1129,11 @@ def selftest() -> int:
         assert str(ctrl.config.path).endswith("config.json")
         if sys.platform == "win32":
             assert APP_NAME in str(ctrl.config.path)
+        assert win.credits.text() == "Created by Ryan Dharmawan | IG: @ryan.dharmawan"
         assert [a.text() for a in win.tray_menu.actions() if not a.isSeparator()] == [
-            "Open NumpadToMIDI2",
+            "Open NumpadToMIDI",
             "Mute MIDI",
-            "Quit NumpadToMIDI2",
+            "Quit NumpadToMIDI",
         ]
         win.hide()
         lines.append(f"SELFTEST OK ({ctrl.engine.description})")
@@ -1116,7 +1146,7 @@ def selftest() -> int:
     payload = "\n".join(lines)
     targets = [
         Path("selftest.log"),
-        Path(os.path.join(tempfile.gettempdir(), "NumpadToMIDI2-selftest.log")),
+        Path(os.path.join(tempfile.gettempdir(), "NumpadToMIDI-selftest.log")),
     ]
     env_target = os.environ.get("SELFTEST_LOG")
     if env_target:

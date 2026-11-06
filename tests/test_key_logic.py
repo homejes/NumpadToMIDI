@@ -171,9 +171,9 @@ class DebounceTests(unittest.TestCase):
         hook.stop()
         self.assertEqual(rec.events, [("1", True), ("1", False)])
 
-    def test_rolling_50ms_triplet_burst_and_hid_engine_pipeline(self):
+    def test_rolling_50ms_triplet_burst_and_ll_pipeline(self):
         from unittest.mock import patch
-        from key_hook import KeyboardDevice
+        from key_hook import KeyboardDevice, VK_NUMPAD0
 
         # Default burst_window must be 100 ms (0.100 s)
         default_hook, _ = KeyHook(Recorder()), None
@@ -193,20 +193,19 @@ class DebounceTests(unittest.TestCase):
             hook.stop()
         self.assertEqual(rec.events, [("000", True), ("000", False)])
 
-        # Unified hidapi engine pipeline: raw 8-byte reports fed through
-        # _win_process_hid_report are queued as (name, is_down, usage, 0) and the
-        # worker dispatch produces exactly one '000' Note On/Off for the burst.
+        # WH_KEYBOARD_LL pipeline: keystrokes intercepted by the hook are queued
+        # via _queue_from_ll as (name, is_down, vk, scan) and the worker dispatch
+        # produces exactly one '000' Note On/Off for the 3x scancode-0x52 burst.
         hook2, rec2 = make(burst_window_ms=75)
         hook2._devices = [KeyboardDevice(r"HID\VID_1C4F&PID_0002", "USB Keypad", "", {3003})]
         hook2._device_by_handle = {3003: hook2._devices[0]}
         hook2.set_target_device(r"HID\VID_1C4F&PID_0002")
-        kb_path = b"\\\\?\\hid#vid_1c4f&pid_0002&mi_00#0"
-        hook2._hid_kind[kb_path] = "kb"
         for _ in range(3):
-            for data in ([0, 0, 0x62, 0, 0, 0, 0, 0], [0] * 8):  # press, release
-                self.assertEqual(hook2._win_process_hid_report(kb_path, data), 1)
-                item = hook2._win_queue.get_nowait()
-                hook2._dispatch(item[0], item[1], item[2], item[3])
+            hook2._queue_from_ll("0", True, VK_NUMPAD0, 0x52)
+            hook2._queue_from_ll("0", False, VK_NUMPAD0, 0x52)
+        while not hook2._win_queue.empty():
+            item = hook2._win_queue.get_nowait()
+            hook2._dispatch(*item)
         hook2.stop()
         self.assertEqual(rec2.events, [("000", True), ("000", False)])
 
@@ -334,13 +333,13 @@ class StartupSafetyTests(unittest.TestCase):
             ctrl.shutdown()
 
     def test_numlock_off_triple_zero_burst(self):
-        """NumLock-off '000' bursts: raw HID Usage 0x62 routing + swallow correlations.
+        """NumLock-off '000' bursts: scancode 0x52 routing + swallow correlations.
 
-        The unified engine reads HID Usage 0x62 (keypad '0') directly, so the
-        NumLock state of Windows is irrelevant; the WH_KEYBOARD_LL hook only
-        needs Raw Input correlation bookkeeping to know which device typed.
+        The WH_KEYBOARD_LL hook resolves '0' by hardware scancode 0x52, so the
+        NumLock state of Windows is irrelevant; the Raw Input correlation
+        bookkeeping only tells the hook which device typed the stroke.
         """
-        from key_hook import KeyboardDevice, RI_KEY_BREAK, RI_KEY_E0, VK_INSERT
+        from key_hook import KeyboardDevice, RI_KEY_BREAK, RI_KEY_E0, VK_INSERT, VK_NUMPAD0
 
         # Raw Input correlation bookkeeping: matched handle updates state,
         # non-matching handle returns False and never queues MIDI.
@@ -355,25 +354,28 @@ class StartupSafetyTests(unittest.TestCase):
         self.assertTrue(hook_dev._win_queue.empty())  # correlation only - no MIDI queued
         hook_dev.stop()
 
-        # HID path: with NumLock OFF on the host, the keypad still emits Usage 0x62
-        # for its '0' key (raw reports bypass the OS NumLock translation).
-        for flags_down in (0, RI_KEY_E0):
+        # Hook path: with NumLock OFF on the host, the keypad's '0' key still
+        # carries hardware scancode 0x52 (reported as VK_INSERT); the NumLock-ON
+        # VK_NUMPAD0 twin resolves to the same key from the same scancode, and
+        # both feed the identical '000' triplet detector.
+        for vk in (VK_NUMPAD0, VK_INSERT):
             hook, rec = make(burst_window_ms=75)
             hook._devices = [KeyboardDevice(r"HID\VID_1C4F&PID_0002", "USB Keypad", "", {3003})]
             hook._device_by_handle = {3003: hook._devices[0]}
             hook.set_target_device(r"HID\VID_1C4F&PID_0002")
-            # Simulate full engine flow: fabricated VK_INSERT Win32 events would map
-            # here, and LL-hook Raw Input correlation sees them before HID reports.
-            hook._process_raw_keyboard(3003, VK_INSERT, 0x52, flags_down)
-            kb_path = b"\\\\?\\hid#vid_1c4f&pid_0002&mi_00#0"
-            hook._hid_kind[kb_path] = "kb"
+            # Simulate full hook flow: Raw Input correlation sees the physical
+            # keypad stroke (scancode 0x52) before the LL callback evaluates it.
+            hook._process_raw_keyboard(3003, vk, 0x52, 0)
+            self.assertEqual(hook._ll_route(vk, 0x52, False), ("0", True))
             for _ in range(3):
-                for data in ([0, 0, 0x62, 0, 0, 0, 0, 0], [0] * 8):
-                    self.assertEqual(hook._win_process_hid_report(kb_path, data), 1)
-                    item = hook._win_queue.get_nowait()
-                    hook._dispatch(item[0], item[1], item[2], item[3])
+                hook._queue_from_ll("0", True, vk, 0x52)
+                hook._queue_from_ll("0", False, vk, 0x52)
+            while not hook._win_queue.empty():
+                item = hook._win_queue.get_nowait()
+                hook._dispatch(*item)
             hook.stop()
             self.assertEqual(rec.events, [("000", True), ("000", False)])
+        del RI_KEY_BREAK, RI_KEY_E0
 
     def test_triple_zero_burst_numlock_on_and_off_identical(self):
         """3x VK_NUMPAD0 (NumLock ON) and 3x keypad VK_INSERT (NumLock OFF) both yield '000'."""
@@ -583,145 +585,96 @@ class StartupSafetyTests(unittest.TestCase):
         self.assertEqual(zero_vk_label(0, 0x52), "KEYPAD0 [Scancode 0x52]")
         self.assertEqual(zero_vk_label(VK_NUMPAD0), "VK_NUMPAD0/NumLock-ON")
 
-    def test_hid_keypad_name_scope_filter(self):
-        """hid_keypad_name scopes Keyboard-page usages per target mode.
+    def test_ll_route_queues_regardless_of_suppress(self):
+        """_ll_route: MIDI routing never depends on Exclusive Mode.
 
-        All-devices mode only honours the dedicated keypad cluster (+ legacy
-        Backspace/Tab parity); a PC main keyboard's number row, navigation
-        cluster and Return never trigger MIDI. Targeted mode honours the full
-        usage map (NumLock-OFF navigation codes included).
+        The hook routes (queues) every mapped keypad key for MIDI generation,
+        but only returns swallow=1 while Exclusive Mode is on - multimedia keys
+        and the matched-keypad NumLock are always swallowed.
         """
-        from key_hook import hid_keypad_name
+        from key_hook import (
+            KeyboardDevice, VK_BACK, VK_BROWSER_HOME, VK_NUMLOCK, VK_NUMPAD0,
+            VK_TAB,
+        )
 
-        #--- All Connected Keypads (Default) scope ---
-        self.assertEqual(hid_keypad_name(0x53), "NumLock")
-        self.assertEqual(hid_keypad_name(0x54), "/")
-        self.assertEqual(hid_keypad_name(0x55), "*")
-        self.assertEqual(hid_keypad_name(0x56), "-")
-        self.assertEqual(hid_keypad_name(0x57), "+")
-        self.assertEqual(hid_keypad_name(0x58), "Enter")
-        self.assertEqual(hid_keypad_name(0x59), "1")
-        self.assertEqual(hid_keypad_name(0x62), "0")
-        self.assertEqual(hid_keypad_name(0x63), ".")
-        self.assertEqual(hid_keypad_name(0x2A), "Backspace")  # legacy global parity
-        self.assertEqual(hid_keypad_name(0x2B), "Tab")        # legacy global parity
-        # Main keyboard exclusions in all-devices mode
-        self.assertIsNone(hid_keypad_name(0x1E))  # number row 1
-        self.assertIsNone(hid_keypad_name(0x27))  # number row 0
-        self.assertIsNone(hid_keypad_name(0x28))  # main Return
-        self.assertIsNone(hid_keypad_name(0x49))  # PC Insert (= keypad '0' nav-cluster)
-        self.assertIsNone(hid_keypad_name(0x4A))  # Home
-        self.assertIsNone(hid_keypad_name(0x50))  # Left arrow
-        self.assertIsNone(hid_keypad_name(0x4D))  # End
-        self.assertIsNone(hid_keypad_name(0x65))  # Application key
+        hook, rec = make(suppress=False, burst_window_ms=75)
+        # All-devices + Exclusive OFF: routed for MIDI, not swallowed
+        self.assertEqual(hook._ll_route(VK_NUMPAD0, 0x52, False), ("0", False))
+        self.assertEqual(hook._ll_route(VK_BACK, 0x0E, False), ("Backspace", False))
+        self.assertEqual(hook._ll_route(VK_TAB, 0x0F, False), ("Tab", False))
+        # Multimedia and matched NumLock are ALWAYS swallowed
+        self.assertEqual(hook._ll_route(VK_BROWSER_HOME, 0x32, True), ("Home", True))
+        self.assertEqual(hook._ll_route(VK_NUMLOCK, 0x45, False), ("NumLock", True))
+        # The hook queues routed keys regardless of Exclusive Mode ('0' strokes
+        # still complete their '000' triplet); the [('000', False)] release is
+        # emitted by stop() releasing the held '000' note.
+        for _ in range(3):
+            hook._queue_from_ll("0", True, VK_NUMPAD0, 0x52)
+        hook._queue_from_ll("Backspace", True, VK_BACK, 0x0E)
+        hook._queue_from_ll("Backspace", False, VK_BACK, 0x0E)
+        hook._queue_from_ll("Tab", True, VK_TAB, 0x0F)
+        hook._queue_from_ll("Tab", False, VK_TAB, 0x0F)
+        while not hook._win_queue.empty():
+            hook._dispatch(*hook._win_queue.get_nowait())
+        hook.stop()
+        self.assertEqual(
+            rec.events,
+            [
+                ("000", True),
+                ("Backspace", True), ("Backspace", False),
+                ("Tab", True), ("Tab", False),
+                ("000", False),
+            ],
+        )
 
-        #--- Targeted keypad scope: full usage map ---
-        self.assertEqual(hid_keypad_name(0x49, True), "0")   # Insert / '000' burst source
-        self.assertEqual(hid_keypad_name(0x1E, True), "1")   # number-row fallback
-        self.assertEqual(hid_keypad_name(0x28, True), "Enter")
-        self.assertEqual(hid_keypad_name(0x4A, True), "Home")
-        self.assertEqual(hid_keypad_name(0x50, True), "4")
-        self.assertIsNone(hid_keypad_name(0x7F, True))       # unknown usage
+        # Targeted keypad + Exclusive OFF: matched device still routes MIDI,
+        # shared Tab/Backspace are excluded, NumLock unswallowed only when the
+        # correlated stream does not match the keypad.
+        hook2, _ = make(suppress=False)
+        hook2._devices = [KeyboardDevice(r"HID\VID_04D9&PID_1203", "M-Tech", "", {2002})]
+        hook2._device_by_handle = {2002: hook2._devices[0]}
+        hook2.set_target_device(r"HID\VID_04D9&PID_1203")
+        hook2._process_raw_keyboard(2002, VK_NUMPAD0, 0x52, 0)
+        self.assertEqual(hook2._ll_route(VK_NUMPAD0, 0x52, False), ("0", False))
+        self.assertIsNone(hook2._ll_route(VK_TAB, 0x0F, False)[0])
+        self.assertIsNone(hook2._ll_route(VK_BACK, 0x0E, False)[0])
+        hook2.stop()
 
-    def test_win_hid_candidate_interfaces(self):
-        """_win_hid_candidate_interfaces binds BOTH keypad interfaces, filters mice/Apple."""
+    def test_macos_ax_trusted_startup_verdict(self):
+        """The tap loop consumes the startup verdict and NEVER re-checks ctypes."""
         from unittest.mock import patch
         import key_hook
 
-        if not hasattr(key_hook, "hid"):
-            self.skipTest("hidapi not installed")
-
-        mock_devices = [
-            # Composite M-Tech keypad: keyboard + consumer interfaces
-            {"vendor_id": 0x04D9, "product_id": 0x1203, "path": b"\\kb0",
-             "usage_page": 1, "usage": 6, "interface_number": 0},
-            {"vendor_id": 0x04D9, "product_id": 0x1203, "path": b"\\cons1",
-             "usage_page": 0x0C, "usage": 1, "interface_number": 1},
-            # Main laptop keyboard
-            {"vendor_id": 0x1234, "product_id": 0x5678, "path": b"\\laptopkb",
-             "usage_page": 1, "usage": 6, "interface_number": 0},
-            # Apple external keyboard (excluded in all-devices mode)
-            {"vendor_id": 0x05AC, "product_id": 0x0250, "path": b"\\applekb",
-             "usage_page": 1, "usage": 6, "interface_number": 0},
-            # Mouse: UsagePage 1 / Usage 2 never qualifies
-            {"vendor_id": 0x1234, "product_id": 0x9999, "path": b"\\mouse",
-             "usage_page": 1, "usage": 2, "interface_number": 0},
-        ]
-
         hook, _ = make()
-        try:
-            with patch.object(key_hook, "HAS_HID", True), \
-                 patch.object(key_hook.hid, "enumerate", return_value=mock_devices):
-                result = hook._win_hid_candidate_interfaces()
-                by_path = {p: (kind, hw) for p, kind, hw in result}
-                self.assertIn(b"\\kb0", by_path)
-                self.assertIn(b"\\cons1", by_path)
-                self.assertIn(b"\\laptopkb", by_path)
-                self.assertNotIn(b"\\applekb", by_path)
-                self.assertNotIn(b"\\mouse", by_path)
-                self.assertEqual(by_path[b"\\kb0"][0], "kb")
-                self.assertEqual(by_path[b"\\cons1"][0], "consumer")
-                self.assertEqual(by_path[b"\\cons1"][1], r"HID\VID_04D9&PID_1203")
+        self.assertIsNone(hook.macos_ax_trusted)
 
-                # Targeted keypad: only its two interfaces qualify
-                hook.set_target_device(r"HID\VID_04D9&PID_1203")
-                result = hook._win_hid_candidate_interfaces()
-                self.assertEqual({p for p, _, _ in result}, {b"\\kb0", b"\\cons1"})
+        def _explode(**kwargs):  # any re-check must fail the test
+            raise AssertionError("check_macos_accessibility must not be called")
 
-                # Unknown target: nothing qualifies (no orphan device handles)
-                hook.set_target_device(r"HID\VID_1111&PID_2222")
-                self.assertEqual(hook._win_hid_candidate_interfaces(), [])
-        finally:
-            hook.set_target_device("")
+        with patch.object(key_hook, "IS_MAC", True), \
+             patch.object(key_hook, "check_macos_accessibility", side_effect=_explode):
+            # Verdict False: tap guarded off without touching the OS API
+            hook.macos_ax_trusted = False
+            hook._mac_tap_loop()
+            self.assertEqual(hook.macos_tap_block_reason, "accessibility")
+            self.assertFalse(hook._mac_tap_granted)
 
-    def test_win_process_hid_report_usage_scope(self):
-        """_win_process_hid_report queues keypad-cluster events only (all-devices)."""
-        hook, _ = make(burst_window_ms=75)
-        kb = b"\\\\?\\hid#vid_1c4f&pid_0002&mi_00#0"
-        hook._hid_kind[kb] = "kb"
-
-        # Number row and navigation usages are masked in all-devices mode
-        self.assertEqual(hook._win_process_hid_report(kb, [0, 0, 0x1E, 0, 0, 0, 0, 0]), 0)
-        self.assertEqual(hook._win_process_hid_report(kb, [0] * 8), 0)
-        self.assertEqual(hook._win_process_hid_report(kb, [0, 0, 0x50, 0, 0, 0, 0, 0]), 0)
-        self.assertEqual(hook._win_process_hid_report(kb, [0] * 8), 0)
-        self.assertTrue(hook._win_queue.empty())
-
-        # Keypad cluster usages are queued (NumLock-independent digits)
-        self.assertEqual(hook._win_process_hid_report(kb, [0, 0, 0x59, 0, 0, 0, 0, 0]), 1)
-        self.assertEqual(hook._win_queue.get_nowait(), ("1", True, 0x59, 0))
-        self.assertEqual(hook._win_process_hid_report(kb, [0] * 8), 1)
-        self.assertEqual(hook._win_queue.get_nowait(), ("1", False, 0x59, 0))
-
-        # Backspace/Tab parity: honoured in all-devices mode like the legacy engine
-        self.assertEqual(hook._win_process_hid_report(kb, [0, 0, 0x2A, 0, 0, 0, 0, 0]), 1)
-        self.assertEqual(hook._win_queue.get_nowait(), ("Backspace", True, 0x2A, 0))
-        self.assertEqual(hook._win_process_hid_report(kb, [0] * 8), 1)
-        self.assertEqual(hook._win_queue.get_nowait(), ("Backspace", False, 0x2A, 0))
-
-        # Targeted keypad: the full usage map applies (nav codes honoured)
-        hook.set_target_device(r"HID\VID_1EDE&PID_0002")
-        self.assertEqual(hook._win_process_hid_report(kb, [0, 0, 0x49, 0, 0, 0, 0, 0]), 1)
-        self.assertEqual(hook._win_queue.get_nowait(), ("0", True, 0x49, 0))
+            # Verdict True: proceeds past the guard (still no tap outside macOS)
+            hook2 = hook
+            hook2.macos_ax_trusted = True
+            hook2._mac_tap_loop()  # must not raise
         hook.stop()
 
-    def test_win_process_hid_report_consumer_interface(self):
-        """Consumer (0x0C) reports route Home/Email/Calc through the engine queue."""
-        hook, rec = make(burst_window_ms=75)
-        cons = b"\\\\?\\hid#vid_04d9&pid_1203&mi_01#0"
-        hook._hid_kind[cons] = "consumer"
-
-        self.assertEqual(hook._win_process_hid_report(cons, [0x23, 0x02]), 1)
-        first = hook._win_queue.get_nowait()
-        self.assertEqual(first, ("Home", True, 0x0223, 0))
-        self.assertEqual(hook._win_process_hid_report(cons, [0, 0]), 1)
-        second = hook._win_queue.get_nowait()
-        self.assertEqual(second, ("Home", False, 0x0223, 0))
-
-        for item in (first, second):
-            hook._dispatch(item[0], item[1], item[2], item[3])
-        self.assertEqual(rec.events, [("Home", True), ("Home", False)])
-        hook.stop()
+        # None verdict (direct library use): falls back to a single lazy check
+        hook3, _ = make()
+        with patch.object(key_hook, "IS_MAC", True), \
+             patch.object(key_hook, "check_macos_accessibility", return_value=False) as ax:
+            hook3._mac_tap_loop()
+        self.assertEqual(hook3.macos_tap_block_reason, "accessibility")
+        self.assertEqual(hook3.macos_ax_trusted, False)
+        self.assertEqual(hook3._mac_tap_thread, None)
+        ax.assert_called_once()  # computed ONCE, then cached on the hook
+        hook3.stop()
 
     def test_ll_swallow_policy_exhaustive(self):
         """_ll_should_swallow: dumb-swallow decisions per scope, matched and suppress."""
@@ -785,10 +738,10 @@ class StartupSafetyTests(unittest.TestCase):
     def test_scancode_threaded_triplet_burst(self):
         """Queue items carry the key identity; 3 rapid '0' presses fire '000'.
 
-        This is the exact tuple shape now produced by the unified hidapi engine
-        (_win_process_hid_report): (name, is_down, usage, scan) - on Windows the
-        usage is the HID Usage ID (0x62 = keypad '0') and the swallow-only
-        WH_KEYBOARD_LL hook never queues MIDI itself.
+        This is the exact tuple shape produced by ``_queue_from_ll`` inside the
+        WH_KEYBOARD_LL hook: (name, is_down, vk, scan) - on Windows the scan is
+        the hardware scancode (0x52 = physical keypad '0' in both NumLock
+        states) and the tap worker drains it asynchronously.
         """
         from unittest.mock import patch
         from key_hook import VK_NUMPAD0, VK_INSERT
@@ -904,26 +857,32 @@ class StartupSafetyTests(unittest.TestCase):
         hook.stop()
 
     def test_show_accessibility_dialog_text_and_selftest_guard(self):
-        """The native warning uses the exact required wording; skipped in --selftest."""
+        """Exact wording, once-per-process guard, and --selftest skip."""
         import sys as _sys
         from unittest.mock import patch
         import main
 
-        with patch.object(main, "QMessageBox") as mb:
-            main.show_accessibility_dialog()
-        self.assertEqual(mb.warning.call_count, 1)
-        text = mb.warning.call_args[0][2]  # (parent, title, text)
         self.assertEqual(
-            text,
-            "Accessibility permissions required. Please enable NumpadToMIDI2 in "
+            main.ACCESSIBILITY_MESSAGE,
+            "Accessibility permissions required. Please enable NumpadToMIDI in "
             "System Settings > Privacy & Security > Accessibility, then restart the app.",
         )
+
+        # Reset / leak-proof the once-per-process guard for this test
+        main._accessibility_dialog_shown = False
+        with patch.object(main, "QMessageBox") as mb:
+            main.show_accessibility_dialog()
+            main.show_accessibility_dialog()  # second call MUST be a no-op
+        self.assertEqual(mb.warning.call_count, 1)
+        text = mb.warning.call_args[0][2]  # (parent, title, text)
+        self.assertEqual(text, main.ACCESSIBILITY_MESSAGE)
 
         # --selftest mode must never block CI with a modal dialog
         with patch.object(main, "QMessageBox") as mb2, \
              patch.object(_sys, "argv", ["main.py", "--selftest"]):
             main.show_accessibility_dialog()
         mb2.warning.assert_not_called()
+        main._accessibility_dialog_shown = False  # leave clean state for other tests
 
     def test_list_macos_keyboard_devices(self):
         from key_hook import list_macos_keyboard_devices

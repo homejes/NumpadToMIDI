@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build NumpadToMIDI2-macOS-[arch-]v<version>.dmg from dist/NumpadToMIDI2.app using only
+# Build NumpadToMIDI-macOS-[arch-]v<version>.dmg from dist/NumpadToMIDI.app using only
 # built-in macOS tools (codesign + hdiutil), so it runs unchanged on CI runners.
 #
 # usage: installer/make_dmg.sh [version] [arch]
@@ -7,9 +7,9 @@
 #   e.g. installer/make_dmg.sh 1.5.0 AppleSilicon
 set -euo pipefail
 
-VERSION="${1:-1.7.0}"
+VERSION="${1:-1.8.0}"
 ARCH="${2:-}"
-APP_NAME="NumpadToMIDI2"
+APP_NAME="NumpadToMIDI"
 APP_PATH="dist/${APP_NAME}.app"
 if [ -n "$ARCH" ]; then
   DMG_PATH="dist/${APP_NAME}-macOS-${ARCH}-v${VERSION}.dmg"

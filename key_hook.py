@@ -1,30 +1,32 @@
-"""Global numpad key hook for NumpadToMIDI2.
+"""Global numpad key hook for NumpadToMIDI.
 
-Unified input architecture: **all MIDI generation lives in a ``hidapi`` engine**
-and the OS-level hooks are reduced to dumb swallow gatekeepers that stop numpad
-keys from typing into the OS / DAW.
+Windows input architecture: MIDI generation lives in the high-priority
+``WH_KEYBOARD_LL`` hook pipeline; the hook itself only *decides* and *queues*.
 
-* On Windows a background ``hidapi`` worker thread reads raw USB HID reports
-  from BOTH composite interfaces of the USB keypad - the Keyboard interface
-  (Usage Page 0x01, usages 6/7) and the Consumer interface (Usage Page 0x0C) -
-  parses the 8-byte reports with ``parse_hid_keyboard_report`` /
-  ``parse_hid_consumer_report`` and dispatches key events on a worker queue.
-  MIDI triggering therefore bypasses the OS keyboard stack completely.
-* Windows additionally keeps a *minimalist* ``WH_KEYBOARD_LL`` hook via
-  ``ctypes`` on a dedicated high-priority message-pump thread. Its ONLY job is
-  the "dumb swallow": when a keystroke belongs to the selected USB keypad it
-  returns ``LRESULT(1)`` in microseconds (no ``CallNextHookEx``) so the key
-  never types into the OS. No MIDI logic lives in the hook.
-* Win32 ``WM_INPUT`` Raw Input no longer generates MIDI either; it is only used
-  to correlate which physical device produced the last keystroke so the swallow
-  hook knows whether the key belongs to the targeted keypad.
-* The "000" key of financial numpads, which hardware-wise just emits three rapid
-  presses of the '0' key HID Usage ID (``0x62``) within an 80 ms window, is
-  recognised as a burst by the triplet detector in ``_zero_event`` and reported
-  as a single ``000`` key (MIDI Note 37 / C#1). The detector is completely
-  NumLock-independent: raw HID Usages do not change when Windows toggles
-  NumLock, and both ``VK_NUMPAD0`` (NumLock ON) and ``VK_INSERT`` (NumLock OFF)
-  sources route into the same detector.
+* Windows installs a minimalist ``WH_KEYBOARD_LL`` hook via ``ctypes`` on a
+  dedicated high-priority message-pump thread. Keystrokes are identified by
+  their **hardware scancode** wherever possible: the physical '0' key of the
+  M-Tech numpad always reports OEM scancode ``0x52`` (both as ``VK_NUMPAD0``
+  with NumLock ON and as ``VK_INSERT`` with NumLock OFF), so the mapping is
+  NumLock-independent by construction.
+* When a keystroke belongs to the numpad, the hook queues the decoded
+  event into ``_queue_from_ll`` (a ``SimpleQueue`` drained by a separate
+  daemon worker that runs all MIDI/debounce/'000'-triplet logic) and returns
+  ``LRESULT(1)`` in microseconds so the key is swallowed before it can type
+  into the OS / DAW. Nothing slow ever runs inside the hook callback, which
+  keeps the system from disabling the hook via ``LowLevelHooksTimeout``.
+* The physical '000' key hardware-wise just emits three rapid presses of
+  scancode ``0x52`` within an 80 ms window. The hook routes every such stroke
+  into the triplet detector in ``_zero_event`` (MIDI Note 37 / C#1 '000'),
+  which is completely NumLock-independent.
+* Win32 ``WM_INPUT`` Raw Input is kept for device correlation only: it tells
+  the swallow hook which physical device produced the last keystroke
+  (``_last_raw_matched``) so a targeted keypad can be told apart from other
+  keyboards. Raw Input never generates MIDI.
+* ``hidapi`` is NOT used on Windows: the Windows kernel refuses to open
+  standard keyboard HID endpoints from user-space (keylogger protection), so
+  a hidapi engine would only ever see the Consumer page (Home/Email/Calc).
+  hidapi remains in use for the macOS device enumeration/telemetry helpers.
 * OS auto-repeat is swallowed (a key that is already down cannot go down again).
 * Stray releases are ignored.
 * On macOS the composite USB keypad exposes two HID interfaces: the numeric
@@ -33,13 +35,14 @@ keys from typing into the OS / DAW.
   ``IOHIDManager`` listeners are attached to BOTH interfaces simultaneously
   (``IOHIDManagerSetDeviceMatchingMultiple``), and a ``CGEventTap`` swallows
   the keypad codes so they do not type numbers into the macOS UI. The tap is
-  crash-safe: Accessibility is verified via ``AXIsProcessTrustedWithOptions``
-  *before* ``CGEventTapCreate``; without permission (or when the tap cannot be
-  created) the run loop is never attached and the app runs safely without it -
-  the PyQt layer shows a native warning dialog instead. Inside the tap
-  callback, keycodes of the mapped numpad return ``None`` (swallow) so they
-  never reach the focused app (e.g. Logic Pro), everything else is returned
-  unchanged.
+  crash-safe: the Accessibility verdict is taken **once per process**
+  (plain, non-prompting ``AXIsProcessTrusted``, cached by the UI layer into
+  ``KeyHook.macos_ax_trusted``) *before* ``CGEventTapCreate``; without
+  permission (or when the tap cannot be created) the run loop is never
+  attached and the app runs safely without it - the PyQt layer shows its
+  warning dialog at most once per process. Inside the tap callback, keycodes
+  of the mapped numpad return ``None`` (swallow) so they never reach the
+  focused app (e.g. Logic Pro), everything else is returned unchanged.
 
 The module is pure logic on top of ``_dispatch`` so it can be unit-tested
 without a keyboard (see ``tests/test_key_logic.py``).
@@ -55,7 +58,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-logger = logging.getLogger("NumpadToMIDI2.hook")
+logger = logging.getLogger("NumpadToMIDI.hook")
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -314,39 +317,6 @@ HID_CONSUMER_USAGE_MAP: dict[int, str] = {
     0x0221: "Home",     # AC Search
     0x0224: "Home",     # AC Back
 }
-
-# --- HID usage scoping (Windows hidapi worker) ---------------------------------
-# Dedicated Keypad-page usages (0x53 NumLock .. 0x63 '.') are the NumLock-ON
-# cluster that a PC main keyboard only emits from its own numeric keypad - and
-# keyboards without one never emit them. Backspace (0x2A) / Tab (0x2B) were
-# captured globally by the legacy Windows engine and remain elected.
-_HID_KEYPAD_CLUSTER_USAGES = frozenset(range(0x53, 0x64))
-_HID_SHARED_USAGES = frozenset({0x2A, 0x2B})
-_HID_ALL_DEVICES_ALLOWED_USAGES = _HID_KEYPAD_CLUSTER_USAGES | _HID_SHARED_USAGES
-
-# hidapi worker poll cadence (seconds)
-_WIN_HID_POLL_ACTIVE = 0.001
-_WIN_HID_POLL_IDLE = 0.050
-_WIN_HID_REENUMERATE_INTERVAL = 2.0
-
-
-def hid_keypad_name(usage: int, targeted: bool = False) -> Optional[str]:
-    """Map a Keyboard-page HID Usage ID to a logical numpad key name.
-
-    Scope-aware: in *All Connected Keypads* mode (``targeted=False``) only the
-    dedicated keypad cluster (plus Backspace/Tab legacy parity) is honoured, so
-    a PC main keyboard's number row and navigation cluster never trigger MIDI.
-    When a specific USB keypad is targeted (``targeted=True``) the full usage
-    map applies - including the NumLock-OFF navigation codes and number-row
-    fallbacks - because only the targeted device's interface is read anyway.
-    """
-    name = HID_KEYPAD_USAGE_MAP.get(usage)
-    if name is None:
-        return None
-    if targeted or usage in _HID_ALL_DEVICES_ALLOWED_USAGES:
-        return name
-    return None
-
 
 # --- macOS HID usage pages -----------------------------------------------------
 # The composite USB keypad exposes two HID interfaces on macOS:
@@ -744,71 +714,33 @@ def _query_raw_device_path(h_device: int) -> str:
 
 
 def check_macos_accessibility(prompt: bool = True) -> bool:
-    """Check if the process has macOS Accessibility permission.
+    """Return the macOS Accessibility trust state of this process (never prompts).
 
-    If prompt=True and permission is not granted, macOS displays a system dialog
-    directing the user to System Settings > Privacy & Security > Accessibility.
+    Uses the plain ``AXIsProcessTrusted`` API, which is a fast, non-blocking,
+    non-prompting syscall: it does NOT display a system dialog and does NOT
+    invalidate anything. Call it **once** at startup (the PyQt layer does, see
+    ``main.build_app``) and feed the result into ``KeyHook.macos_ax_trusted``.
+    The ``prompt`` parameter is accepted for backward compatibility but is
+    intentionally ignored.
+
+    When the framework cannot be loaded at all the permissive ``True`` fallback
+    keeps the app alive (missing Accessibility then only degrades to a NULL
+    ``CGEventTapCreate`` handled by the crash-safe tap guard).
     """
     if not IS_MAC:
         return True
     try:
-        from ctypes import (
-            POINTER, byref, c_bool, c_char_p, c_long, c_uint32, c_void_p, cdll, util,
-        )
+        from ctypes import c_bool, cdll, util
 
         app_services_path = (
             util.find_library("ApplicationServices")
             or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
         )
-        cf_path = (
-            util.find_library("CoreFoundation")
-            or "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-
         app_services = cdll.LoadLibrary(app_services_path)
-        cf = cdll.LoadLibrary(cf_path)
-
-        ax_is_trusted = app_services.AXIsProcessTrustedWithOptions
-        ax_is_trusted.argtypes = [c_void_p]
+        ax_is_trusted = app_services.AXIsProcessTrusted
+        ax_is_trusted.argtypes = []
         ax_is_trusted.restype = c_bool
-
-        if not prompt:
-            return bool(ax_is_trusted(None))
-
-        k_cf_boolean_true = c_void_p.in_dll(cf, "kCFBooleanTrue")
-
-        cf_string_create = cf.CFStringCreateWithCString
-        cf_string_create.argtypes = [c_void_p, c_char_p, c_uint32]
-        cf_string_create.restype = c_void_p
-
-        cf_dictionary_create = cf.CFDictionaryCreate
-        cf_dictionary_create.argtypes = [
-            c_void_p,
-            POINTER(c_void_p),
-            POINTER(c_void_p),
-            c_long,
-            c_void_p,
-            c_void_p,
-        ]
-        cf_dictionary_create.restype = c_void_p
-
-        cf_release = cf.CFRelease
-        cf_release.argtypes = [c_void_p]
-
-        key_str = cf_string_create(None, b"AXTrustedCheckOptionPrompt", 0x08000100)
-        try:
-            keys = (c_void_p * 1)(key_str)
-            values = (c_void_p * 1)(k_cf_boolean_true.value)
-            options = cf_dictionary_create(None, keys, values, 1, None, None)
-            try:
-                trusted = bool(ax_is_trusted(options))
-                return trusted
-            finally:
-                if options:
-                    cf_release(options)
-        finally:
-            if key_str:
-                cf_release(key_str)
+        return bool(ax_is_trusted())
     except Exception as exc:
         logger.warning("check_macos_accessibility error: %s", exc)
         return True
@@ -1170,30 +1102,40 @@ class KeyHook:
         self._mac_tap_src_ref = None      # CFRunLoopSourceRef of the tap
         self._mac_tap_granted = False     # tap successfully created (Accessibility)
         self._mac_tap_block_reason: Optional[str] = None  # why no tap could be created
-        # Windows unified hidapi engine + WH_KEYBOARD_LL swallow-hook state
+        # Startup Accessibility verdict fed once by the UI layer (None = unknown);
+        # the tap thread must never re-query macOS permission state itself.
+        self._mac_ax_trusted: Optional[bool] = None
+        # Windows WH_KEYBOARD_LL hook (MIDI generation) + worker state
         self._running = False
         self._win_thread: Optional[threading.Thread] = None
         self._win_worker: Optional[threading.Thread] = None
-        self._win_hid_thread: Optional[threading.Thread] = None
         self._win_thread_id: int = 0
         self._win_hook_handle = None
         self._win_raw_hwnd = None
         self._win_proc_ref = None  # prevent GC of ctypes callback
         self._win_queue: queue.SimpleQueue[Optional[tuple]] = queue.SimpleQueue()
         self._win_ready = threading.Event()
-        # hidapi worker state: opened interfaces and their previous usage sets
-        self._hid_open: dict[bytes, Any] = {}
-        self._hid_prev_keys: dict[bytes, set[int]] = {}
-        self._hid_kind: dict[bytes, str] = {}
-        self._hid_hw_id: dict[bytes, str] = {}
-        self._hid_target_sig: str = "\x00-init"
-        self._hid_last_enumerate: float = 0.0
         self.refresh_devices()
 
     # ------------------------------------------------------------------ control
     def set_suppress(self, value: bool) -> None:
         """Enable or disable Exclusive Mode (swallowing numpad keys from the OS)."""
         self._suppress = bool(value)
+
+    @property
+    def macos_ax_trusted(self) -> Optional[bool]:
+        """Startup Accessibility verdict: True/False after the UI checked once, None before.
+
+        The verdict is computed **exactly once per process** (``main.build_app``
+        calls ``check_macos_accessibility`` at startup). The CGEventTap thread
+        must never re-query the OS permission state, so ``_mac_tap_loop``
+        consumes this value instead of calling ctypes again.
+        """
+        return self._mac_ax_trusted
+
+    @macos_ax_trusted.setter
+    def macos_ax_trusted(self, value: Optional[bool]) -> None:
+        self._mac_ax_trusted = None if value is None else bool(value)
 
     @property
     def macos_tap_block_reason(self) -> Optional[str]:
@@ -1216,7 +1158,6 @@ class KeyHook:
             self._target_device = (device_id or "").strip()
             self._rebuild_target_handles()
             self._last_raw_matched = True
-            self._hid_target_sig = "\x00-reopen"  # hidapi worker re-opens interfaces
 
     def refresh_devices(self) -> list[KeyboardDevice]:
         """Re-enumerate connected keyboard/keypad devices via Win32 Raw Input API."""
@@ -1275,10 +1216,10 @@ class KeyHook:
     def _process_raw_keyboard(self, h_device: int, vk: int, scan: int, flags: int) -> bool:
         """Correlate a Win32 RAWKEYBOARD event with the selected keypad device.
 
-        Raw Input no longer generates MIDI - the unified hidapi worker owns Windows
-        MIDI generation. This method only maintains the device-membership
-        bookkeeping (``_last_raw_matched``) used by the swallow-only
-        ``WH_KEYBOARD_LL`` gate to decide which keys belong to the keypad.
+        Raw Input never generates MIDI - the ``WH_KEYBOARD_LL`` hook owns
+        Windows MIDI generation. This method only maintains the device-membership
+        bookkeeping (``_last_raw_matched``) used by the hook to decide which
+        keys belong to the targeted keypad.
         """
         now = time.perf_counter()
         matched = self.matches_device(h_device)
@@ -1298,10 +1239,6 @@ class KeyHook:
                     target=self._win_dispatch_loop, name="NumpadDispatchWorker", daemon=True
                 )
                 self._win_worker.start()
-                self._win_hid_thread = threading.Thread(
-                    target=self._win_hid_loop, name="NumpadHidEngine", daemon=True
-                )
-                self._win_hid_thread.start()
                 self._win_thread = threading.Thread(
                     target=self._win_message_pump, name="NumpadKeyboardHookPump", daemon=True
                 )
@@ -1354,11 +1291,6 @@ class KeyHook:
                 if self._win_thread is not None:
                     self._win_thread.join(timeout=1.5)
                     self._win_thread = None
-                if self._win_hid_thread is not None:
-                    self._win_hid_thread.join(timeout=1.5)
-                    self._win_hid_thread = None
-                # close after joining so no concurrent hid_read is in flight
-                self._win_hid_close_all()
                 if self._win_worker is not None:
                     self._win_worker.join(timeout=1.5)
                     self._win_worker = None
@@ -1381,51 +1313,88 @@ class KeyHook:
                 self._emit(name, False)
 
     # --------------------------------------- Windows dedicated WH_KEYBOARD_LL + WM_INPUT
-    def _ll_should_swallow(
-        self, vk: int, scan: int, extended: bool, wparam: int
-    ) -> bool:
-        """Swallow-only gatekeeper for ``WH_KEYBOARD_LL`` (no MIDI logic).
+    def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
+        """Queue an event intercepted by ``WH_KEYBOARD_LL`` for async processing.
 
-        Returns True when the incoming keystroke belongs to a USB keypad and must
-        return ``1`` from the hook (never reaching ``CallNextHookEx`` / the OS):
+        This is the ONLY work the hook does with routed keys - it never computes
+        MIDI notes, timers or debounce state inline. The dispatch worker thread
+        (``_win_dispatch_loop``) drains the queue and runs ``_dispatch``, which
+        keeps the hook callback in the microsecond range (no
+        ``LowLevelHooksTimeout``) while MIDI note-on/off still fires within
+        milliseconds.
+        """
+        self._win_queue.put_nowait((name, is_down, vk, scan))
 
-        * Multimedia launcher keys (Home/Email/Calc) are always swallowed because
-          a bad pass-through would launch Chrome/Mail/Calculator.
-        * ``VK_NUMLOCK`` from the keypad is swallowed so the physical button can
-          never toggle the hardware into navigation mode.
-        * In "All Connected Keypads (Default)" mode numpad-cluster keys are
-          swallowed when Exclusive Mode is enabled.
-        * With a specific USB keypad selected, keys are swallowed when the
-          correlated Raw Input stream matches the targeted device, or when the
-          stroke is keypad '0' / Insert (scancode 0x52 non-extended or
-          ``VK_NUMPAD0``) so a '000' burst is never leaked mid-correlation.
-          Tab/Backspace are shared with the main keyboard and never swallowed
-          for a targeted keypad.
+    def _ll_route(self, vk: int, scan: int, extended: bool) -> tuple[Optional[str], bool]:
+        """Resolve the ``WH_KEYBOARD_LL`` route for one keystroke: (key_name, swallow).
+
+        Returns ``(name, swallow)``:
+
+        * ``name`` is the mapped numpad key, or ``None`` when the stroke must be
+          ignored entirely (not a keypad event, or out-of-scope for the current
+          target selection). Routed keys are ALWAYS queued for MIDI generation,
+          regardless of Exclusive Mode.
+        * ``swallow`` tells the hook whether to ``return 1`` (block the key from
+          reaching the OS) - the Exclusive Mode / suppress setting only affects
+          OS delivery, never MIDI generation.
+
+        The keystroke identity is resolved scancode-first (``win_key_name``):
+        the physical '0' key reports OEM scancode ``0x52`` in both NumLock
+        states, so the NumLock switch never changes the mapping.
         """
         name = win_key_name(
             vk, scan, extended,
             keypad_verified=bool(self._target_device and self._last_raw_matched),
         )
         if name is None:
-            return False
+            return None, False
 
         if name in _ALWAYS_SUPPRESS_KEYS:
-            return True
+            # Multimedia launcher keys (Home/Email/Calc) would launch
+            # Chrome/Mail/Calculator when passed through: always dispatched and
+            # always swallowed, in every mode.
+            return name, True
 
         is_numlock = (vk == VK_NUMLOCK) or (name == "NumLock") or (scan == 0x45 and not extended)
         if is_numlock:
-            return not self._target_device or self._last_raw_matched
+            if not self._target_device or self._last_raw_matched:
+                return name, True
+            return None, False
 
         if not self._target_device:
-            # "All Connected Keypads (Default)" mode: swallow keypad keys while
-            # Exclusive Mode is on (this includes keypad VK_INSERT when NumLock
-            # is OFF, so the '000' burst never toggles Insert/Overtype mode).
-            return bool(self._suppress)
+            # "All Connected Keypads (Default)" mode: route the keypad key for
+            # MIDI and swallow it while Exclusive Mode is on (this also swallows
+            # keypad VK_INSERT when NumLock is OFF, so the '000' burst never
+            # toggles Insert/Overtype mode).
+            return name, bool(self._suppress)
 
+        # Specific USB keypad selected: route and (with Exclusive Mode) swallow
+        # when the correlated Raw Input stream matches the targeted device, or
+        # when the stroke is keypad '0' / Insert (non-extended scancode 0x52 or
+        # VK_NUMPAD0) so a '000' burst is never leaked mid-correlation.
+        # Tab/Backspace are shared with the main keyboard and never routed for
+        # a targeted keypad.
         is_keypad_zero = (scan == _WIN_SCAN_KEYPAD_ZERO and not extended) or (vk == VK_NUMPAD0)
         if self._last_raw_matched or is_keypad_zero:
-            return name not in ("Tab", "Backspace") and bool(self._suppress)
-        return False
+            if name not in ("Tab", "Backspace"):
+                return name, bool(self._suppress)
+        return None, False
+
+    def _ll_should_swallow(
+        self, vk: int, scan: int, extended: bool, wparam: int
+    ) -> bool:
+        """Whether ``WH_KEYBOARD_LL`` must swallow this keystroke (OS delivery only).
+
+        Pure decision helper (no side effects, no MIDI): multimedia keys are
+        always swallowed, NumLock is swallowed when the keypad is matched /
+        all-devices mode, keypad keys are swallowed in Exclusive Mode, and a
+        targeted keypad excludes Tab/Backspace. MIDI routing additionally
+        happens for every *routed* key even when this returns False - see
+        :meth:`_ll_route`.
+        """
+        _ = wparam  # kept for callback-signature compatibility
+        _name, swallow = self._ll_route(vk, scan, extended)
+        return swallow
 
     def _handle_wm_input(self, lparam: int) -> None:  # pragma: no cover - real OS message
         if not lparam:
@@ -1471,7 +1440,7 @@ class KeyHook:
             # Register hidden message-only window for Raw Input (WM_INPUT)
             try:
                 self._win_raw_hwnd = _user32.CreateWindowExW(
-                    0, "Static", "NumpadToMIDI2RawInputSink", 0,
+                    0, "Static", "NumpadToMIDIRawInputSink", 0,
                     0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
                 )
                 if self._win_raw_hwnd:
@@ -1498,16 +1467,20 @@ class KeyHook:
                             kb = ctypes.cast(
                                 lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)
                             ).contents
-                            # DUMB SWALLOW ONLY - no MIDI logic lives in the hook.
-                            # All MIDI triggering is done by the separate hidapi
-                            # engine (via _win_queue / _win_dispatch_loop).
-                            if self._ll_should_swallow(
-                                int(kb.vkCode),
-                                int(kb.scanCode),
-                                bool(kb.flags & _LLKHF_EXTENDED),
-                                wParam,
-                            ):
-                                return 1
+                            extended = bool(kb.flags & _LLKHF_EXTENDED)
+                            vk_code = int(kb.vkCode)
+                            scan_code = int(kb.scanCode)
+                            is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
+                            name, swallow = self._ll_route(vk_code, scan_code, extended)
+                            if name is not None:
+                                # Queue MIDI asynchronously OUTSIDE the hook: the
+                                # dispatch worker thread runs all note/debounce/
+                                # '000'-triplet logic, so this callback stays in
+                                # the microsecond range and the system never
+                                # trips LowLevelHooksTimeout.
+                                self._queue_from_ll(name, is_down, vk_code, scan_code)
+                                if swallow:
+                                    return 1
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
                 return int(_user32.CallNextHookEx(self._win_hook_handle, nCode, wParam, lParam))
@@ -1562,222 +1535,6 @@ class KeyHook:
                 self._dispatch(name, is_down, vk, scan)
             except Exception:
                 pass
-
-    # -------------------------------------------------------------- Windows unified hidapi engine
-    def _win_hid_candidate_interfaces(self) -> list[tuple[bytes, str, str]]:
-        """Enumerate the hidapi interfaces eligible as keypad input sources.
-
-        Returns ``(raw_path, kind, hw_id)`` tuples where ``kind`` is ``'kb'``
-        for the Keyboard interface (Usage Page 0x01, usages 6/7 - the numpad
-        digits/operators cluster) and ``'consumer'`` for the Consumer interface
-        (Usage Page 0x0C - Home/Email/Calc). Both composite interfaces must be
-        read together for every keypad key on the M-Tech hardware to be seen.
-
-        When a specific USB keypad is targeted only that VID/PID's interfaces
-        are returned; in *All Connected Keypads* mode every non-Apple keyboard
-        and consumer interface qualifies (usage scoping in ``hid_keypad_name``
-        keeps main-keyboard number rows safe).
-        """
-        if not HAS_HID:
-            return []
-        try:
-            raw_list = hid.enumerate()
-        except Exception as exc:
-            logger.debug("hid.enumerate failed on Windows: %s", exc)
-            return []
-
-        target = self._target_device.upper()
-        candidates: list[tuple[bytes, str, str]] = []
-        seen_paths: set[bytes] = set()
-        for d in raw_list:
-            vid = d.get("vendor_id", 0)
-            pid = d.get("product_id", 0)
-            if vid == 0x05AC and not target:  # Apple keyboards in all-devices mode
-                continue
-            if vid == 0 and pid == 0:
-                continue
-
-            hw_id = f"HID\\VID_{vid:04X}&PID_{pid:04X}"
-            if target:
-                if target != hw_id.upper() and target not in hw_id.upper():
-                    continue
-
-            raw_path = d.get("path")
-            if not raw_path:
-                continue
-            path_bytes = raw_path if isinstance(raw_path, bytes) else str(raw_path).encode("utf-8")
-            if path_bytes in seen_paths:
-                continue
-            seen_paths.add(path_bytes)
-
-            usage_page = d.get("usage_page", 0) or 0
-            usage = d.get("usage", 0) or 0
-            if usage_page == HID_PAGE_CONSUMER or (usage_page == 0 and usage == 0x0C):
-                kind = "consumer"
-            elif usage_page in (HID_PAGE_GENERIC_DESKTOP, 0) and usage in (0, 6, 7):
-                kind = "kb"
-            else:
-                continue  # mice (usage 2), digitizers, vendor pages, ...
-
-            candidates.append((path_bytes, kind, hw_id))
-        return candidates
-
-    def _win_hid_ensure_opened(self) -> None:
-        """(Re)open the eligible hidapi interfaces; drop stale/unplugged paths."""
-        with self._lock:
-            target_sig = self._target_device
-        if target_sig != self._hid_target_sig:
-            self._win_hid_close_all()
-            self._hid_target_sig = target_sig
-
-        candidates = self._win_hid_candidate_interfaces()
-        known = set(self._hid_open)
-        wanted = {path for path, _, _ in candidates}
-        for stale_path in known - wanted:
-            self._win_hid_close_path(stale_path)
-
-        opened_any = False
-        for path, kind, hw_id in candidates:
-            if path in self._hid_open:
-                continue
-            if not HAS_HID:
-                break
-            try:
-                dev = hid.device()
-                dev.open_path(path)
-                dev.set_nonblocking(1)
-            except Exception as exc:
-                logger.debug("hid.open_path(%s) failed: %s", path, exc)
-                continue
-            with self._lock:
-                self._hid_open[path] = dev
-                self._hid_kind[path] = kind
-                self._hid_hw_id[path] = hw_id
-                self._hid_prev_keys[path] = set()
-            opened_any = True
-            logger.info(
-                "Opened HID interface %s (%s, %s) for MIDI generation", path, kind, hw_id
-            )
-        if opened_any:
-            logger.info(
-                "Windows hidapi engine active: %d interface(s) open of %d candidate(s)",
-                len(self._hid_open), len(candidates),
-            )
-        if not self._hid_open and candidates:
-            logger.debug("No HID interface opened; retrying each cycle")
-
-    def _win_hid_close_path(self, path: bytes) -> None:
-        with self._lock:
-            dev = self._hid_open.pop(path, None)
-            self._hid_kind.pop(path, None)
-            self._hid_prev_keys.pop(path, None)
-            self._hid_hw_id.pop(path, None)
-        if dev is None:
-            return
-        try:
-            dev.close()
-        except Exception:
-            pass
-
-    def _win_hid_close_all(self) -> None:
-        for path in list(self._hid_open):
-            self._win_hid_close_path(path)
-
-    def _win_process_hid_report(self, path: bytes, data: Any) -> int:
-        """Parse one raw HID report from ``path`` and queue its key events.
-
-        Handles both composite interfaces: the Keyboard interface
-        (Usage Page 0x01, 8-byte standard reports) via
-        ``parse_hid_keyboard_report`` and the Consumer interface (Usage Page
-        0x0C) via ``parse_hid_consumer_report``. Queued tuples are
-        ``(name, is_down, usage, 0)``; ``usage`` flows into ``_dispatch`` /
-        ``_zero_event`` so the '000' triplet detection tracks the HID Usage ID
-        0x62 and is NumLock-independent.
-
-        Returns the number of queued events. Must be called from one thread
-        only (the hidapi worker) or with external synchronisation.
-        """
-        kind = self._hid_kind.get(path, "kb")
-        prev = self._hid_prev_keys.setdefault(path, set())
-        if kind == "consumer":
-            events, current = parse_hid_consumer_report(data, prev)
-        else:
-            events, current = parse_hid_keyboard_report(data, prev)
-        self._hid_prev_keys[path] = current
-        if not events:
-            return 0
-
-        targeted = bool(self._target_device)
-        queued = 0
-        for name, is_down, usage in events:
-            if kind != "consumer" and not targeted:
-                # All-devices mode: scope to the keypad cluster so main
-                # keyboard number rows / navigation keys stay untouched.
-                if hid_keypad_name(usage, targeted=False) is None:
-                    continue
-            self._win_queue.put_nowait((name, is_down, usage, 0))
-            queued += 1
-        return queued
-
-    def _win_hid_loop(self) -> None:  # pragma: no cover - real HID thread
-        """Dedicated daemon thread implementing the unified Windows HID engine.
-
-        Replaces the MIDI generation formerly living inside ``WH_KEYBOARD_LL`` /
-        ``WM_INPUT``: raw 8-byte USB reports are read straight from both
-        composite interfaces of the keypad via ``hidapi``, bypassing the OS
-        keyboard stack (and therefore any NumLock state). Handles device
-        (re-)enumeration, unplug and target switching transparently.
-        """
-        if not HAS_HID:
-            logger.warning(
-                "hidapi unavailable - Windows MIDI input disabled; "
-                "run: pip install hidapi"
-            )
-            return
-        try:
-            self._win_hid_ensure_opened()
-        except Exception as exc:
-            logger.debug("initial hid enumeration failed: %s", exc)
-
-        idle_cycles = 0
-        while self._running:
-            delay = _WIN_HID_POLL_IDLE
-            try:
-                with self._lock:
-                    target_changed = self._target_device != self._hid_target_sig
-                now = time.perf_counter()
-                if target_changed or now - self._hid_last_enumerate >= _WIN_HID_REENUMERATE_INTERVAL:
-                    self._hid_last_enumerate = now
-                    self._win_hid_ensure_opened()
-
-                read_any = False
-                for path in list(self._hid_open):
-                    dev = self._hid_open.get(path)
-                    if dev is None:
-                        continue
-                    try:
-                        data = dev.read(16)
-                    except Exception:
-                        self._win_hid_close_path(path)  # unplugged / device error
-                        continue
-                    if data:
-                        read_any = True
-                        try:
-                            self._win_process_hid_report(path, data)
-                        except Exception as exc:
-                            logger.debug("HID report parse error: %s", exc)
-
-                if read_any:
-                    idle_cycles = 0
-                    delay = _WIN_HID_POLL_ACTIVE
-                else:
-                    idle_cycles += 1
-                    delay = min(_WIN_HID_POLL_IDLE, 0.002 * idle_cycles)
-            except Exception as exc:
-                logger.error("Windows HID engine loop error: %s", exc, exc_info=True)
-                delay = _WIN_HID_POLL_IDLE
-            self._win_ready.set()
-            time.sleep(delay)
 
     # ----------------------------------------------------- macOS multi-interface HID & IOHIDManager
     def _find_mac_device_interfaces(self) -> tuple[list[bytes], list[bytes]]:
@@ -2110,26 +1867,31 @@ class KeyHook:
         the PC-navigation cluster only when a specific external keypad is
         targeted, because those codes are shared with the internal keyboard.
 
-        Anti-crash: Accessibility is verified with
-        ``Quartz.AXIsProcessTrustedWithOptions`` semantics (via
-        ``check_macos_accessibility``) *before* the tap is created. When the
-        permission is missing or ``CGEventTapCreate`` returns NULL the tap is
-        NOT created at all and the ``CFRunLoop`` is never attached - this is
-        the historically crash-looping configuration - and the app runs
+        Anti-crash: the Accessibility verdict is consumed **once per process**
+        (``KeyHook.macos_ax_trusted``, computed by the startup layer with the
+        plain non-prompting ``AXIsProcessTrusted``) *before* the tap is created.
+        When the permission is missing or ``CGEventTapCreate`` returns NULL the
+        tap is NOT created at all and the ``CFRunLoop`` is never attached - this
+        is the historically crash-looping configuration - and the app runs
         safely without keystroke swallowing while ``_mac_tap_block_reason``
-        records why (the PyQt layer surfaces a native warning dialog).
+        records why (the PyQt layer surfaces its warning dialog once).
         """
         if not IS_MAC:
             return
-        # --- Anti-crash pre-check: never create/attach a tap without Accessibility.
-        if not check_macos_accessibility(prompt=False):
+        # --- Startup-only Accessibility verdict: never re-query the OS here.
+        ax_trusted = self._mac_ax_trusted
+        if ax_trusted is None:
+            # Direct library use (tests/tools): compute once lazily and cache.
+            ax_trusted = check_macos_accessibility(prompt=False)
+            self.macos_ax_trusted = bool(ax_trusted)
+        if not ax_trusted:
             with self._lock:
                 self._mac_tap_granted = False
                 self._mac_tap_block_reason = "accessibility"
             logger.warning(
                 "Accessibility permission missing - CGEventTap NOT created and NOT "
                 "attached to the run loop. Keypad keys will not be blocked from the "
-                "macOS UI. Grant NumpadToMIDI2 in System Settings > Privacy & "
+                "macOS UI. Grant NumpadToMIDI in System Settings > Privacy & "
                 "Security > Accessibility, then restart the app (raw HID capture "
                 "keeps working without it)."
             )
@@ -2223,7 +1985,7 @@ class KeyHook:
                 logger.warning(
                     "CGEventTapCreate failed - CGEventTap NOT attached to the run "
                     "loop; keypad keys will not be blocked from the macOS UI. Grant "
-                    "NumpadToMIDI2 Accessibility in System Settings > Privacy & "
+                    "NumpadToMIDI Accessibility in System Settings > Privacy & "
                     "Security > Accessibility, then restart the app (raw HID capture "
                     "keeps working without it)."
                 )

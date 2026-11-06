@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for NumpadToMIDI2.
-#   Windows -> dist/NumpadToMIDI2-Windows.exe   (single file)
-#   macOS   -> dist/NumpadToMIDI2.app           (zipped to NumpadToMIDI2-macOS.zip by CI)
+# PyInstaller spec for NumpadToMIDI.
+#   Windows -> dist/NumpadToMIDI-Windows.exe   (single file)
+#   macOS   -> dist/NumpadToMIDI.app           (zipped to NumpadToMIDI-macOS.zip by CI)
 import os
 import sys
 
@@ -9,7 +9,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 _version = {}
 exec(open("version.py", encoding="utf-8").read(), _version)
-APP_VERSION = _version.get("VERSION", "1.7.0")
+APP_VERSION = _version.get("VERSION", "1.8.0")
 
 hiddenimports = collect_submodules("rtmidi")
 hiddenimports += ["hid"]
@@ -37,7 +37,7 @@ if sys.platform == "darwin":
         a.scripts,
         [],
         exclude_binaries=True,
-        name="NumpadToMIDI2",
+        name="NumpadToMIDI",
         debug=False,
         strip=False,
         upx=False,
@@ -46,24 +46,24 @@ if sys.platform == "darwin":
         target_arch=os.environ.get("TARGET_ARCH") or None,
         icon="assets/icon.icns",
     )
-    coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="NumpadToMIDI2")
+    coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="NumpadToMIDI")
     app = BUNDLE(
         coll,
-        name="NumpadToMIDI2.app",
+        name="NumpadToMIDI.app",
         icon="assets/icon.icns",
-        bundle_identifier="com.numpadtomidi2.app",
+        bundle_identifier="com.numpadtomidi.app",
         info_plist={
-            "CFBundleName": "NumpadToMIDI2",
-            "CFBundleDisplayName": "NumpadToMIDI2",
+            "CFBundleName": "NumpadToMIDI",
+            "CFBundleDisplayName": "NumpadToMIDI",
             "CFBundleShortVersionString": APP_VERSION,
             "CFBundleVersion": APP_VERSION,
             "NSHighResolutionCapable": True,
             "NSInputMonitoringUsageDescription":
-                "NumpadToMIDI2 listens to your numpad to send MIDI notes.",
+                "NumpadToMIDI listens to your numpad to send MIDI notes.",
             "NSAppleEventsUsageDescription":
-                "NumpadToMIDI2 requires event monitoring to map keypad inputs to MIDI signals.",
+                "NumpadToMIDI requires event monitoring to map keypad inputs to MIDI signals.",
             "NSAccessibilityUsageDescription":
-                "NumpadToMIDI2 requires accessibility permissions to capture external numpad keystrokes.",
+                "NumpadToMIDI requires accessibility permissions to capture external numpad keystrokes.",
             "LSUIElement": False,
         },
     )
@@ -74,7 +74,7 @@ else:
         a.binaries,
         a.datas,
         [],
-        name="NumpadToMIDI2-Windows",
+        name="NumpadToMIDI-Windows",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
