@@ -1,11 +1,11 @@
-; NumpadToMIDI2 - Windows all-in-one installer (Inno Setup 6.3+)
+; NumpadToMIDI - Windows all-in-one installer (Inno Setup 6.3+)
 ;
 ; Build (from the repository root, after `pyinstaller build.spec`):
-;   ISCC.exe /DAppVersion=1.4.1 installer\windows_installer.iss
-; Output: dist\NumpadToMIDI2-Setup-v<AppVersion>.exe
+;   ISCC.exe /DAppVersion=1.9 installer\windows_installer.iss
+; Output: dist\NumpadToMIDI-Setup-v<AppVersion>.exe
 ;
 ; The installer
-;   * installs NumpadToMIDI2 (admin elevation, Start Menu + Desktop shortcuts)
+;   * installs NumpadToMIDI (admin elevation, Start Menu + Desktop shortcuts)
 ;   * downloads the official loopMIDI package (which installs the teVirtualMIDI
 ;     driver) from tobias-erichsen.de at install time, verifies its SHA-256 and
 ;     installs it silently - ONLY if the driver is not already present.
@@ -13,11 +13,11 @@
 ;     the installer (see installer\driver_notice.txt).
 
 #ifndef AppVersion
-  #define AppVersion "1.6.0"
+  #define AppVersion "1.9"
 #endif
-#define AppName      "NumpadToMIDI2"
-#define AppExeName   "NumpadToMIDI2.exe"
-#define AppUrl       "https://github.com/homejes/NumpadToMIDI2"
+#define AppName      "NumpadToMIDI"
+#define AppExeName   "NumpadToMIDI.exe"
+#define AppUrl       "https://github.com/homejes/NumpadToMIDI"
 
 ; Official vendor package. SHA-256 is pinned: if the vendor replaces the file the
 ; download is rejected and the installer continues without the driver.
@@ -30,7 +30,7 @@ AppId={{6F1D2B8E-3C54-4B1A-9E27-5A8C0D4F7E31}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=NumpadToMIDI2
+AppPublisher=NumpadToMIDI
 AppPublisherURL={#AppUrl}
 AppSupportURL={#AppUrl}/issues
 AppUpdatesURL={#AppUrl}/releases
@@ -51,7 +51,7 @@ CloseApplications=yes
 RestartApplications=no
 InfoBeforeFile=driver_notice.txt
 OutputDir=..\dist
-OutputBaseFilename=NumpadToMIDI2-Setup-v{#AppVersion}
+OutputBaseFilename=NumpadToMIDI-Setup-v{#AppVersion}
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName={#AppName}
 VersionInfoDescription={#AppName} Setup
@@ -64,7 +64,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "installdriver"; Description: "Install the virtual MIDI driver (teVirtualMIDI by Tobias Erichsen, downloaded from the vendor) if it is missing"; GroupDescription: "Virtual MIDI:"
 
 [Files]
-Source: "..\dist\NumpadToMIDI2-Windows.exe"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
+Source: "..\dist\NumpadToMIDI-Windows.exe"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
 Source: "..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\config.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -115,8 +115,8 @@ var
 begin
   Result := '';
   DriverZip := '';
-  // Ensure any running NumpadToMIDI2 process (including tray) releases driver handles
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM NumpadToMIDI2.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Ensure any running NumpadToMIDI process (including tray) releases driver handles
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM NumpadToMIDI.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if not WizardIsTaskSelected('installdriver') then
   begin
     Log('Driver task not selected - skipping virtual MIDI driver.');
@@ -137,7 +137,7 @@ begin
     Log('Driver download failed: ' + GetExceptionMessage);
     SuppressibleMsgBox(
       'The virtual MIDI driver could not be downloaded:' + #13#10 + GetExceptionMessage + #13#10#13#10 +
-      'NumpadToMIDI2 will still be installed. To get a virtual MIDI port later, install loopMIDI ' +
+      'NumpadToMIDI will still be installed. To get a virtual MIDI port later, install loopMIDI ' +
       'from tobias-erichsen.de or run this installer again with an internet connection.',
       mbError, MB_OK, IDOK);
   end;
@@ -180,7 +180,7 @@ begin
       3010: SuppressibleMsgBox('Windows must be restarted to finish installing the virtual MIDI driver.',
                                mbInformation, MB_OK, IDOK);
     else
-      SuppressibleMsgBox(Format('The virtual MIDI driver installer returned code %d. NumpadToMIDI2 is installed; ' +
+      SuppressibleMsgBox(Format('The virtual MIDI driver installer returned code %d. NumpadToMIDI is installed; ' +
                          'you can install loopMIDI manually if no virtual port appears.', [ResultCode]),
                          mbError, MB_OK, IDOK);
     end;

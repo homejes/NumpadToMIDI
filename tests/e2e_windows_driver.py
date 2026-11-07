@@ -1,6 +1,6 @@
 """End-to-end check of the virtual MIDI port (Windows, driver installed).
 
-Creates the "NumpadToMIDI2" virtual port through MidiEngine, opens it as a MIDI
+Creates the "NumpadToMIDI" virtual port through MidiEngine, opens it as a MIDI
 *input* with python-rtmidi (like a DAW would) and checks that Note On / Off sent
 by the engine arrive. Used by CI after the silent installer has put the driver
 in place:   python tests/e2e_windows_driver.py
@@ -27,7 +27,7 @@ def main() -> int:
     dll = TeVirtualMidiPort._load()
     for flags in (8, 12, 0):
         ctypes.windll.kernel32.SetLastError(0)
-        handle = dll.virtualMIDICreatePortEx2("NumpadToMIDI2-probe", None, 0, 65535, flags)
+        handle = dll.virtualMIDICreatePortEx2("NumpadToMIDI-probe", None, 0, 65535, flags)
         print(f"probe flags={flags}: handle={'ok' if handle else None} lasterr={ctypes.GetLastError()}")
         if handle:
             dll.virtualMIDIClosePort(handle)
@@ -44,7 +44,7 @@ def main() -> int:
     index = None
     for _ in range(15):
         ports = midi_in.get_ports()
-        index = next((i for i, p in enumerate(ports) if p.startswith("NumpadToMIDI2")), None)
+        index = next((i for i, p in enumerate(ports) if p.startswith("NumpadToMIDI")), None)
         if index is not None:
             break
         time.sleep(0.2)

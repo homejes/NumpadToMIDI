@@ -1,4 +1,4 @@
-"""Global numpad key hook for NumpadToMIDI2.
+"""Global numpad key hook for NumpadToMIDI.
 
 Translates raw OS keyboard events into logical numpad key names and guarantees
 *exactly one* "down" and one "up" per physical press:
@@ -42,7 +42,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-logger = logging.getLogger("NumpadToMIDI2.hook")
+logger = logging.getLogger("NumpadToMIDI.hook")
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -1374,7 +1374,7 @@ class KeyHook:
             # Register hidden message-only window for Raw Input (WM_INPUT)
             try:
                 self._win_raw_hwnd = _user32.CreateWindowExW(
-                    0, "Static", "NumpadToMIDI2RawInputSink", 0,
+                    0, "Static", "NumpadToMIDIRawInputSink", 0,
                     0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
                 )
                 if self._win_raw_hwnd:
@@ -1912,7 +1912,7 @@ class KeyHook:
             if not tap:
                 logger.warning(
                     "CGEventTapCreate failed - keypad keys will not be blocked from the "
-                    "macOS UI. Grant NumpadToMIDI2 Accessibility in System Settings > "
+                    "macOS UI. Grant NumpadToMIDI Accessibility in System Settings > "
                     "Privacy & Security (raw HID capture keeps working without it)."
                 )
                 return
