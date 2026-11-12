@@ -1164,6 +1164,17 @@ def selftest() -> int:
                 assert up_item[1] is False and up_item[0] == "0"
                 assert hook._ll_handle_event("0", 0x60, 0x52, False, now, False) is False
                 assert hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False) is False
+                # v1.9.6 background Raw Input sink: the hidden top-level sink
+                # window must register with RIDEV_INPUTSINK and the OS must
+                # verify the registration as background-capable. Without it,
+                # MIDI generation (and the LL swallow correlation) dies the
+                # moment a DAW takes the focus (v1.9.5 regression). The pump
+                # thread started above owns the sink; re-registering here is
+                # idempotent and re-verifies against the OS.
+                assert hook._raw_sink_owns_wm_input is True  # pump set it
+                assert hook._register_raw_input_sink() is True
+                assert hook._verify_raw_input_registration() is True
+                assert hook._win_raw_hwnd is not None
             finally:
                 hook.set_target_device(saved_state[5])
                 hook._raw_last_by_key.clear()

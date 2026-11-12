@@ -543,6 +543,12 @@ RIM_TYPEKEYBOARD = 1
 RIDI_DEVICENAME = 0x20000007
 RID_INPUT = 0x10000003
 _WM_INPUT = 0x00FF
+_WM_TIMER = 0x0113
+_WS_POPUP = 0x80000000  # hidden top-level sink window (no WS_VISIBLE)
+_RAW_SINK_CLASS = "NumpadToMIDIRawSink"
+_RAW_SINK_TIMER_ID = 1
+_RAW_SINK_WATCHDOG_MS = 30000
+_ERROR_CLASS_ALREADY_EXISTS = 1410
 RI_KEY_BREAK = 0x0001
 RI_KEY_E0 = 0x0002
 RI_KEY_E1 = 0x0004
@@ -624,6 +630,29 @@ if IS_WIN:
         LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
     )
 
+    # v1.9.6: WNDCLASS/WNDPROC scaffolding for the Raw Input sink window. A
+    # properly registered top-level window with its own wndproc is the
+    # documented, battle-tested pattern for background WM_INPUT delivery
+    # (RIDEV_INPUTSINK); the previous message-only "Static" window relied on
+    # undocumented delivery behavior and broke background processing.
+    WNDPROC = ctypes.WINFUNCTYPE(
+        LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    )
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", ctypes.c_void_p),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
     _user32 = ctypes.windll.user32
     _kernel32 = ctypes.windll.kernel32
 
@@ -680,6 +709,26 @@ if IS_WIN:
     _kernel32.GetCurrentThread.restype = wintypes.HANDLE
     _kernel32.SetThreadPriority.restype = wintypes.BOOL
     _kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+    # v1.9.6: raw input sink window plumbing
+    _user32.RegisterClassW.restype = wintypes.ATOM
+    _user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    _user32.DefWindowProcW.restype = LRESULT
+    _user32.DefWindowProcW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    ]
+    _user32.SetTimer.restype = ctypes.c_size_t
+    _user32.SetTimer.argtypes = [
+        wintypes.HWND, ctypes.c_size_t, wintypes.UINT, wintypes.LPVOID
+    ]
+    _user32.KillTimer.restype = wintypes.BOOL
+    _user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+    _user32.GetRegisteredRawInputDevices.restype = wintypes.UINT
+    _user32.GetRegisteredRawInputDevices.argtypes = [
+        ctypes.POINTER(RAWINPUTDEVICE), ctypes.POINTER(wintypes.UINT), wintypes.UINT
+    ]
+    _kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+    _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    _kernel32.GetLastError.restype = wintypes.DWORD
 
 
 def _lookup_pnp_friendly_name(pnp_id: str, hw_id: str) -> str:
@@ -1161,6 +1210,9 @@ class KeyHook:
         # and the LL media-key channel). Debounces OS auto-repeat and
         # guarantees every Note ON is paired with exactly one Note OFF.
         self._pad_down: set[str] = set()
+        # v1.9.6: background Raw Input sink state
+        self._raw_sink_wndproc_ref = None
+        self._raw_sink_owns_wm_input = False
         # 000-burst detection state (NumLock-independent triplet detector)
         self._zbuf: list[bool] = []
         self._zlast_ts: float = 0.0
@@ -1691,6 +1743,155 @@ class KeyHook:
         except Exception as exc:
             logger.debug("WM_INPUT parse error: %s", exc)
 
+    # --- v1.9.6: Raw Input background sink (RIDEV_INPUTSINK) --------------------
+
+    def _raw_sink_wndproc(self, hwnd: int, umsg: int, wparam: int, lparam: int) -> int:
+        """WndProc of the hidden Raw Input sink window.
+
+        WM_INPUT is handled HERE (no longer in the pump loop) so each raw
+        event is processed exactly once, per the documented pattern. The
+        message is still forwarded to DefWindowProc so the system can perform
+        its cleanup for RIM_INPUT (foreground) events. WM_TIMER drives the
+        registration watchdog that keeps background delivery alive.
+        """
+        try:
+            if umsg == _WM_INPUT:
+                try:
+                    self._handle_wm_input(lparam)
+                except Exception as exc:
+                    logger.debug("WM_INPUT handler error: %s", exc)
+                # No early return: fall through to DefWindowProcW below so the
+                # system performs its cleanup for RIM_INPUT (foreground)
+                # events, per the WM_INPUT documentation.
+            elif umsg == _WM_TIMER and wparam == _RAW_SINK_TIMER_ID:
+                self._verify_raw_input_registration()
+                return 0
+        except Exception as exc:
+            logger.debug("Raw Input sink wndproc error: %s", exc)
+        return int(_user32.DefWindowProcW(hwnd, umsg, wparam, lparam))
+
+    def _create_raw_sink_window(self) -> bool:
+        """Create the hidden top-level sink window with a custom WNDCLASS.
+
+        A hidden top-level window (``_WS_POPUP`` without ``WS_VISIBLE``) with
+        its own wndproc is the documented, battle-tested pattern for
+        background raw input delivery; the previous message-only "Static"
+        window with no wndproc degraded to foreground-only delivery on real
+        systems (v1.9.5 foreground-only regression).
+        """
+        if self._raw_sink_wndproc_ref is None:
+            self._raw_sink_wndproc_ref = WNDPROC(self._raw_sink_wndproc)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._raw_sink_wndproc_ref
+        wc.hInstance = _kernel32.GetModuleHandleW(None)
+        wc.lpszClassName = _RAW_SINK_CLASS
+        if not _user32.RegisterClassW(ctypes.byref(wc)):
+            err = int(_kernel32.GetLastError())
+            if err != _ERROR_CLASS_ALREADY_EXISTS:
+                logger.error(
+                    "RegisterClassW(%s) failed (GetLastError=%s)", _RAW_SINK_CLASS, err
+                )
+                self._raw_sink_wndproc_ref = None
+                return False
+            # Class already registered (app restart within this process):
+            # reuse it; the persistent wndproc reference above stays alive.
+            logger.debug("WndClass %s already registered; reusing", _RAW_SINK_CLASS)
+        hwnd = _user32.CreateWindowExW(
+            0, _RAW_SINK_CLASS, "NumpadToMIDI Raw Input Sink",
+            _WS_POPUP,  # hidden: no WS_VISIBLE
+            0, 0, 0, 0, None, None, wc.hInstance, None,
+        )
+        if not hwnd:
+            logger.error(
+                "Raw Input sink CreateWindowExW failed (GetLastError=%s)",
+                _kernel32.GetLastError(),
+            )
+            return False
+        self._win_raw_hwnd = hwnd
+        return True
+
+    def _register_raw_input_sink(self) -> bool:
+        """(Re-)register the keyboard Raw Input sink with RIDEV_INPUTSINK.
+
+        RIDEV_INPUTSINK is MANDATORY for background operation: without it,
+        WM_INPUT is delivered only while one of this process's windows is in
+        the foreground - which stopped all MIDI generation (WM_INPUT owns the
+        MIDI engine since v1.9.4) and, via the dead origin correlation, also
+        the LL swallow decisions, whenever a DAW held the focus (v1.9.5 bug).
+        Failures are logged loudly and verified against the OS via
+        ``GetRegisteredRawInputDevices`` instead of failing silently.
+        """
+        if not self._win_raw_hwnd:
+            if not self._create_raw_sink_window():
+                return False
+        rid = RAWINPUTDEVICE(
+            HID_USAGE_PAGE_GENERIC,
+            HID_USAGE_GENERIC_KEYBOARD,
+            RIDEV_INPUTSINK,
+            self._win_raw_hwnd,
+        )
+        if not _user32.RegisterRawInputDevices(
+            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
+        ):
+            logger.error(
+                "RegisterRawInputDevices(RIDEV_INPUTSINK) FAILED (GetLastError=%s) "
+                "- background WM_INPUT unavailable",
+                _kernel32.GetLastError(),
+            )
+            return False
+        if not self._verify_raw_input_registration(log_healthy=True):
+            return False
+        logger.info(
+            "Registered Win32 Raw Input keyboard sink (hwnd=%s, flags=RIDEV_INPUTSINK, "
+            "background delivery verified)",
+            self._win_raw_hwnd,
+        )
+        return True
+
+    def _verify_raw_input_registration(self, log_healthy: bool = False) -> bool:
+        """True when the keyboard registration carries RIDEV_INPUTSINK.
+
+        Re-registers when the registration is missing or lost - e.g. after
+        display sleep, session switches, or third-party input software
+        overwriting this process's registration. Called from the WM_TIMER
+        watchdog on the pump thread.
+        """
+        try:
+            if not self._win_raw_hwnd:
+                return False
+            buf = (RAWINPUTDEVICE * 8)()
+            count = wintypes.UINT(8)
+            res = _user32.GetRegisteredRawInputDevices(
+                buf, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICE)
+            )
+            if res == 0xFFFFFFFF:
+                logger.warning(
+                    "GetRegisteredRawInputDevices failed (GetLastError=%s)",
+                    _kernel32.GetLastError(),
+                )
+                return False
+            for i in range(min(count.value, 8)):
+                d = buf[i]
+                if (
+                    d.usUsagePage == HID_USAGE_PAGE_GENERIC
+                    and d.usUsage == HID_USAGE_GENERIC_KEYBOARD
+                    and (d.dwFlags & RIDEV_INPUTSINK)
+                ):
+                    if log_healthy:
+                        logger.debug(
+                            "Raw Input keyboard registration verified (INPUTSINK active)"
+                        )
+                    return True
+            logger.warning(
+                "Raw Input keyboard registration missing RIDEV_INPUTSINK "
+                "(count=%s); re-registering",
+                count.value,
+            )
+            return self._register_raw_input_sink()
+        except Exception as exc:
+            logger.warning("Raw Input registration verification error: %s", exc)
+            return False
+
     def _win_message_pump(self) -> None:  # pragma: no cover - real OS hook loop
         """Dedicated high-priority Win32 message loop owning WH_KEYBOARD_LL and WM_INPUT."""
         try:
@@ -1705,26 +1906,42 @@ class KeyHook:
             _user32.PostThreadMessageW(self._win_thread_id, 0, 0, 0)
             _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
 
-            # Register hidden message-only window for Raw Input (WM_INPUT)
+            # Register the hidden top-level Raw Input sink (RIDEV_INPUTSINK)
+            # BEFORE the hook so background WM_INPUT delivery is verified up
+            # front; a failed registration is logged loudly instead of
+            # silently degrading to foreground-only operation (v1.9.5 bug).
+            self._raw_sink_owns_wm_input = False
             try:
-                self._win_raw_hwnd = _user32.CreateWindowExW(
-                    0, "Static", "NumpadToMIDIRawInputSink", 0,
-                    0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
-                )
-                if self._win_raw_hwnd:
-                    rid = RAWINPUTDEVICE(
-                        HID_USAGE_PAGE_GENERIC,
-                        HID_USAGE_GENERIC_KEYBOARD,
-                        RIDEV_INPUTSINK,
+                if self._register_raw_input_sink():
+                    self._raw_sink_owns_wm_input = True
+                    _user32.SetTimer(
                         self._win_raw_hwnd,
+                        _RAW_SINK_TIMER_ID,
+                        _RAW_SINK_WATCHDOG_MS,
+                        None,
                     )
-                    if _user32.RegisterRawInputDevices(
-                        ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
-                    ):
-                        logger.info(
-                            "Registered Win32 Raw Input keyboard sink (hwnd=%s)",
+                else:
+                    # Fallback: legacy message-only "Static" window handled
+                    # from the pump loop branch (v1.9.5 behavior).
+                    logger.warning("Falling back to legacy message-only Raw Input sink")
+                    self._win_raw_hwnd = _user32.CreateWindowExW(
+                        0, "Static", "NumpadToMIDIRawInputSink", 0,
+                        0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
+                    )
+                    if self._win_raw_hwnd:
+                        rid = RAWINPUTDEVICE(
+                            HID_USAGE_PAGE_GENERIC,
+                            HID_USAGE_GENERIC_KEYBOARD,
+                            RIDEV_INPUTSINK,
                             self._win_raw_hwnd,
                         )
+                        if _user32.RegisterRawInputDevices(
+                            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
+                        ):
+                            logger.info(
+                                "Registered legacy Win32 Raw Input keyboard sink (hwnd=%s)",
+                                self._win_raw_hwnd,
+                            )
             except Exception as exc:
                 logger.warning("Could not register Raw Input sink: %s", exc)
 
@@ -1773,7 +1990,10 @@ class KeyHook:
                 ret = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret <= 0:  # 0 == WM_QUIT, -1 == error
                     break
-                if msg.message == _WM_INPUT:
+                if not self._raw_sink_owns_wm_input and msg.message == _WM_INPUT:
+                    # Legacy fallback path (no custom wndproc): handle here.
+                    # With the v1.9.6 sink window the wndproc owns WM_INPUT
+                    # and this branch is skipped to avoid double processing.
                     self._handle_wm_input(int(msg.lParam))
                 _user32.TranslateMessage(ctypes.byref(msg))
                 _user32.DispatchMessageW(ctypes.byref(msg))
