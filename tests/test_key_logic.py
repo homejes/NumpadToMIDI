@@ -104,16 +104,13 @@ class DebounceTests(unittest.TestCase):
         for _ in range(10):
             hook._dispatch("5", True)
         hook._dispatch("5", False)
+        hook._dispatch("5", False)  # stray release
         self.assertEqual(rec.events, [("5", True), ("5", False)])
 
-    def test_stray_release_still_forces_note_off_dispatch(self):
-        # v1.9.5 (stuck-keys fix): a release whose make never reached the hook
-        # is no longer silently ignored - the OFF is still dispatched so the
-        # UI pad un-lights and no Note ON can hang. The Controller gracefully
-        # ignores the OFF for a key it never sounded.
+    def test_stray_release_ignored(self):
         hook, rec = make()
         hook._dispatch("7", False)
-        self.assertEqual(rec.events, [("7", False)])
+        self.assertEqual(rec.events, [])
 
     def test_single_zero_press(self):
         hook, rec = make()
@@ -263,10 +260,11 @@ class StartupSafetyTests(unittest.TestCase):
             1001: hook._devices[0],
             2002: hook._devices[1],
         }
-        # Default (""): all devices match
+        # v1.9.8 strict isolation: "" means "no device selected" -> nothing
+        # matches, so the WM_INPUT channel stays silent for every keyboard.
         hook.set_target_device("")
-        self.assertTrue(hook.matches_device(1001))
-        self.assertTrue(hook.matches_device(2002))
+        self.assertFalse(hook.matches_device(1001))
+        self.assertFalse(hook.matches_device(2002))
 
         # Select only the M-Tech USB keypad (handle 2002)
         hook.set_target_device(r"HID\VID_04D9&PID_1203")
@@ -314,8 +312,8 @@ class StartupSafetyTests(unittest.TestCase):
 
             # Verify pressing '1', '2', Up, Down does not change Target USB Keypad combo selection
             win.device.clear()
-            win.device.addItem("All Connected Keypads (Default)", "")
-            win.device.addItem(r"USB Keypad (HID\VID_04D9&PID_1203)", r"HID\VID_04D9&PID_1203")
+            win.device.addItem(r"USB Keypad A (HID\VID_04D9&PID_1203)", r"HID\VID_04D9&PID_1203")
+            win.device.addItem(r"USB Keypad B (HID\VID_1C4F&PID_0002)", r"HID\VID_1C4F&PID_0002")
             win.device.setCurrentIndex(1)
             for key, text in (
                 (Qt.Key.Key_1, "1"),
@@ -912,12 +910,9 @@ class WindowsRawInputOriginTests(unittest.TestCase):
     """Device-origin correlation between WH_KEYBOARD_LL and WM_INPUT (Windows fix).
 
     The laptop's built-in keyboard (a general typing keyboard) must never have
-    its '0'/NumLock/Backspace/Tab keys swallowed, and it must never trigger
-    MIDI: WM_INPUT owns 100% of the MIDI generation (exact hDevice match),
-    while WH_KEYBOARD_LL only swallows keys correlated with the selected USB
-    keypad. These tests drive the pure decision logic (`_ll_origin_device`,
-    `_ll_resolve_name`, `_ll_should_swallow`, `_ll_handle_event`,
-    `_process_raw_keyboard`) without any OS.
+    its '0'/NumLock/Backspace/Tab keys swallowed; only keys correlated with the
+    selected USB keypad are blocked. These tests drive the pure decision logic
+    (`_ll_origin_device`, `_ll_decide`, `_process_raw_keyboard`) without any OS.
     """
 
     LAPTOP_H = 1001
@@ -959,168 +954,133 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         self.assertEqual(entry[0], self.LAPTOP_H)
         self.assertEqual(self.hook._raw_recent_hdevice, self.LAPTOP_H)
 
-    def test_all_mode_laptop_zero_never_swallowed_after_flagging(self):
+    def test_no_selection_laptop_zero_is_strict_noop(self):
         self.flag_laptop()
         now = time.perf_counter()
         self.hook._raw_last_by_key[(0x60, False)] = (self.LAPTOP_H, now)
-        # Laptop's embedded numpad '0' (VK_NUMPAD0, scan 0x52) in All mode:
-        # never swallowed (its MIDI still comes via WM_INPUT, v1.6 parity).
-        self.assertFalse(self.hook._ll_should_swallow("0", 0x60, 0x52, False, now))
+        # v1.9.8: with no device selected the hook is completely inert - the
+        # laptop's embedded numpad '0' generates no MIDI and is not swallowed.
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
+        self.assertEqual((queue, swallow), (False, False))
 
-    def test_all_mode_keypad_zero_is_swallowed(self):
+    def test_no_selection_keypad_zero_is_strict_noop(self):
         now = time.perf_counter()
         self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
-        self.assertTrue(
-            self.hook._ll_should_swallow("0", 0x60, 0x52, False, now)
-        )  # suppress defaults to True
+        # v1.9.8: the former "All Connected Keypads" mode is gone; until the
+        # user picks a specific device nothing generates MIDI.
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
+        self.assertEqual((queue, swallow), (False, False))
 
-    def test_all_mode_unknown_origin_never_swallowed(self):
+    def test_no_selection_unknown_origin_is_strict_noop(self):
         self.hook._raw_recent_ts = 0.0
-        self.assertFalse(
-            self.hook._ll_should_swallow("0", 0x60, 0x52, False, time.perf_counter())
-        )
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, time.perf_counter())
+        self.assertEqual((queue, swallow), (False, False))
 
     def test_specific_target_laptop_zero_completely_ignored(self):
         self.flag_laptop()
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         self.hook._raw_last_by_key[(0x60, False)] = (self.LAPTOP_H, now)
-        # Never swallowed...
-        self.assertFalse(self.hook._ll_should_swallow("0", 0x60, 0x52, False, now))
-        # ...and no MIDI: WM_INPUT drops the non-matching handle entirely.
-        before = self.hook._win_queue.qsize()
-        self.assertFalse(self.hook._process_raw_keyboard(self.LAPTOP_H, 0x60, 0x52, 0))
-        self.assertEqual(self.hook._win_queue.qsize(), before)
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
+        self.assertEqual((queue, swallow), (False, False))
 
     def test_specific_target_keypad_zero_is_swallowed(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
-        self.assertTrue(self.hook._ll_should_swallow("0", 0x60, 0x52, False, now))
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
+        self.assertEqual((queue, swallow), (True, True))
 
-    def test_specific_target_unknown_origin_never_swallowed(self):
+    def test_specific_target_unknown_origin_is_strict_noop(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         self.hook._raw_recent_ts = 0.0
-        # Strict isolation: unattributed events are never blocked; their MIDI
-        # comes from the exact-match WM_INPUT channel.
-        self.assertFalse(
-            self.hook._ll_should_swallow("0", 0x60, 0x52, False, time.perf_counter())
-        )
+        # v1.9.8 leak fix: v1.9.1 queued MIDI here ((True, False)) when no Raw
+        # Input origin had arrived yet, so the laptop's built-in numpad could
+        # produce notes before its first WM_INPUT packet. Strict isolation
+        # requires a proven origin: no MIDI, no swallow.
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, time.perf_counter())
+        self.assertEqual((queue, swallow), (False, False))
 
-    def test_keypad_enter_backspace_tab_swallowed_laptop_versions_pass(self):
+    def test_specific_target_tab_backspace_pass_through(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
-        # Keypad Enter (E0 0x1C) -> MIDI "Enter", swallowed (Cubase Play fix).
-        self.hook._raw_last_by_key[(0x0D, True)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
-        name = self.hook._ll_resolve_name(0x0D, 0x1C, True, self.KEYPAD_H, True)
-        self.assertEqual(name, "Enter")
-        self.assertTrue(self.hook._ll_should_swallow(name, 0x0D, 0x1C, True, now))
-        # Keypad Backspace / Tab: swallowed now (device-gated); v1.6 passed
-        # them through, which leaked into DAW shortcuts.
-        self.hook._raw_last_by_key[(0x08, False)] = (self.KEYPAD_H, now)
-        self.assertTrue(
-            self.hook._ll_should_swallow("Backspace", 0x08, 0x0E, False, now)
-        )
         self.hook._raw_last_by_key[(0x09, False)] = (self.KEYPAD_H, now)
-        self.assertTrue(self.hook._ll_should_swallow("Tab", 0x09, 0x0F, False, now))
-        # The laptop's main Enter (non-extended VK_RETURN), Backspace and Tab
-        # are NEVER swallowed (main-Enter extended-flag guard + unmatched
-        # origin) and stay unmapped for MIDI.
-        self.hook._raw_last_by_key[(0x0D, False)] = (self.LAPTOP_H, now)
-        self.hook._raw_recent_hdevice = self.LAPTOP_H
-        self.hook._raw_recent_ts = now
-        self.assertIsNone(
-            self.hook._ll_resolve_name(0x0D, 0x1C, False, self.LAPTOP_H, False)
-        )
-        self.assertFalse(self.hook._ll_should_swallow("Enter", 0x0D, 0x1C, False, now))
-        self.hook._raw_last_by_key[(0x08, False)] = (self.LAPTOP_H, now)
-        self.assertFalse(
-            self.hook._ll_should_swallow("Backspace", 0x08, 0x0E, False, now)
-        )
-        self.hook._raw_last_by_key[(0x09, False)] = (self.LAPTOP_H, now)
-        self.assertFalse(self.hook._ll_should_swallow("Tab", 0x09, 0x0F, False, now))
-        # All mode: the keypad's E0 Enter is still swallowed.
-        self.hook.set_target_device("")
-        self.hook._raw_last_by_key[(0x0D, True)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
-        self.assertTrue(self.hook._ll_should_swallow("Enter", 0x0D, 0x1C, True, now))
-
-    def test_plain_return_keypad_enter_midi_via_wm_input_never_swallowed(self):
-        # Some USB keypads send their Enter as the plain Return HID usage
-        # (non-extended 0x1C). Per the extended-flag rule the main-Enter
-        # signature is never swallowed, but the WM_INPUT channel still plays
-        # its MIDI with the scancode-derived name.
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x0D, False)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
-        name = self.hook._ll_resolve_name(0x0D, 0x1C, False, self.KEYPAD_H, True)
-        self.assertEqual(name, "Enter")
-        self.assertFalse(self.hook._ll_should_swallow(name, 0x0D, 0x1C, False, now))
-        # WM_INPUT path queues it with the scancode-derived name.
-        before = self.hook._win_queue.qsize()
-        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x0D, 0x1C, 0))
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        queued_name, is_down, vk, scan = self.hook._win_queue.get()
-        self.assertEqual((queued_name, is_down, vk, scan), ("Enter", True, 0x0D, 0x1C))
+        queue, swallow = self.hook._ll_decide("Tab", 0x09, 0x0F, False, now)
+        self.assertEqual((queue, swallow), (False, False))
+        self.hook._raw_last_by_key[(0x08, False)] = (self.KEYPAD_H, now)
+        queue, swallow = self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now)
+        self.assertEqual((queue, swallow), (False, False))
 
     def test_numlock_from_laptop_passes_and_keypad_numlock_is_swallowed(self):
         self.flag_laptop()
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         self.hook._raw_last_by_key[(0x90, False)] = (self.LAPTOP_H, now)
-        self.assertFalse(
-            self.hook._ll_should_swallow("NumLock", 0x90, 0x45, False, now)
-        )
+        queue, swallow = self.hook._ll_decide("NumLock", 0x90, 0x45, False, now)
+        self.assertEqual((queue, swallow), (False, False))
         # Keypad NumLock is still swallowed (hardware navigation mode). The
         # keypad is the actively played device here (its WM_INPUT just arrived),
         # so it - not the freshly typed laptop - is the recent-hot device.
         self.hook._raw_last_by_key[(0x90, False)] = (self.KEYPAD_H, now)
         self.hook._raw_recent_hdevice = self.KEYPAD_H
         self.hook._raw_recent_ts = now
-        self.assertTrue(
-            self.hook._ll_should_swallow("NumLock", 0x90, 0x45, False, now)
-        )
-        # Unattributed NumLock (cold state) stays blocked: passing it through
-        # would toggle the M-Tech hardware into navigation mode.
-        self.hook._raw_last_by_key.pop((0x90, False), None)
+        queue, swallow = self.hook._ll_decide("NumLock", 0x90, 0x45, False, now)
+        self.assertEqual((queue, swallow), (True, True))
+
+    def test_specific_target_unknown_origin_numlock_is_not_swallowed(self):
+        # v1.9.8: v1.9.1 swallowed NumLock with no origin data in target mode
+        # ((True, True) on a cold start), which ate the LAPTOP's NumLock
+        # toggle. Strict isolation requires a proven keypad origin.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         self.hook._raw_recent_ts = 0.0
-        self.assertTrue(
-            self.hook._ll_should_swallow("NumLock", 0x90, 0x45, False, now)
+        queue, swallow = self.hook._ll_decide(
+            "NumLock", 0x90, 0x45, False, time.perf_counter()
         )
+        self.assertEqual((queue, swallow), (False, False))
 
     def test_laptop_home_key_is_device_gated_media_home_is_not(self):
         self.flag_laptop()
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         # Dedicated keyboard Home key (VK_HOME 0x24 + E0, scancode 0x47) is Raw
-        # Input trackable -> device-gated, so the laptop's Home passes through.
+        # Input trackable -> device-gated, so the laptop's Home is completely
+        # ignored (no MIDI, no swallow).
         self.hook._raw_last_by_key[(0x24, True)] = (self.LAPTOP_H, now)
-        self.assertFalse(self.hook._ll_should_swallow("Home", 0x24, 0x47, True, now))
+        queue, swallow = self.hook._ll_decide("Home", 0x24, 0x47, True, now)
+        self.assertEqual((queue, swallow), (False, False))
         # The M-Tech multimedia Home (VK_BROWSER_HOME 0xAC) never emits
-        # WM_INPUT: the LL channel is its only MIDI source - it is queued AND
-        # swallowed unconditionally regardless of tracking state.
-        before = self.hook._win_queue.qsize()
-        self.assertTrue(
-            self.hook._ll_handle_event("Home", 0xAC, 0x32, True, now, True)
-        )
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        # WM_INPUT: while a specific keypad is selected it keeps the v1.9.1
+        # unconditional swallow (the key is untrackable in either direction).
+        queue, swallow = self.hook._ll_decide("Home", 0xAC, 0x32, True, now)
+        self.assertEqual((queue, swallow), (True, True))
+
+    def test_no_selection_media_home_is_inert(self):
+        # v1.9.8: the unconditional multimedia-key swallow only applies while
+        # a specific device is selected; with no selection the app is inert.
+        self.hook._raw_recent_ts = 0.0
+        queue, swallow = self.hook._ll_decide("Home", 0xAC, 0x32, True, time.perf_counter())
+        self.assertEqual((queue, swallow), (False, False))
 
     def test_recent_typing_keyboard_overrides_stale_per_key_memory(self):
         self.flag_laptop()
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         # Per-key memory says keypad (played '0' 2s ago), but the laptop is hot
         # (typing 'a' 0.2s ago): the actively typing device must win so the
-        # laptop's '0' is not swallowed after a device switch.
+        # laptop's '0' is attributed to the LAPTOP - not misattributed to the
+        # stale keypad record.
         self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now - 2.0)
         self.hook._raw_last_by_key[(0x41, False)] = (self.LAPTOP_H, now - 0.2)
         self.hook._raw_recent_hdevice = self.LAPTOP_H
         self.hook._raw_recent_ts = now - 0.2
-        self.assertFalse(self.hook._ll_should_swallow("0", 0x60, 0x52, False, now))
+        origin = self.hook._ll_origin_device(0x60, False, now)
+        self.assertEqual(origin, self.LAPTOP_H)
+        # Proven foreign origin under a specific target: strict no-op.
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
+        self.assertEqual((queue, swallow), (False, False))
 
     def test_recent_activity_fallback_covers_new_keys_in_drum_cadence(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         # '9' has no per-key memory, but the keypad was just played (0.3s ago):
         # the active-device fallback must correlate it with the keypad.
@@ -1129,7 +1089,8 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         self.hook._raw_recent_ts = now - 0.3
         origin = self.hook._ll_origin_device(0x69, False, now)
         self.assertEqual(origin, self.KEYPAD_H)
-        self.assertTrue(self.hook._ll_should_swallow("9", 0x69, 0x49, False, now))
+        queue, swallow = self.hook._ll_decide("9", 0x69, 0x49, False, now)
+        self.assertEqual((queue, swallow), (True, True))
 
     def test_stale_memory_and_idle_fallback_returns_unknown(self):
         now = time.perf_counter()
@@ -1138,279 +1099,29 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         self.hook._raw_recent_ts = now - 5.0
         self.assertEqual(self.hook._ll_origin_device(0x60, False, now), 0)
 
-    def test_wm_input_all_mode_flagged_laptop_zero_still_queued_for_midi(self):
-        # v1.6 MIDI parity: WM_INPUT owns the MIDI generation and keeps
-        # feeding the engine regardless of device flags; the LL channel only
-        # swallows (device-aware, see _ll_should_swallow).
+    def test_wm_input_no_selection_flagged_laptop_zero_is_ignored(self):
+        # v1.9.8 strict isolation: the WM_INPUT channel must not queue MIDI
+        # for any device when no specific keypad is selected (v1.9.1 kept
+        # v1.6 "All" parity here, which is exactly the laptop-numpad leak).
         self.flag_laptop()
         before = self.hook._win_queue.qsize()
         ok = self.hook._process_raw_keyboard(self.LAPTOP_H, 0x60, 0x52, 0)
-        self.assertTrue(ok)
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        # And the matching LL decision never blocks the OS keystroke:
-        now = time.perf_counter()
-        self.assertFalse(self.hook._ll_should_swallow("0", 0x60, 0x52, False, now))
-
-    # --- v1.9.2: NumLock-OFF navigational variants ----------------------------
-
-    def test_e0_nav_keys_from_keypad_map_to_digits_and_swallow(self):
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        now = time.perf_counter()
-        # USB keypads emit HID navigation usages as E0-extended scancodes when
-        # their NumLock is OFF/desynced: '2' arrives as VK_DOWN (E0 0x50), etc.
-        # The physical scancode must map the MIDI name; the OS key is swallowed.
-        cases = [
-            (0x2D, 0x52, "0"),  # VK_INSERT -> numpad 0
-            (0x23, 0x4F, "1"),  # VK_END    -> numpad 1
-            (0x28, 0x50, "2"),  # VK_DOWN   -> numpad 2
-            (0x22, 0x51, "3"),  # VK_NEXT   -> numpad 3
-            (0x25, 0x4B, "4"),  # VK_LEFT   -> numpad 4
-            (0x27, 0x4D, "6"),  # VK_RIGHT  -> numpad 6
-            (0x24, 0x47, "7"),  # VK_HOME   -> numpad 7 (not "Home")
-            (0x26, 0x48, "8"),  # VK_UP     -> numpad 8
-            (0x21, 0x49, "9"),  # VK_PRIOR  -> numpad 9
-            (0x2E, 0x53, "."),  # VK_DELETE -> numpad .
-        ]
-        for vk, scan, expected in cases:
-            self.hook._raw_last_by_key[(vk, True)] = (self.KEYPAD_H, now)
-            name = self.hook._ll_resolve_name(vk, scan, True, self.KEYPAD_H, True)
-            self.assertEqual(name, expected, f"E0 scan 0x{scan:02X}")
-            self.assertTrue(
-                self.hook._ll_should_swallow(name, vk, scan, True, now),
-                f"E0 scan 0x{scan:02X}",
-            )
-
-    def test_numlock_off_vk_down_reported_by_windows_is_swallowed(self):
-        # The user's exact report: numpad '2' with NumLock OFF leaking into
-        # Cubase as a Down arrow.
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x28, True)] = (self.KEYPAD_H, now)
-        name = self.hook._ll_resolve_name(0x28, 0x50, True, self.KEYPAD_H, True)
-        self.assertEqual(name, "2")
-        self.assertTrue(self.hook._ll_should_swallow(name, 0x28, 0x50, True, now))
-        # Classic-AT variant (non-extended, same scancode) via the OEM table
-        # is swallowed through the same nav list.
-        self.hook._raw_last_by_key[(0x28, False)] = (self.KEYPAD_H, now)
-        self.assertTrue(self.hook._ll_should_swallow("2", 0x28, 0x50, False, now))
-
-    def test_laptop_e0_arrows_never_swallowed_or_mapped(self):
-        self.flag_laptop()
-        now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x28, True)] = (self.LAPTOP_H, now)
-        # All mode, flagged general keyboard: no scancode override, no MIDI.
-        self.assertIsNone(
-            self.hook._ll_resolve_name(0x28, 0x50, True, self.LAPTOP_H, True)
-        )
-        # Specific target: the laptop's real Down arrow is rejected entirely.
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        self.assertFalse(self.hook._ll_should_swallow("2", 0x28, 0x50, True, now))
-
-    def test_wm_input_e0_nav_keypad_queued_with_scancode_name(self):
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        before = self.hook._win_queue.qsize()
-        ok = self.hook._process_raw_keyboard(
-            self.KEYPAD_H, 0x28, 0x50, 0x0002  # RI_KEY_E0: VK_DOWN, scan 0x50
-        )
-        self.assertTrue(ok)
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        name, is_down, vk, scan = self.hook._win_queue.get()
-        self.assertEqual((name, is_down, vk, scan), ("2", True, 0x28, 0x50))
-
-    def test_wm_input_e0_nav_flagged_laptop_not_queued_all_mode(self):
-        self.flag_laptop()
-        before = self.hook._win_queue.qsize()
-        ok = self.hook._process_raw_keyboard(
-            self.LAPTOP_H, 0x28, 0x50, 0x0002  # laptop's real Down arrow
-        )
-        self.assertFalse(ok)  # name stays None -> WM_INPUT drops it
+        self.assertFalse(ok)
         self.assertEqual(self.hook._win_queue.qsize(), before)
-
-    # --- v1.9.4: WM_INPUT owns MIDI; LL is swallow-only -------------------------
-
-    def test_ll_never_queues_midi_for_trackable_keys(self):
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        # And the matching LL decision is a strict no-op as well:
         now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
+        queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
+        self.assertEqual((queue, swallow), (False, False))
+
+    def test_wm_input_specific_target_rejects_laptop_and_accepts_keypad(self):
+        # Strict hDevice equality in the WM_INPUT channel: only the selected
+        # keypad's hardware handle is allowed through.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         before = self.hook._win_queue.qsize()
-        # Keypad '0' via LL: swallowed, but NOT queued for MIDI...
-        self.assertTrue(self.hook._ll_handle_event("0", 0x60, 0x52, False, now, True))
+        self.assertFalse(self.hook._process_raw_keyboard(self.LAPTOP_H, 0x60, 0x52, 0))
         self.assertEqual(self.hook._win_queue.qsize(), before)
-        # ...WM_INPUT is the sole MIDI source (exact hDevice match).
         self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0))
         self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        queued_name, is_down, vk, scan = self.hook._win_queue.get()
-        self.assertEqual((queued_name, is_down, vk, scan), ("0", True, 0x60, 0x52))
-
-    def test_ll_still_queues_media_keys_as_only_midi_source(self):
-        # Multimedia launcher keys never emit RIM_TYPEKEYBOARD WM_INPUT, so
-        # the LL channel remains their only MIDI source.
-        before = self.hook._win_queue.qsize()
-        now = time.perf_counter()
-        self.assertTrue(
-            self.hook._ll_handle_event("Email", 0xB4, 0x6C, True, now, True)
-        )
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        queued_name, is_down, vk, scan = self.hook._win_queue.get()
-        self.assertEqual((queued_name, is_down, vk, scan), ("Email", True, 0xB4, 0x6C))
-
-    # --- v1.9.5: pad-state debounce + guaranteed Note OFF (stuck-keys fix) ------
-
-    def test_wm_input_consumes_auto_repeat_makes(self):
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
-        before = self.hook._win_queue.qsize()
-        # First make is queued for MIDI...
-        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0))
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        # ...every OS auto-repeat make is consumed: no Note ON spam, no UI update.
-        for _ in range(5):
-            self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0))
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-
-    def test_wm_input_break_after_repeat_makes_still_queues_off(self):
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
-        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0)
-        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0)
-        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0)
-        self.hook._win_queue.get()  # drain the single queued make
-        before = self.hook._win_queue.qsize()
-        # RI_KEY_BREAK (flags 0x01): the break ALWAYS queues its Note OFF.
-        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0x01))
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        queued_name, is_down, vk, scan = self.hook._win_queue.get()
-        self.assertEqual((queued_name, is_down, vk, scan), ("0", False, 0x60, 0x52))
-        # The pad is released: a fresh make is no longer debounced away.
-        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0))
-
-    def test_wm_input_break_without_make_still_queues_off(self):
-        # Make lost upstream (device-gate flicker / app started mid-press):
-        # the break must still produce the Note OFF / UI un-light.
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x69, False)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
-        before = self.hook._win_queue.qsize()
-        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x69, 0x49, 0x01))
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        queued_name, is_down, vk, scan = self.hook._win_queue.get()
-        self.assertEqual((queued_name, is_down, vk, scan), ("9", False, 0x69, 0x49))
-
-    def test_ll_never_swallows_trackable_key_ups(self):
-        # v1.9.5: a swallowed break is the one edge whose loss hangs a note
-        # (Note ON without Note OFF). Trackable key-UPs always fall through;
-        # their Note OFF comes from the WM_INPUT channel instead.
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
-        self.hook._raw_recent_hdevice = self.KEYPAD_H
-        self.hook._raw_recent_ts = now
-        # Down: swallowed (matched device, Exclusive Mode on)...
-        self.assertTrue(self.hook._ll_handle_event("0", 0x60, 0x52, False, now, True))
-        # ...up: NEVER swallowed.
-        self.assertFalse(self.hook._ll_handle_event("0", 0x60, 0x52, False, now, False))
-        # The keypad's E0 numpad Enter: same rule (Cubase "Play" fires on
-        # key-DOWN only; a leaked key-up is inert to the OS and the DAW).
-        self.hook._raw_last_by_key[(0x0D, True)] = (self.KEYPAD_H, now)
-        self.assertTrue(self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, True))
-        self.assertFalse(self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False))
-
-    def test_ll_media_key_up_still_queues_off_and_swallows(self):
-        # Media keys keep the queue-then-swallow contract on BOTH edges: the
-        # LL channel is their only MIDI source, so the Note OFF must be queued
-        # before the event is swallowed.
-        before = self.hook._win_queue.qsize()
-        now = time.perf_counter()
-        self.assertTrue(
-            self.hook._ll_handle_event("Email", 0xB4, 0x6C, True, now, False)
-        )
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        queued_name, is_down, vk, scan = self.hook._win_queue.get()
-        self.assertEqual((queued_name, is_down, vk, scan), ("Email", False, 0xB4, 0x6C))
-
-    def test_media_key_auto_repeat_consumed_but_up_always_queued(self):
-        now = time.perf_counter()
-        before = self.hook._win_queue.qsize()
-        # First make queues...
-        self.assertTrue(self.hook._ll_handle_event("Calc", 0xB7, 0x21, True, now, True))
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        self.hook._win_queue.get()
-        # ...auto-repeat makes are consumed (no Note ON spam)...
-        for _ in range(4):
-            self.assertTrue(self.hook._ll_handle_event("Calc", 0xB7, 0x21, True, now, True))
-        self.assertEqual(self.hook._win_queue.qsize(), before)
-        # ...and the break still queues its Note OFF.
-        self.assertTrue(self.hook._ll_handle_event("Calc", 0xB7, 0x21, True, now, False))
-        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
-        queued_name, is_down, _, _ = self.hook._win_queue.get()
-        self.assertEqual((queued_name, is_down), ("Calc", False))
-
-    # --- v1.9.7: bulletproof global swallow (target mode) -----------------------
-
-    def test_target_mode_globally_swallows_extended_enter_without_correlation(self):
-        # The LL<->WM_INPUT race must not be able to leak Numpad Enter into a
-        # focused DAW: with a target keypad selected, the E0-extended
-        # VK_RETURN is swallowed with NO origin data at all (cold start).
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        self.hook._raw_last_by_key.clear()
-        self.hook._raw_recent_ts = 0.0
-        now = time.perf_counter()
-        self.assertTrue(
-            self.hook._ll_global_swallow(0x0D, True, True),
-            "E0 Numpad Enter must be swallowed globally in target mode",
-        )
-        # ...and the full LL event path agrees even with no name resolution
-        # data (correlation is cold).
-        self.assertTrue(
-            self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, True)
-        )
-        # Key-UP is still never swallowed (v1.9.5): its Note OFF comes from
-        # the WM_INPUT channel and the OS delivery of a lone break is inert.
-        self.assertFalse(
-            self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False)
-        )
-
-    def test_target_mode_main_enter_still_never_swallowed(self):
-        # The laptop's main Enter (VK_RETURN, NON-extended) must pass even in
-        # target mode with zero correlation - the extended-flag rule is
-        # absolute.
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        self.hook._raw_last_by_key.clear()
-        self.hook._raw_recent_ts = 0.0
-        self.assertFalse(self.hook._ll_global_swallow(0x0D, False, True))
-
-    def test_target_mode_globally_swallows_math_operators(self):
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
-        self.hook._raw_last_by_key.clear()
-        self.hook._raw_recent_ts = 0.0
-        for vk, extended in ((0x6F, True), (0x6A, False), (0x6D, False), (0x6B, False)):
-            self.assertTrue(
-                self.hook._ll_global_swallow(vk, extended, True),
-                f"operator VK 0x{vk:02X} must be swallowed globally in target mode",
-            )
-        # Exclusive Mode off: nothing is swallowed (keys pass to the OS as
-        # configured by the user).
-        self.hook.set_suppress(False)
-        try:
-            self.assertFalse(self.hook._ll_global_swallow(0x0D, True, True))
-            self.assertFalse(self.hook._ll_global_swallow(0x6F, True, True))
-        finally:
-            self.hook.set_suppress(True)
-        # All mode keeps the strict correlation gating (a laptop's embedded
-        # numpad is protected there).
-        self.hook.set_target_device("")
-        self.assertFalse(self.hook._ll_global_swallow(0x0D, True, True))
-        self.assertFalse(self.hook._ll_global_swallow(0x6F, True, True))
 
     def test_matched_handle_cache_rebuilt_on_target_switch(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
@@ -1421,8 +1132,12 @@ class WindowsRawInputOriginTests(unittest.TestCase):
             self.hook._matched_handle_cache.get(self.KEYPAD_H), True
         )
         self.hook.set_target_device("")
+        # v1.9.8: with no device selected nothing is matched anymore.
         self.assertEqual(
-            self.hook._matched_handle_cache.get(self.LAPTOP_H), True
+            self.hook._matched_handle_cache.get(self.LAPTOP_H), False
+        )
+        self.assertEqual(
+            self.hook._matched_handle_cache.get(self.KEYPAD_H), False
         )
 
 

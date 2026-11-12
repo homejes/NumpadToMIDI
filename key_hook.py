@@ -60,6 +60,10 @@ else:
     from ctypes import wintypes
     import winreg
 
+# v1.9.8: the "All Connected Keypads" mode was REMOVED from the UI and from
+# the decision logic. These constants remain only so main.py can recognize a
+# legacy config.json value naming that mode and map it to "" ("no device
+# selected", a strict no-op) - they are not a selectable operating mode.
 ALL_DEVICES_ID = ""
 ALL_DEVICES_LABEL = "All Connected Keypads (Default)"
 
@@ -128,10 +132,6 @@ VK_INSERT = 0x2D          # 45  - Insert (Numpad 0 / '000' burst when NumLock is
 VK_DELETE = 0x2E          # 46  - Delete (Numpad '.' when NumLock is OFF)
 VK_NUMPAD0 = 0x60         # 96  - Numpad 0 (when NumLock is ON)
 VK_DECIMAL = 0x6E         # 110 - Numpad '.' (when NumLock is ON)
-VK_MULTIPLY = 0x6A        # 106 - Numpad * (when NumLock is ON)
-VK_ADD = 0x6B             # 107 - Numpad + (when NumLock is ON)
-VK_SUBTRACT = 0x6D        # 109 - Numpad - (when NumLock is ON)
-VK_DIVIDE = 0x6F          # 111 - Numpad / (when NumLock is ON)
 VK_NUMLOCK = 0x90         # 144 - NumLock
 VK_BROWSER_SEARCH = 0xAA  # 170 - Browser Search multimedia key
 VK_BROWSER_HOME = 0xAC    # 172 - Browser Home multimedia key (scancode 0xE032)
@@ -229,59 +229,6 @@ _WIN_NUMLOCK_OFF_VK_MAP: dict[int, str] = {
     VK_DELETE: ".",
 }
 _WIN_NUMLOCK_OFF_VKS = frozenset(_WIN_NUMLOCK_OFF_VK_MAP.keys())
-
-# Comprehensive WH_KEYBOARD_LL swallow list: every Virtual Key the selected
-# USB keypad can emit depending on NumLock state. NumLock-ON keys are the
-# numeric keypad VKs; NumLock-OFF (or a NumLock desync - e.g. a toggle that
-# slipped through on the UAC secure desktop or the keypad firmware toggling
-# internally while the app swallows the host-side keystroke) makes the SAME
-# physical keys arrive as navigational variants: a '2' arrives as VK_DOWN
-# and would move the selected track in Cubase. Swallowing is strictly gated
-# by the Raw Input (WM_INPUT) device-origin correlation, so the laptop's
-# real arrow/Home/End keys are never swallowed.
-_NUMPAD_SWALLOW_VKS = frozenset(
-    {
-        *range(VK_NUMPAD0, VK_NUMPAD0 + 10),  # VK_NUMPAD0..9 (NumLock ON digits)
-        VK_MULTIPLY, VK_ADD, VK_SUBTRACT, VK_DECIMAL, VK_DIVIDE,  # NumLock ON operators
-        # Physical keypad keys whose Virtual Keys are shared with the main
-        # keyboard (device-gated swallowing keeps the laptop's keys alive):
-        VK_RETURN,  # Numpad Enter (E0 0x1C; plain-Return keypads send 0x1C) - Cubase "Play"
-        VK_BACK,    # Numpad Backspace (scan 0x0E)
-        VK_TAB,     # Numpad Tab (scan 0x0F) - DAW transport/track shortcuts
-        # NumLock OFF navigational equivalents of the same physical keys:
-        VK_INSERT,  # Numpad 0
-        VK_END,     # Numpad 1
-        VK_DOWN,    # Numpad 2
-        VK_NEXT,    # Numpad 3 / Page Down
-        VK_LEFT,    # Numpad 4
-        VK_CLEAR,   # Numpad 5
-        VK_RIGHT,   # Numpad 6
-        VK_HOME,    # Numpad 7
-        VK_UP,      # Numpad 8
-        VK_PRIOR,   # Numpad 9 / Page Up
-        VK_DELETE,  # Numpad .
-    }
-)
-# v1.9.7 "bulletproof" global swallow list (target mode + Exclusive Mode):
-# the keypad's keys whose Virtual Keys a normal typing keyboard can NEVER
-# produce. A missed device-gated swallow for these leaks directly into DAW
-# shortcuts (Numpad Enter = Cubase "Play"), so while a specific USB keypad is
-# selected they are swallowed with NO origin correlation - the LL<->WM_INPUT
-# race cannot leak them. VK_RETURN itself is handled separately: only the
-# E0-extended variant is swallowed globally; the main Enter (non-extended) of
-# every keyboard stays untouched. Key-UPs are never swallowed (v1.9.5): the
-# OS delivery of a lone break is inert (DAWs trigger on key-DOWN only) and
-# the Note OFFs flow through the WM_INPUT channel.
-_TARGET_GLOBAL_SWALLOW_VKS = frozenset(
-    {VK_DIVIDE, VK_MULTIPLY, VK_SUBTRACT, VK_ADD}
-)
-# Device-gated scancode overrides for keypad keys whose scancode is missing
-# from the pure OEM table above (adding it there would map the laptop's main
-# keys everywhere and fire MIDI from them in All mode). Consulted only when
-# the Raw Input origin is verified as the selected keypad.
-_WIN_KEYPAD_SCAN_OVERRIDES: dict[int, str] = {
-    0x1C: "Enter",  # Numpad Enter (E0 0x1C); plain-Return keypads send 0x1C non-extended
-}
 _MAPVK_VSC_TO_VK = 1
 _ALWAYS_SUPPRESS_KEYS = frozenset({"Home", "Email", "Calc"})
 
@@ -483,10 +430,6 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
     Bypasses Windows NumLock state by checking OEM hardware scancodes first.
     Physical '0' (scancode 0x52) always maps to "0" whether NumLock is ON or OFF.
     Physical '.' (scancode 0x53) always maps to "." whether NumLock is ON or OFF.
-    E0-extended navigational variants (NumLock OFF arrows/Home/End, emitted by
-    USB keypads as HID navigation usages) intentionally map to ``None`` here -
-    they are resolved device-gated by ``KeyHook._ll_resolve_name`` so general
-    keyboards (the laptop's real arrows) keep their native keys.
     """
     if IS_WIN and vk in (0, 0xFF) and scan and not extended:
         try:
@@ -556,12 +499,6 @@ RIM_TYPEKEYBOARD = 1
 RIDI_DEVICENAME = 0x20000007
 RID_INPUT = 0x10000003
 _WM_INPUT = 0x00FF
-_WM_TIMER = 0x0113
-_WS_POPUP = 0x80000000  # hidden top-level sink window (no WS_VISIBLE)
-_RAW_SINK_CLASS = "NumpadToMIDIRawSink"
-_RAW_SINK_TIMER_ID = 1
-_RAW_SINK_WATCHDOG_MS = 30000
-_ERROR_CLASS_ALREADY_EXISTS = 1410
 RI_KEY_BREAK = 0x0001
 RI_KEY_E0 = 0x0002
 RI_KEY_E1 = 0x0004
@@ -643,29 +580,6 @@ if IS_WIN:
         LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
     )
 
-    # v1.9.6: WNDCLASS/WNDPROC scaffolding for the Raw Input sink window. A
-    # properly registered top-level window with its own wndproc is the
-    # documented, battle-tested pattern for background WM_INPUT delivery
-    # (RIDEV_INPUTSINK); the previous message-only "Static" window relied on
-    # undocumented delivery behavior and broke background processing.
-    WNDPROC = ctypes.WINFUNCTYPE(
-        LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-    )
-
-    class WNDCLASSW(ctypes.Structure):
-        _fields_ = [
-            ("style", wintypes.UINT),
-            ("lpfnWndProc", WNDPROC),
-            ("cbClsExtra", ctypes.c_int),
-            ("cbWndExtra", ctypes.c_int),
-            ("hInstance", wintypes.HINSTANCE),
-            ("hIcon", wintypes.HICON),
-            ("hCursor", ctypes.c_void_p),
-            ("hbrBackground", wintypes.HBRUSH),
-            ("lpszMenuName", wintypes.LPCWSTR),
-            ("lpszClassName", wintypes.LPCWSTR),
-        ]
-
     _user32 = ctypes.windll.user32
     _kernel32 = ctypes.windll.kernel32
 
@@ -722,26 +636,6 @@ if IS_WIN:
     _kernel32.GetCurrentThread.restype = wintypes.HANDLE
     _kernel32.SetThreadPriority.restype = wintypes.BOOL
     _kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
-    # v1.9.6: raw input sink window plumbing
-    _user32.RegisterClassW.restype = wintypes.ATOM
-    _user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
-    _user32.DefWindowProcW.restype = LRESULT
-    _user32.DefWindowProcW.argtypes = [
-        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-    ]
-    _user32.SetTimer.restype = ctypes.c_size_t
-    _user32.SetTimer.argtypes = [
-        wintypes.HWND, ctypes.c_size_t, wintypes.UINT, wintypes.LPVOID
-    ]
-    _user32.KillTimer.restype = wintypes.BOOL
-    _user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
-    _user32.GetRegisteredRawInputDevices.restype = wintypes.UINT
-    _user32.GetRegisteredRawInputDevices.argtypes = [
-        ctypes.POINTER(RAWINPUTDEVICE), ctypes.POINTER(wintypes.UINT), wintypes.UINT
-    ]
-    _kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
-    _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-    _kernel32.GetLastError.restype = wintypes.DWORD
 
 
 def _lookup_pnp_friendly_name(pnp_id: str, hw_id: str) -> str:
@@ -1209,7 +1103,7 @@ class KeyHook:
         detect_triple_zero: bool = True,
         burst_window_ms: float = 100.0,
         suppress: bool = True,
-        target_device: str = ALL_DEVICES_ID,
+        target_device: str = "",  # "" = no device selected (strict no-op)
     ) -> None:
         self._on_key = on_key
         self.detect_triple_zero = detect_triple_zero
@@ -1219,17 +1113,6 @@ class KeyHook:
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
-        # v1.9.5: pads currently held as seen by the MIDI sources (WM_INPUT
-        # and the LL media-key channel). Debounces OS auto-repeat and
-        # guarantees every Note ON is paired with exactly one Note OFF.
-        self._pad_down: set[str] = set()
-        # v1.9.6: background Raw Input sink state
-        self._raw_sink_wndproc_ref = None
-        self._raw_sink_owns_wm_input = False
-        # v1.9.7: WM_INPUT delivery diagnostics (RIM_INPUT vs RIM_INPUTSINK)
-        self._last_wm_input_code = -1
-        self._last_wm_input_ts = 0.0
-        self._raw_watchdog_last_ts = 0.0
         # 000-burst detection state (NumLock-independent triplet detector)
         self._zbuf: list[bool] = []
         self._zlast_ts: float = 0.0
@@ -1291,7 +1174,13 @@ class KeyHook:
         return self._target_device
 
     def set_target_device(self, device_id: str) -> None:
-        """Select a specific USB keypad hardware ID, or '' for all connected keypads."""
+        """Select one specific USB keypad hardware ID (strict device isolation).
+
+        v1.9.8: an empty string means "no device selected" - the hook is then
+        a strict no-op (no MIDI, no swallowing) until the user picks a
+        specific device. The former "All Connected Keypads" mode no longer
+        exists.
+        """
         with self._lock:
             self._target_device = (device_id or "").strip()
             self._rebuild_target_handles()
@@ -1335,7 +1224,10 @@ class KeyHook:
         """Return True if Raw Input handle ``h_device`` matches the selected target device."""
         target = self._target_device
         if not target:
-            return True
+            # v1.9.8 strict isolation: with no device selected nothing may
+            # match, so the WM_INPUT channel stays silent for every keyboard
+            # (including the laptop's built-in one).
+            return False
         if not h_device:
             return False
         with self._lock:
@@ -1369,7 +1261,8 @@ class KeyHook:
         if not h_device:
             return False
         if not self._target_device:
-            return True
+            # v1.9.8 strict isolation: no device selected -> nothing matches.
+            return False
         cached = self._matched_handle_cache.get(h_device)
         if cached is None:
             cached = self.matches_device(h_device)
@@ -1401,194 +1294,78 @@ class KeyHook:
             return self._raw_recent_hdevice
         return 0
 
-    def _ll_nav_origin_verified(self, origin: int) -> bool:
-        """True when ``origin`` is a keypad-like device under the current mode.
-
-        Gate for the NumLock-OFF navigational swallow list: a general typing
-        keyboard (flagged via Raw Input) or an uncorrelated origin is never
-        trusted, so the laptop's real arrow/Home/End keys keep their native
-        OS function and never trigger numpad handling.
-        """
-        if not origin:
-            return False
-        if self._target_device:
-            return self._origin_matches(origin)
-        return origin not in self._general_kb_handles
-
-    def _ll_resolve_name(
-        self, vk: int, scan: int, extended: bool, origin: int, origin_matched: bool
-    ) -> Optional[str]:
-        """Map a WH_KEYBOARD_LL event to a numpad key name (device-gated).
-
-        Standard scancode-first mapping first; for NumLock-OFF navigational
-        variants (vk in ``_NUMPAD_SWALLOW_VKS``) whose origin correlates with
-        a keypad-like device, the constant physical scancode overrides the
-        name so the correct MIDI note fires regardless of whether Windows
-        translated the key as ``VK_NUMPAD2`` or ``VK_DOWN`` (the E0-extended
-        arrows/Home/End previously fell through to ``None`` and leaked into
-        DAWs). General keyboards are never overridden.
-        """
-        name = win_key_name(
-            vk, scan, extended,
-            keypad_verified=origin_matched and bool(self._target_device),
-        )
-        if vk in _NUMPAD_SWALLOW_VKS and self._ll_nav_origin_verified(origin):
-            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(
-                scan
-            ) or _WIN_KEYPAD_SCAN_OVERRIDES.get(scan)
-            if nav_name:
-                name = nav_name
-        return name
-
-    def _ll_should_swallow(
+    def _ll_decide(
         self, name: str, vk: int, scan: int, extended: bool, now: float
-    ) -> bool:
-        """True when WH_KEYBOARD_LL must swallow (``return 1``) this keystroke.
+    ) -> tuple[bool, bool]:
+        """Decide (queue_for_midi, swallow) for a WH_KEYBOARD_LL event.
 
-        v1.9.4 architecture: the LL hook ONLY blocks keystrokes; WM_INPUT owns
-        100% of the MIDI generation (exact ``hDevice`` match), so a failed LL
-        device correlation can never make another keyboard trigger notes.
-        Swallowing is strictly device-gated: only keystrokes correlated (via
-        the Raw Input origin tracking) with the selected USB keypad are
-        blocked; keys from any other keyboard fall through to
-        ``CallNextHookEx`` untouched, and unattributed events (origin 0) are
-        never swallowed either.
+        v1.9.8 strict hardware device isolation: MIDI and swallowing are
+        granted ONLY when the event's Raw Input origin strictly matches the
+        selected USB keypad. Events proven to come from any other device -
+        and events whose origin cannot be proven (unknown handle, cold start,
+        correlation expired) - are ignored completely: no MIDI is generated
+        and the OS keystroke passes through untouched, so the laptop's
+        built-in keyboard (including its embedded numpad) can never trigger
+        MIDI or be swallowed.
+
+        The former "All Connected Keypads" mode was removed: an empty
+        ``_target_device`` (fresh config, or a legacy "All" value mapped to
+        "" by main.py) is a strict no-op for every key.
         """
-        # VK_RETURN is shared between the main Enter and Numpad Enter: only
-        # the E0-extended variant (LLKHF_EXTENDED) is a numpad key. The main
-        # Enter is never swallowed; plain-Return keypads still get their MIDI
-        # via the WM_INPUT channel.
-        if vk == VK_RETURN and not extended:
-            return False
+        if not self._target_device:
+            # No device selected: the app is completely inert; every keyboard
+            # keeps typing normally.
+            return False, False
+
+        # Multimedia launcher keys (Browser Home/Search, Mail, Calc) never emit
+        # RIM_TYPEKEYBOARD WM_INPUT packets, so no Raw Input origin can ever be
+        # correlated for them; while a specific keypad is selected they keep
+        # the v1.9.1 unconditional swallow or the M-Tech's top-row keys would
+        # launch Calculator/Mail. The dedicated Home key of a normal keyboard
+        # (VK_HOME + E0, scancode 0x47) IS Raw Input trackable and is
+        # deliberately excluded here so it is device-gated like every other
+        # key.
+        if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
+            return True, True
 
         origin = self._ll_origin_device(vk, extended, now)
 
-        if vk == VK_NUMLOCK or name == "NumLock" or (scan == 0x45 and not extended):
-            # Keypad NumLock stays blocked even for unattributed events:
-            # passing it through would toggle the M-Tech hardware into
-            # navigation mode. Keystrokes proven to come from a general
-            # keyboard reach the OS untouched.
-            if self._target_device:
-                if not origin:
-                    return True
-                return self._origin_matches(origin)
-            return not (origin and origin in self._general_kb_handles)
-
-        if vk in _NUMPAD_SWALLOW_VKS:
-            # Comprehensive keypad swallow list (digits, operators,
-            # NumLock-OFF navigational variants, Enter/Backspace/Tab): the
-            # selected keypad's variants never reach the OS, while the
-            # laptop's real navigation keys pass through untouched
-            # (device-gated). Exclusive Mode (``self._suppress``) still
-            # controls whether keypad keys are blocked, as in v1.6.
-            if self._target_device:
-                if not origin:
-                    return False
-                return self._origin_matches(origin) and bool(self._suppress)
-            return (
-                bool(origin)
-                and origin not in self._general_kb_handles
-                and bool(self._suppress)
-            )
-
-        if self._target_device:
+        is_numlock = (
+            vk == VK_NUMLOCK or name == "NumLock" or (scan == 0x45 and not extended)
+        )
+        if is_numlock:
+            # Swallowing the keypad's NumLock stays mandatory (passing it
+            # through would toggle the M-Tech hardware into navigation mode),
+            # but only with a PROVEN keypad origin: an unknown origin (app
+            # just started / WM_INPUT sink failure / TTL expired) must never
+            # eat the laptop's NumLock toggle.
             if not origin:
-                # Strict device isolation: an unattributed keystroke is never
-                # blocked (it could belong to the laptop), and its MIDI comes
-                # from the exact-match WM_INPUT channel anyway.
-                return False
-            return self._origin_matches(origin) and bool(self._suppress)
+                return False, False
+            matched = self._origin_matches(origin)
+            return matched, matched
 
-        # "All Connected Keypads (Default)" mode:
         if not origin:
-            return False
-        if origin in self._general_kb_handles:
-            # General typing keyboard (e.g. the laptop's built-in one): the
-            # OS keystroke is never swallowed (WM_INPUT still plays MIDI as
-            # v1.6 did).
-            return False
-        return bool(self._suppress)
-
-    def _ll_global_swallow(self, vk: int, extended: bool, is_down: bool) -> bool:
-        """v1.9.7 bulletproof swallow for the keypad's unambiguous keys.
-
-        While a specific USB keypad is selected (``_target_device``) and
-        Exclusive Mode is on (``_suppress``), these keys are swallowed
-        UNCONDITIONALLY - no ``WH_KEYBOARD_LL``↔``WM_INPUT`` race, no origin
-        correlation, no TTL - because a missed swallow leaks directly into
-        DAW shortcuts (Numpad Enter = Cubase "Play"). Covered keys:
-
-        * ``VK_RETURN`` with ``LLKHF_EXTENDED`` (E0 0x1C): Numpad Enter. The
-          main Enter (non-extended) of every keyboard is NEVER swallowed.
-        * ``VK_DIVIDE`` / ``VK_MULTIPLY`` / ``VK_SUBTRACT`` / ``VK_ADD``: the
-          numpad math operators, which a normal typing keyboard cannot emit.
-
-        Only the key-DOWN edge is swallowed; key-UPs always fall through
-        (v1.9.5) - a lone break is inert to the OS and DAWs, and its Note OFF
-        comes from the WM_INPUT channel.
-        """
-        if not (is_down and self._target_device and self._suppress):
-            return False
-        if vk == VK_RETURN:
-            return extended
-        return vk in _TARGET_GLOBAL_SWALLOW_VKS
-
-    def _ll_handle_event(
-        self, name: str, vk: int, scan: int, extended: bool, now: float, is_down: bool
-    ) -> bool:
-        """Handle one WH_KEYBOARD_LL event; returns True to swallow (return 1).
-
-        WM_INPUT owns the MIDI generation for every Raw Input trackable key
-        (exact ``hDevice`` match in ``_process_raw_keyboard``); the LL channel
-        only swallows device-correlated keypad keystrokes. The sole exception
-        is the multimedia launcher keys (Browser Home/Search, Mail, Calc):
-        they are HID Consumer Control events that never emit RIM_TYPEKEYBOARD
-        WM_INPUT packets, so the LL channel is their only MIDI source. The
-        dedicated Home key of a normal keyboard (VK_HOME + E0, scancode 0x47)
-        IS Raw Input trackable and is deliberately excluded from that branch
-        so it stays device-gated like every other key.
-
-        v1.9.5 (stuck-keys fix): key-UP events of trackable keys are NEVER
-        swallowed - they always fall through to ``CallNextHookEx``. A break
-        event that is removed from the input stream (``return 1``) is the one
-        edge whose loss produces a hanging MIDI note (Note ON without Note
-        OFF) and a permanently lit pad, and a swallowed break whose make
-        reached the OS also leaves the OS key state stuck down. A leaked
-        break is harmless: the OS has no matching make (it was swallowed) or
-        already released the key, DAW shortcuts (e.g. Cubase "Play") trigger
-        on key-DOWN only, and text input produces nothing from a lone key-up.
-        Media keys keep the queue-then-swallow contract on BOTH edges: their
-        Note OFF is queued before ``return 1`` (their only MIDI source), and
-        they never emit WM_INPUT so nothing is lost from that channel.
-        """
-        if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
-            self._queue_from_ll(name, is_down, vk, scan)
-            return True
-        # v1.9.7 bulletproof swallow: the keypad's unambiguous keys (Numpad
-        # Enter E0, math operators) are blocked in target mode with no origin
-        # correlation, so the LL<->WM_INPUT race can never leak them into a
-        # focused DAW.
-        if self._ll_global_swallow(vk, extended, is_down):
-            return True
-        if not is_down:
-            return False
-        return self._ll_should_swallow(name, vk, scan, extended, now)
+            # No Raw Input origin data yet (app just started / WM_INPUT sink
+            # failure / correlation TTL expired). v1.9.1 queued the MIDI event
+            # here so the app stayed functional, which let the laptop's
+            # built-in numpad produce notes before its first WM_INPUT packet
+            # arrived (the reported leak). Strict isolation: without a proven
+            # origin nothing is generated and nothing is swallowed.
+            return False, False
+        matched = self._origin_matches(origin)
+        if not matched:
+            # Proven origin on ANOTHER device (e.g. the laptop's embedded
+            # numpad): no MIDI, never swallowed.
+            return False, False
+        if name in ("Tab", "Backspace"):
+            # v1.6 behaviour: the keypad's Tab/Backspace keys pass through
+            # to the OS; their MIDI events arrive via the WM_INPUT channel.
+            return False, False
+        return True, self._suppress
 
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
-        """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication.
-
-        v1.9.5 pad-state debounce: OS auto-repeat floods the LL channel with
-        WM_KEYDOWN while a pad is held; only the first make is queued for MIDI
-        (no Note ON spam). Breaks are ALWAYS queued so every Note ON gets its
-        Note OFF even when the make was debounced or lost.
-        """
+        """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
         now = time.perf_counter()
-        if is_down:
-            if name in self._pad_down:
-                return  # auto-repeat: no MIDI, no UI update
-            self._pad_down.add(name)
-        else:
-            self._pad_down.discard(name)
         # 50 ms dedup window, clearing opposite edge for this key to prevent dedup cross-stroke bleed
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup
@@ -1617,28 +1394,9 @@ class KeyHook:
             item for item in self._pending_raw_dedup if now - item[2] < 0.050
         ]
         if not matched:
-            # Strict device isolation: only the exact selected device (UI
-            # dropdown) generates MIDI here; every other keyboard - e.g. the
-            # laptop's built-in one - is dropped by its Raw Input handle.
-            logger.debug(
-                "WM_INPUT dropped: hDevice=0x%X vk=0x%02X scan=0x%02X does not "
-                "match target %r", h_device, vk, scan, self._target_device,
-            )
             return False
         is_down = not bool(flags & RI_KEY_BREAK)
         name = win_key_name(vk, scan, extended, keypad_verified=bool(self._target_device))
-        if vk in _NUMPAD_SWALLOW_VKS and (
-            self._target_device or h_device not in self._general_kb_handles
-        ):
-            # NumLock-OFF navigational variant (e.g. '2' reported as VK_DOWN):
-            # map by the constant physical scancode so the correct MIDI note
-            # fires via WM_INPUT too, regardless of the VK Windows translated.
-            # Flagged general keyboards (the laptop) are never overridden.
-            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(
-                scan
-            ) or _WIN_KEYPAD_SCAN_OVERRIDES.get(scan)
-            if nav_name:
-                name = nav_name
         if name is None:
             return False
         for idx, (q_name, q_down, _) in enumerate(self._pending_raw_dedup):
@@ -1649,30 +1407,6 @@ class KeyHook:
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup if item[0] != name or item[1] == is_down
         ]
-        # v1.9.5 pad-state debounce (stuck-keys fix): the first make of a
-        # physical press is queued for MIDI; OS auto-repeat makes are consumed
-        # here (correlation above still ran) so neither MIDI nor the UI sees
-        # Note ON spam. Breaks are ALWAYS queued - every Note ON is guaranteed
-        # exactly one Note OFF, and a break whose make was dropped (device
-        # gate flicker, name-less make, app started mid-press) still flows so
-        # no note can hang.
-        if is_down:
-            if name in self._pad_down:
-                logger.debug(
-                    "WM_INPUT auto-repeat consumed: vk=0x%02X scan=0x%02X name=%r",
-                    vk, scan, name,
-                )
-                return True
-            self._pad_down.add(name)
-        else:
-            if name not in self._pad_down:
-                # Make never arrived here; queue the break anyway so the
-                # Note OFF / UI un-light still happens.
-                logger.debug(
-                    "WM_INPUT break without make: vk=0x%02X scan=0x%02X name=%r",
-                    vk, scan, name,
-                )
-            self._pad_down.discard(name)
         self._win_queue.put_nowait((name, is_down, vk, scan))
         return True
 
@@ -1723,7 +1457,6 @@ class KeyHook:
                 self._zlast_ts = 0.0
                 self._zlast_vk = 0
                 self._triple_ups_left = 0
-                self._pad_down.clear()
                 for name in list(self._down):
                     self._emit(name, False)
             return
@@ -1758,7 +1491,6 @@ class KeyHook:
             self._zlast_ts = 0.0
             self._zlast_vk = 0
             self._triple_ups_left = 0
-            self._pad_down.clear()
             for name in list(self._down):
                 self._emit(name, False)
 
@@ -1790,185 +1522,6 @@ class KeyHook:
         except Exception as exc:
             logger.debug("WM_INPUT parse error: %s", exc)
 
-    # --- v1.9.6: Raw Input background sink (RIDEV_INPUTSINK) --------------------
-
-    def _raw_sink_wndproc(self, hwnd: int, umsg: int, wparam: int, lparam: int) -> int:
-        """WndProc of the hidden Raw Input sink window.
-
-        WM_INPUT is handled HERE (no longer in the pump loop) so each raw
-        event is processed exactly once, per the documented pattern. The
-        message is still forwarded to DefWindowProc so the system can perform
-        its cleanup for RIM_INPUT (foreground) events. WM_TIMER drives the
-        registration watchdog that keeps background delivery alive.
-        """
-        try:
-            if umsg == _WM_INPUT:
-                # v1.9.7 delivery diagnostic: wParam & 0xFF is
-                # GET_RAWINPUT_CODE_WPARAM - 0 (RIM_INPUT) when this process
-                # was foreground, 1 (RIM_INPUTSINK) when delivered in the
-                # background. The watchdog heartbeat reports it so background
-                # delivery is provable in the log.
-                self._last_wm_input_code = int(wparam) & 0xFF
-                self._last_wm_input_ts = time.perf_counter()
-                try:
-                    self._handle_wm_input(lparam)
-                except Exception as exc:
-                    logger.debug("WM_INPUT handler error: %s", exc)
-                # No early return: fall through to DefWindowProcW below so the
-                # system performs its cleanup for RIM_INPUT (foreground)
-                # events, per the WM_INPUT documentation.
-            elif umsg == _WM_TIMER and wparam == _RAW_SINK_TIMER_ID:
-                self._verify_raw_input_registration()
-                return 0
-        except Exception as exc:
-            logger.debug("Raw Input sink wndproc error: %s", exc)
-        return int(_user32.DefWindowProcW(hwnd, umsg, wparam, lparam))
-
-    def _create_raw_sink_window(self) -> bool:
-        """Create the hidden top-level sink window with a custom WNDCLASS.
-
-        A hidden top-level window (``_WS_POPUP`` without ``WS_VISIBLE``) with
-        its own wndproc is the documented, battle-tested pattern for
-        background raw input delivery; the previous message-only "Static"
-        window with no wndproc degraded to foreground-only delivery on real
-        systems (v1.9.5 foreground-only regression).
-        """
-        if self._raw_sink_wndproc_ref is None:
-            self._raw_sink_wndproc_ref = WNDPROC(self._raw_sink_wndproc)
-        wc = WNDCLASSW()
-        wc.lpfnWndProc = self._raw_sink_wndproc_ref
-        wc.hInstance = _kernel32.GetModuleHandleW(None)
-        wc.lpszClassName = _RAW_SINK_CLASS
-        if not _user32.RegisterClassW(ctypes.byref(wc)):
-            err = int(_kernel32.GetLastError())
-            if err != _ERROR_CLASS_ALREADY_EXISTS:
-                logger.error(
-                    "RegisterClassW(%s) failed (GetLastError=%s)", _RAW_SINK_CLASS, err
-                )
-                self._raw_sink_wndproc_ref = None
-                return False
-            # Class already registered (app restart within this process):
-            # reuse it; the persistent wndproc reference above stays alive.
-            logger.debug("WndClass %s already registered; reusing", _RAW_SINK_CLASS)
-        hwnd = _user32.CreateWindowExW(
-            0, _RAW_SINK_CLASS, "NumpadToMIDI Raw Input Sink",
-            _WS_POPUP,  # hidden: no WS_VISIBLE
-            0, 0, 0, 0, None, None, wc.hInstance, None,
-        )
-        if not hwnd:
-            logger.error(
-                "Raw Input sink CreateWindowExW failed (GetLastError=%s)",
-                _kernel32.GetLastError(),
-            )
-            return False
-        self._win_raw_hwnd = hwnd
-        return True
-
-    def _register_raw_input_sink(self) -> bool:
-        """(Re-)register the keyboard Raw Input sink with RIDEV_INPUTSINK.
-
-        RIDEV_INPUTSINK is MANDATORY for background operation: without it,
-        WM_INPUT is delivered only while one of this process's windows is in
-        the foreground - which stopped all MIDI generation (WM_INPUT owns the
-        MIDI engine since v1.9.4) and, via the dead origin correlation, also
-        the LL swallow decisions, whenever a DAW held the focus (v1.9.5 bug).
-        Failures are logged loudly and verified against the OS via
-        ``GetRegisteredRawInputDevices`` instead of failing silently.
-        """
-        if not self._win_raw_hwnd:
-            if not self._create_raw_sink_window():
-                return False
-        rid = RAWINPUTDEVICE(
-            HID_USAGE_PAGE_GENERIC,
-            HID_USAGE_GENERIC_KEYBOARD,
-            RIDEV_INPUTSINK,
-            self._win_raw_hwnd,
-        )
-        if not _user32.RegisterRawInputDevices(
-            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
-        ):
-            logger.error(
-                "RegisterRawInputDevices(RIDEV_INPUTSINK) FAILED (GetLastError=%s) "
-                "- background WM_INPUT unavailable",
-                _kernel32.GetLastError(),
-            )
-            return False
-        if not self._verify_raw_input_registration(log_healthy=True):
-            return False
-        logger.info(
-            "Registered Win32 Raw Input keyboard sink (hwnd=%s, flags=RIDEV_INPUTSINK, "
-            "background delivery verified)",
-            self._win_raw_hwnd,
-        )
-        return True
-
-    def _verify_raw_input_registration(self, log_healthy: bool = False) -> bool:
-        """True when the keyboard registration carries RIDEV_INPUTSINK.
-
-        Re-registers when the registration is missing or lost - e.g. after
-        display sleep, session switches, or third-party input software
-        overwriting this process's registration. Called from the WM_TIMER
-        watchdog on the pump thread.
-        """
-        try:
-            if not self._win_raw_hwnd:
-                return False
-            buf = (RAWINPUTDEVICE * 8)()
-            count = wintypes.UINT(8)
-            res = _user32.GetRegisteredRawInputDevices(
-                buf, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICE)
-            )
-            if res == 0xFFFFFFFF:
-                logger.warning(
-                    "GetRegisteredRawInputDevices failed (GetLastError=%s)",
-                    _kernel32.GetLastError(),
-                )
-                return False
-            for i in range(min(count.value, 8)):
-                d = buf[i]
-                if (
-                    d.usUsagePage == HID_USAGE_PAGE_GENERIC
-                    and d.usUsage == HID_USAGE_GENERIC_KEYBOARD
-                    and (d.dwFlags & RIDEV_INPUTSINK)
-                ):
-                    if log_healthy:
-                        logger.debug(
-                            "Raw Input keyboard registration verified (INPUTSINK active)"
-                        )
-                    self._report_wm_input_delivery()
-                    return True
-            logger.warning(
-                "Raw Input keyboard registration missing RIDEV_INPUTSINK "
-                "(count=%s); re-registering",
-                count.value,
-            )
-            return self._register_raw_input_sink()
-        except Exception as exc:
-            logger.warning("Raw Input registration verification error: %s", exc)
-            return False
-
-    def _report_wm_input_delivery(self) -> None:
-        """Log whether recent WM_INPUT events arrived foreground or background.
-
-        Called from the watchdog heartbeat: proof that RIDEV_INPUTSINK is
-        actually delivering while a DAW holds the focus (the v1.9.5/v1.9.6
-        foreground-only regression made background delivery fail silently).
-        """
-        ts = self._last_wm_input_ts
-        if ts <= self._raw_watchdog_last_ts:
-            return  # no new events since the last heartbeat
-        self._raw_watchdog_last_ts = ts
-        code = self._last_wm_input_code
-        if code == 1:
-            logger.info(
-                "Raw Input delivery verified: last WM_INPUT was BACKGROUND "
-                "(RIM_INPUTSINK) - MIDI generation works while a DAW is focused"
-            )
-        elif code == 0:
-            logger.debug(
-                "Raw Input delivery: last WM_INPUT was foreground (RIM_INPUT)"
-            )
-
     def _win_message_pump(self) -> None:  # pragma: no cover - real OS hook loop
         """Dedicated high-priority Win32 message loop owning WH_KEYBOARD_LL and WM_INPUT."""
         try:
@@ -1983,42 +1536,26 @@ class KeyHook:
             _user32.PostThreadMessageW(self._win_thread_id, 0, 0, 0)
             _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
 
-            # Register the hidden top-level Raw Input sink (RIDEV_INPUTSINK)
-            # BEFORE the hook so background WM_INPUT delivery is verified up
-            # front; a failed registration is logged loudly instead of
-            # silently degrading to foreground-only operation (v1.9.5 bug).
-            self._raw_sink_owns_wm_input = False
+            # Register hidden message-only window for Raw Input (WM_INPUT)
             try:
-                if self._register_raw_input_sink():
-                    self._raw_sink_owns_wm_input = True
-                    _user32.SetTimer(
+                self._win_raw_hwnd = _user32.CreateWindowExW(
+                    0, "Static", "NumpadToMIDIRawInputSink", 0,
+                    0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
+                )
+                if self._win_raw_hwnd:
+                    rid = RAWINPUTDEVICE(
+                        HID_USAGE_PAGE_GENERIC,
+                        HID_USAGE_GENERIC_KEYBOARD,
+                        RIDEV_INPUTSINK,
                         self._win_raw_hwnd,
-                        _RAW_SINK_TIMER_ID,
-                        _RAW_SINK_WATCHDOG_MS,
-                        None,
                     )
-                else:
-                    # Fallback: legacy message-only "Static" window handled
-                    # from the pump loop branch (v1.9.5 behavior).
-                    logger.warning("Falling back to legacy message-only Raw Input sink")
-                    self._win_raw_hwnd = _user32.CreateWindowExW(
-                        0, "Static", "NumpadToMIDIRawInputSink", 0,
-                        0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
-                    )
-                    if self._win_raw_hwnd:
-                        rid = RAWINPUTDEVICE(
-                            HID_USAGE_PAGE_GENERIC,
-                            HID_USAGE_GENERIC_KEYBOARD,
-                            RIDEV_INPUTSINK,
+                    if _user32.RegisterRawInputDevices(
+                        ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
+                    ):
+                        logger.info(
+                            "Registered Win32 Raw Input keyboard sink (hwnd=%s)",
                             self._win_raw_hwnd,
                         )
-                        if _user32.RegisterRawInputDevices(
-                            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
-                        ):
-                            logger.info(
-                                "Registered legacy Win32 Raw Input keyboard sink (hwnd=%s)",
-                                self._win_raw_hwnd,
-                            )
             except Exception as exc:
                 logger.warning("Could not register Raw Input sink: %s", exc)
 
@@ -2030,30 +1567,25 @@ class KeyHook:
                             extended = bool(kb.flags & _LLKHF_EXTENDED)
                             vk_code = int(kb.vkCode)
                             scan_code = int(kb.scanCode)
-                            is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
-                            # v1.9.7 bulletproof swallow FIRST: the keypad's
-                            # unambiguous keys (Numpad Enter E0, math
-                            # operators) are blocked with no origin
-                            # correlation while a target keypad is selected,
-                            # so no LL<->WM_INPUT race can leak them into a
-                            # focused DAW.
-                            if self._ll_global_swallow(vk_code, extended, is_down):
-                                return 1
                             now = time.perf_counter()
                             # Correlate this event with Raw Input (WM_INPUT) device
                             # tracking, then apply the device-aware decision.
                             origin = self._ll_origin_device(vk_code, extended, now)
                             origin_matched = self._origin_matches(origin) if origin else False
-                            name = self._ll_resolve_name(
-                                vk_code, scan_code, extended, origin, origin_matched
+                            name = win_key_name(
+                                vk_code,
+                                scan_code,
+                                extended,
+                                keypad_verified=origin_matched and bool(self._target_device),
                             )
                             if name is not None:
-                                # Device-aware swallow decision. WM_INPUT owns
-                                # the MIDI generation for trackable keys (exact
-                                # hDevice match); the LL channel only swallows.
-                                if self._ll_handle_event(
-                                    name, vk_code, scan_code, extended, now, is_down
-                                ):
+                                is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
+                                queue_key, swallow = self._ll_decide(
+                                    name, vk_code, scan_code, extended, now
+                                )
+                                if queue_key:
+                                    self._queue_from_ll(name, is_down, vk_code, scan_code)
+                                if swallow:
                                     return 1
                                 # Not swallowed: fall through so the OS receives the key.
                 except Exception as exc:
@@ -2075,10 +1607,7 @@ class KeyHook:
                 ret = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret <= 0:  # 0 == WM_QUIT, -1 == error
                     break
-                if not self._raw_sink_owns_wm_input and msg.message == _WM_INPUT:
-                    # Legacy fallback path (no custom wndproc): handle here.
-                    # With the v1.9.6 sink window the wndproc owns WM_INPUT
-                    # and this branch is skipped to avoid double processing.
+                if msg.message == _WM_INPUT:
                     self._handle_wm_input(int(msg.lParam))
                 _user32.TranslateMessage(ctypes.byref(msg))
                 _user32.DispatchMessageW(ctypes.byref(msg))
@@ -2604,13 +2133,8 @@ class KeyHook:
             self._down.add(name)
         else:
             if name not in self._down:
-                # v1.9.5: a stray release (its make never reached us) is no
-                # longer silently dropped - the OFF is still dispatched so
-                # the UI pad un-lights and no Note ON can hang. The
-                # Controller ignores an OFF for a key it never lit.
-                logger.debug("Stray release for %r; forcing Note OFF dispatch", name)
-            else:
-                self._down.discard(name)
+                return  # stray release
+            self._down.discard(name)
         try:
             self._on_key(name, down)
         except Exception:  # a UI/MIDI error must not kill the hook thread

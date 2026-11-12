@@ -88,7 +88,7 @@ from PyQt6.QtWidgets import (
 )
 
 from key_hook import (
-    ALL_DEVICES_ID, ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
+    ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
     KEY_SPAN, KeyHook, check_macos_permissions,
 )
 from midi_engine import MidiEngine, note_name
@@ -195,7 +195,13 @@ class Config:
         d["channel"] = max(1, min(16, int(d["channel"])))
         d["velocity"] = max(1, min(127, int(d["velocity"])))
         d["burst_window_ms"] = max(50.0, min(200.0, float(d["burst_window_ms"])))
-        d["target_device"] = str(d.get("target_device", "") or "")
+        _t = str(d.get("target_device", "") or "").strip()
+        if _t.lower() == ALL_DEVICES_LABEL.lower():
+            # v1.9.8: the "All Connected Keypads" mode was removed; a legacy
+            # config value naming it maps to "no device selected" (strict
+            # no-op) instead of silently acting on every keyboard.
+            _t = ""
+        d["target_device"] = _t
         d["exclusive_mode"] = bool(d["exclusive_mode"])
         d["suppress_keys"] = bool(d["suppress_keys"])
 
@@ -271,11 +277,6 @@ class Controller(QObject):
             else:
                 entry = self._active.pop(name, None)
                 if entry is None:
-                    # v1.9.5: stray release (its Note ON never registered).
-                    # Still clear the UI pad highlight so no pad can remain
-                    # stuck lit; there is no Note OFF to send (this key was
-                    # never sounded by the Controller).
-                    self.key_state.emit(name, False)
                     return
                 note, channel = entry
                 velocity = 0
@@ -323,12 +324,21 @@ class Controller(QObject):
 
     def set_target_device(self, device_id: str) -> None:
         target = (device_id or "").strip()
+        if target.lower() == ALL_DEVICES_LABEL.lower():
+            # v1.9.8: the "All Connected Keypads" mode was removed; a legacy
+            # selection maps to "no device selected" (strict no-op).
+            target = ""
         self.panic()
         self.config["target_device"] = target
         self.hook.set_target_device(target)
         self.config.save()
-        label = target if target else ALL_DEVICES_LABEL
-        self.log.emit(f"{self._ts()}  Target USB keypad: {label}")
+        if target:
+            self.log.emit(f"{self._ts()}  Target USB keypad: {target}")
+        else:
+            self.log.emit(
+                f"{self._ts()}  Target USB keypad: none selected - pick a "
+                "device in the dropdown to generate MIDI"
+            )
 
     def set_muted(self, value: bool) -> None:
         muted = bool(value)
@@ -901,18 +911,23 @@ class MainWindow(QMainWindow):
         self.ctrl.log.emit(f"{self.ctrl._ts()}  Refreshed MIDI -> {self.ctrl.engine.description}")
 
     def _on_device_chosen(self, index: int) -> None:
-        dev_id = self.device.itemData(index) or ALL_DEVICES_ID
-        self.ctrl.set_target_device(str(dev_id))
+        # v1.9.8: the dropdown only ever contains specific enumerated devices;
+        # a None itemData (should not happen) maps to "no device selected".
+        dev_id = str(self.device.itemData(index) or "")
+        self.ctrl.set_target_device(dev_id)
         self.device.clearFocus()
 
     def _refresh_devices(self) -> None:
         devices = self.ctrl.hook.refresh_devices()
         target = str(self.ctrl.config["target_device"] or "")
+        if target.lower() == ALL_DEVICES_LABEL.lower():
+            # v1.9.8: legacy "All Connected Keypads" configs map to "no
+            # device selected"; the user must pick a specific device.
+            target = ""
         self.device.blockSignals(True)
         self.device.clear()
-        self.device.addItem(ALL_DEVICES_LABEL, ALL_DEVICES_ID)
-        selected_idx = 0
-        for idx, dev in enumerate(devices, start=1):
+        selected_idx = -1
+        for idx, dev in enumerate(devices):
             self.device.addItem(dev.label, dev.device_id)
             if target and (
                 target.upper() == dev.device_id.upper()
@@ -920,10 +935,15 @@ class MainWindow(QMainWindow):
                 or target.upper() == dev.label.upper()
             ):
                 selected_idx = idx
-        if target and selected_idx == 0:
+        if target and selected_idx == -1:
+            # The selected device is currently disconnected: keep it visible
+            # and targeted so it works again the moment it is reconnected.
             self.device.addItem(f"{target} (disconnected)", target)
             selected_idx = self.device.count() - 1
-        self.device.setCurrentIndex(selected_idx)
+        if selected_idx >= 0:
+            self.device.setCurrentIndex(selected_idx)
+        # With no selection the combo stays blank: the user MUST pick a
+        # specific device before anything generates MIDI (v1.9.8).
         self.device.blockSignals(False)
 
     def _refresh_notes(self) -> None:
@@ -1063,8 +1083,17 @@ def selftest() -> int:
         app.processEvents()
         assert len(win._pads) == len(KEY_NAMES) == 23
         assert not win.windowIcon().isNull()
-        assert win.device.count() >= 1
-        assert win.device.itemText(0) == ALL_DEVICES_LABEL
+        # v1.9.8: the device dropdown contains ONLY specific enumerated
+        # devices - the "All Connected Keypads" option is gone.
+        device_texts = [win.device.itemText(i) for i in range(win.device.count())]
+        assert ALL_DEVICES_LABEL not in device_texts
+        for i in range(win.device.count()):
+            assert win.device.itemData(i), "every dropdown entry must target a device ID"
+        # A legacy config value naming the removed All mode maps to "no
+        # device selected" instead of acting on every keyboard.
+        ctrl.set_target_device(ALL_DEVICES_LABEL)
+        assert ctrl.config["target_device"] == ""
+        assert ctrl.hook._target_device == ""
         assert win.device.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert win.port.focusPolicy() == Qt.FocusPolicy.NoFocus
         assert win.channel.focusPolicy() == Qt.FocusPolicy.NoFocus
@@ -1105,88 +1134,21 @@ def selftest() -> int:
             )
             try:
                 now = time.perf_counter()
-                hook.set_target_device("")  # deterministic All-mode baseline
                 hook._general_kb_handles.add(4242)  # fake "laptop" handle
                 hook._raw_last_by_key[(0x60, False)] = (4242, now)
                 hook._raw_recent_hdevice = 4242
                 hook._raw_recent_ts = now
-                # All mode: WM_INPUT still plays MIDI (v1.6 parity) but the OS
-                # keystroke passes through untouched.
-                assert hook._ll_should_swallow("0", 0x60, 0x52, False, now) is False
+                # v1.9.8, no device selected: strict no-op - no MIDI, no
+                # swallow (the laptop keeps typing normally).
+                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, False)
                 # Specific target: an unmatched laptop origin is completely
-                # ignored (no MIDI, no swallow - WM_INPUT owns MIDI).
+                # ignored (MIDI off, OS keystroke passes through).
                 hook.set_target_device(r"HID\VID_FAKE&PID_0001")
-                assert hook._ll_should_swallow("0", 0x60, 0x52, False, now) is False
-                # NumLock-OFF navigational variants (v1.9.2): the keypad's '2'
-                # arriving as VK_DOWN (E0) maps to "2" by physical scancode
-                # and is swallowed; an unmatched (laptop) origin passes through.
-                hook.set_target_device("HDEVICE:4343")
-                hook._raw_last_by_key[(0x28, True)] = (4343, now)
-                hook._raw_recent_hdevice = 4343
-                hook._raw_recent_ts = now
-                assert hook._ll_resolve_name(0x28, 0x50, True, 4343, True) == "2"
-                assert hook._ll_should_swallow("2", 0x28, 0x50, True, now) is True
-                hook._raw_last_by_key[(0x28, True)] = (4242, now)
-                hook._raw_recent_hdevice = 4242
-                hook._raw_recent_ts = now
-                assert hook._ll_resolve_name(0x28, 0x50, True, 4242, False) is None
-                assert hook._ll_should_swallow("2", 0x28, 0x50, True, now) is False
-                # Numpad Enter (v1.9.4): the E0-extended keypad Enter is
-                # swallowed, while the laptop's main Enter (non-extended
-                # VK_RETURN) is NEVER swallowed (extended-flag guard).
-                hook._raw_last_by_key[(0x0D, True)] = (4343, now)
-                hook._raw_recent_hdevice = 4343
-                hook._raw_recent_ts = now
-                assert hook._ll_resolve_name(0x0D, 0x1C, True, 4343, True) == "Enter"
-                assert hook._ll_should_swallow("Enter", 0x0D, 0x1C, True, now) is True
-                hook._raw_last_by_key[(0x0D, False)] = (4242, now)
-                hook._raw_recent_hdevice = 4242
-                hook._raw_recent_ts = now
-                assert hook._ll_resolve_name(0x0D, 0x1C, False, 4242, False) is None
-                assert hook._ll_should_swallow("Enter", 0x0D, 0x1C, False, now) is False
-                # v1.9.5 stuck-keys fix: WM_INPUT debounce + guaranteed Note
-                # OFF. First make queues; auto-repeat makes are consumed;
-                # breaks ALWAYS queue their Note OFF (even without a make);
-                # and the LL hook never swallows a trackable key-up.
-                hook._pad_down.clear()
-                hook._raw_last_by_key[(0x60, False)] = (4343, now)
-                hook._raw_recent_hdevice = 4343
-                hook._raw_recent_ts = now
-                q0 = hook._win_queue.qsize()
-                assert hook._process_raw_keyboard(4343, 0x60, 0x52, 0) is True
-                assert hook._win_queue.qsize() == q0 + 1
-                hook._win_queue.get()  # drain the single queued make
-                assert hook._process_raw_keyboard(4343, 0x60, 0x52, 0) is True
-                assert hook._win_queue.qsize() == q0  # repeat consumed
-                assert hook._process_raw_keyboard(4343, 0x60, 0x52, 0x01) is True
-                assert hook._win_queue.qsize() == q0 + 1  # break always queued
-                up_item = hook._win_queue.get()
-                assert up_item[1] is False and up_item[0] == "0"
-                assert hook._ll_handle_event("0", 0x60, 0x52, False, now, False) is False
-                assert hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False) is False
-                # v1.9.7 bulletproof swallow: with a target keypad selected,
-                # the E0 Numpad Enter and the math operators are swallowed
-                # with NO origin correlation (the LL<->WM_INPUT race can
-                # never leak them into a focused DAW), while the main Enter
-                # (non-extended) of any keyboard always passes.
-                hook._raw_last_by_key.clear()
-                hook._raw_recent_ts = 0.0
-                assert hook._ll_global_swallow(0x0D, True, True) is True
-                assert hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, True) is True
-                assert hook._ll_global_swallow(0x6F, True, True) is True
-                assert hook._ll_global_swallow(0x6A, False, True) is True
-                assert hook._ll_global_swallow(0x0D, False, True) is False
-                # v1.9.6 background Raw Input sink: the hidden top-level sink
-                # window must register with RIDEV_INPUTSINK and the OS must
-                # verify the registration as background-capable. Without it,
-                # MIDI generation (and the LL swallow correlation) dies the
-                # moment a DAW takes the focus (v1.9.5 regression). The pump
-                # thread started above owns the sink; re-registering here is
-                # idempotent and re-verifies against the OS.
-                assert hook._raw_sink_owns_wm_input is True  # pump set it
-                assert hook._register_raw_input_sink() is True
-                assert hook._verify_raw_input_registration() is True
-                assert hook._win_raw_hwnd is not None
+                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, False)
+                # And the WM_INPUT channel is equally strict with no selection:
+                before_q = hook._win_queue.qsize()
+                assert hook._process_raw_keyboard(4242, 0x60, 0x52, 0) is False
+                assert hook._win_queue.qsize() == before_q
             finally:
                 hook.set_target_device(saved_state[5])
                 hook._raw_last_by_key.clear()
