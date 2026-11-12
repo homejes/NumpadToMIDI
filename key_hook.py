@@ -128,6 +128,10 @@ VK_INSERT = 0x2D          # 45  - Insert (Numpad 0 / '000' burst when NumLock is
 VK_DELETE = 0x2E          # 46  - Delete (Numpad '.' when NumLock is OFF)
 VK_NUMPAD0 = 0x60         # 96  - Numpad 0 (when NumLock is ON)
 VK_DECIMAL = 0x6E         # 110 - Numpad '.' (when NumLock is ON)
+VK_MULTIPLY = 0x6A        # 106 - Numpad * (when NumLock is ON)
+VK_ADD = 0x6B             # 107 - Numpad + (when NumLock is ON)
+VK_SUBTRACT = 0x6D        # 109 - Numpad - (when NumLock is ON)
+VK_DIVIDE = 0x6F          # 111 - Numpad / (when NumLock is ON)
 VK_NUMLOCK = 0x90         # 144 - NumLock
 VK_BROWSER_SEARCH = 0xAA  # 170 - Browser Search multimedia key
 VK_BROWSER_HOME = 0xAC    # 172 - Browser Home multimedia key (scancode 0xE032)
@@ -225,6 +229,34 @@ _WIN_NUMLOCK_OFF_VK_MAP: dict[int, str] = {
     VK_DELETE: ".",
 }
 _WIN_NUMLOCK_OFF_VKS = frozenset(_WIN_NUMLOCK_OFF_VK_MAP.keys())
+
+# Comprehensive WH_KEYBOARD_LL swallow list: every Virtual Key the selected
+# USB keypad can emit depending on NumLock state. NumLock-ON keys are the
+# numeric keypad VKs; NumLock-OFF (or a NumLock desync - e.g. a toggle that
+# slipped through on the UAC secure desktop or the keypad firmware toggling
+# internally while the app swallows the host-side keystroke) makes the SAME
+# physical keys arrive as navigational variants: a '2' arrives as VK_DOWN
+# and would move the selected track in Cubase. Swallowing is strictly gated
+# by the Raw Input (WM_INPUT) device-origin correlation, so the laptop's
+# real arrow/Home/End keys are never swallowed.
+_NUMPAD_SWALLOW_VKS = frozenset(
+    {
+        *range(VK_NUMPAD0, VK_NUMPAD0 + 10),  # VK_NUMPAD0..9 (NumLock ON digits)
+        VK_MULTIPLY, VK_ADD, VK_SUBTRACT, VK_DECIMAL, VK_DIVIDE,  # NumLock ON operators
+        # NumLock OFF navigational equivalents of the same physical keys:
+        VK_INSERT,  # Numpad 0
+        VK_END,     # Numpad 1
+        VK_DOWN,    # Numpad 2
+        VK_NEXT,    # Numpad 3 / Page Down
+        VK_LEFT,    # Numpad 4
+        VK_CLEAR,   # Numpad 5
+        VK_RIGHT,   # Numpad 6
+        VK_HOME,    # Numpad 7
+        VK_UP,      # Numpad 8
+        VK_PRIOR,   # Numpad 9 / Page Up
+        VK_DELETE,  # Numpad .
+    }
+)
 _MAPVK_VSC_TO_VK = 1
 _ALWAYS_SUPPRESS_KEYS = frozenset({"Home", "Email", "Calc"})
 
@@ -426,6 +458,10 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
     Bypasses Windows NumLock state by checking OEM hardware scancodes first.
     Physical '0' (scancode 0x52) always maps to "0" whether NumLock is ON or OFF.
     Physical '.' (scancode 0x53) always maps to "." whether NumLock is ON or OFF.
+    E0-extended navigational variants (NumLock OFF arrows/Home/End, emitted by
+    USB keypads as HID navigation usages) intentionally map to ``None`` here -
+    they are resolved device-gated by ``KeyHook._ll_resolve_name`` so general
+    keyboards (the laptop's real arrows) keep their native keys.
     """
     if IS_WIN and vk in (0, 0xFF) and scan and not extended:
         try:
@@ -1280,6 +1316,43 @@ class KeyHook:
             return self._raw_recent_hdevice
         return 0
 
+    def _ll_nav_origin_verified(self, origin: int) -> bool:
+        """True when ``origin`` is a keypad-like device under the current mode.
+
+        Gate for the NumLock-OFF navigational swallow list: a general typing
+        keyboard (flagged via Raw Input) or an uncorrelated origin is never
+        trusted, so the laptop's real arrow/Home/End keys keep their native
+        OS function and never trigger numpad handling.
+        """
+        if not origin:
+            return False
+        if self._target_device:
+            return self._origin_matches(origin)
+        return origin not in self._general_kb_handles
+
+    def _ll_resolve_name(
+        self, vk: int, scan: int, extended: bool, origin: int, origin_matched: bool
+    ) -> Optional[str]:
+        """Map a WH_KEYBOARD_LL event to a numpad key name (device-gated).
+
+        Standard scancode-first mapping first; for NumLock-OFF navigational
+        variants (vk in ``_NUMPAD_SWALLOW_VKS``) whose origin correlates with
+        a keypad-like device, the constant physical scancode overrides the
+        name so the correct MIDI note fires regardless of whether Windows
+        translated the key as ``VK_NUMPAD2`` or ``VK_DOWN`` (the E0-extended
+        arrows/Home/End previously fell through to ``None`` and leaked into
+        DAWs). General keyboards are never overridden.
+        """
+        name = win_key_name(
+            vk, scan, extended,
+            keypad_verified=origin_matched and bool(self._target_device),
+        )
+        if vk in _NUMPAD_SWALLOW_VKS and self._ll_nav_origin_verified(origin):
+            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(scan)
+            if nav_name:
+                name = nav_name
+        return name
+
     def _ll_decide(
         self, name: str, vk: int, scan: int, extended: bool, now: float
     ) -> tuple[bool, bool]:
@@ -1301,6 +1374,24 @@ class KeyHook:
             return True, True
 
         origin = self._ll_origin_device(vk, extended, now)
+
+        if vk in _NUMPAD_SWALLOW_VKS:
+            # Comprehensive NumLock-OFF navigational swallow (arrows, Home,
+            # End, PgUp/PgDn, Insert/Delete/Clear, plus the NumLock-ON keypad
+            # VKs): the selected keypad's variants never reach the OS, while
+            # the laptop's real navigation keys pass through untouched
+            # (device-gated). Exclusive Mode (``self._suppress``) still
+            # controls whether keypad keys are blocked, as in v1.6.
+            if self._target_device:
+                if not origin:
+                    return True, False
+                matched = self._origin_matches(origin)
+                if not matched:
+                    return False, False
+                return True, self._suppress
+            if origin and origin not in self._general_kb_handles:
+                return True, self._suppress
+            return True, False
 
         is_numlock = (
             vk == VK_NUMLOCK or name == "NumLock" or (scan == 0x45 and not extended)
@@ -1382,6 +1473,16 @@ class KeyHook:
             return False
         is_down = not bool(flags & RI_KEY_BREAK)
         name = win_key_name(vk, scan, extended, keypad_verified=bool(self._target_device))
+        if vk in _NUMPAD_SWALLOW_VKS and (
+            self._target_device or h_device not in self._general_kb_handles
+        ):
+            # NumLock-OFF navigational variant (e.g. '2' reported as VK_DOWN):
+            # map by the constant physical scancode so the correct MIDI note
+            # fires via WM_INPUT too, regardless of the VK Windows translated.
+            # Flagged general keyboards (the laptop) are never overridden.
+            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(scan)
+            if nav_name:
+                name = nav_name
         if name is None:
             return False
         for idx, (q_name, q_down, _) in enumerate(self._pending_raw_dedup):
@@ -1557,11 +1658,8 @@ class KeyHook:
                             # tracking, then apply the device-aware decision.
                             origin = self._ll_origin_device(vk_code, extended, now)
                             origin_matched = self._origin_matches(origin) if origin else False
-                            name = win_key_name(
-                                vk_code,
-                                scan_code,
-                                extended,
-                                keypad_verified=origin_matched and bool(self._target_device),
+                            name = self._ll_resolve_name(
+                                vk_code, scan_code, extended, origin, origin_matched
                             )
                             if name is not None:
                                 is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)

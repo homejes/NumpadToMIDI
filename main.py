@@ -1111,6 +1111,20 @@ def selftest() -> int:
                 # ignored (MIDI off, OS keystroke passes through).
                 hook.set_target_device(r"HID\VID_FAKE&PID_0001")
                 assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, False)
+                # NumLock-OFF navigational variants (v1.9.2): the keypad's '2'
+                # arriving as VK_DOWN (E0) maps to "2" by physical scancode
+                # and is swallowed; an unmatched (laptop) origin passes through.
+                hook.set_target_device("HDEVICE:4343")
+                hook._raw_last_by_key[(0x28, True)] = (4343, now)
+                hook._raw_recent_hdevice = 4343
+                hook._raw_recent_ts = now
+                assert hook._ll_resolve_name(0x28, 0x50, True, 4343, True) == "2"
+                assert hook._ll_decide("2", 0x28, 0x50, True, now) == (True, True)
+                hook._raw_last_by_key[(0x28, True)] = (4242, now)
+                hook._raw_recent_hdevice = 4242
+                hook._raw_recent_ts = now
+                assert hook._ll_resolve_name(0x28, 0x50, True, 4242, False) is None
+                assert hook._ll_decide("2", 0x28, 0x50, True, now) == (False, False)
             finally:
                 hook.set_target_device(saved_state[5])
                 hook._raw_last_by_key.clear()

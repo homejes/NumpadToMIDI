@@ -1077,6 +1077,80 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
         self.assertEqual((queue, swallow), (True, False))
 
+    # --- v1.9.2: NumLock-OFF navigational variants ----------------------------
+
+    def test_e0_nav_keys_from_keypad_map_to_digits_and_swallow(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        # USB keypads emit HID navigation usages as E0-extended scancodes when
+        # their NumLock is OFF/desynced: '2' arrives as VK_DOWN (E0 0x50), etc.
+        # The physical scancode must map the MIDI name; the OS key is swallowed.
+        cases = [
+            (0x2D, 0x52, "0"),  # VK_INSERT -> numpad 0
+            (0x23, 0x4F, "1"),  # VK_END    -> numpad 1
+            (0x28, 0x50, "2"),  # VK_DOWN   -> numpad 2
+            (0x22, 0x51, "3"),  # VK_NEXT   -> numpad 3
+            (0x25, 0x4B, "4"),  # VK_LEFT   -> numpad 4
+            (0x27, 0x4D, "6"),  # VK_RIGHT  -> numpad 6
+            (0x24, 0x47, "7"),  # VK_HOME   -> numpad 7 (not "Home")
+            (0x26, 0x48, "8"),  # VK_UP     -> numpad 8
+            (0x21, 0x49, "9"),  # VK_PRIOR  -> numpad 9
+            (0x2E, 0x53, "."),  # VK_DELETE -> numpad .
+        ]
+        for vk, scan, expected in cases:
+            self.hook._raw_last_by_key[(vk, True)] = (self.KEYPAD_H, now)
+            name = self.hook._ll_resolve_name(vk, scan, True, self.KEYPAD_H, True)
+            self.assertEqual(name, expected, f"E0 scan 0x{scan:02X}")
+            queue, swallow = self.hook._ll_decide(name, vk, scan, True, now)
+            self.assertEqual((queue, swallow), (True, True), f"E0 scan 0x{scan:02X}")
+
+    def test_numlock_off_vk_down_reported_by_windows_is_swallowed(self):
+        # The user's exact report: numpad '2' with NumLock OFF leaking into
+        # Cubase as a Down arrow.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        self.hook._raw_last_by_key[(0x28, True)] = (self.KEYPAD_H, now)
+        name = self.hook._ll_resolve_name(0x28, 0x50, True, self.KEYPAD_H, True)
+        self.assertEqual(name, "2")
+        self.assertEqual(self.hook._ll_decide(name, 0x28, 0x50, True, now), (True, True))
+        # Classic-AT variant (non-extended, same scancode) via the OEM table
+        # is swallowed through the same nav list.
+        self.hook._raw_last_by_key[(0x28, False)] = (self.KEYPAD_H, now)
+        self.assertEqual(self.hook._ll_decide("2", 0x28, 0x50, False, now), (True, True))
+
+    def test_laptop_e0_arrows_never_swallowed_or_mapped(self):
+        self.flag_laptop()
+        now = time.perf_counter()
+        self.hook._raw_last_by_key[(0x28, True)] = (self.LAPTOP_H, now)
+        # All mode, flagged general keyboard: no scancode override, no MIDI.
+        self.assertIsNone(
+            self.hook._ll_resolve_name(0x28, 0x50, True, self.LAPTOP_H, True)
+        )
+        # Specific target: the laptop's real Down arrow is rejected entirely.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        queue, swallow = self.hook._ll_decide("2", 0x28, 0x50, True, now)
+        self.assertEqual((queue, swallow), (False, False))
+
+    def test_wm_input_e0_nav_keypad_queued_with_scancode_name(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        before = self.hook._win_queue.qsize()
+        ok = self.hook._process_raw_keyboard(
+            self.KEYPAD_H, 0x28, 0x50, 0x0002  # RI_KEY_E0: VK_DOWN, scan 0x50
+        )
+        self.assertTrue(ok)
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        name, is_down, vk, scan = self.hook._win_queue.get()
+        self.assertEqual((name, is_down, vk, scan), ("2", True, 0x28, 0x50))
+
+    def test_wm_input_e0_nav_flagged_laptop_not_queued_all_mode(self):
+        self.flag_laptop()
+        before = self.hook._win_queue.qsize()
+        ok = self.hook._process_raw_keyboard(
+            self.LAPTOP_H, 0x28, 0x50, 0x0002  # laptop's real Down arrow
+        )
+        self.assertFalse(ok)  # name stays None -> WM_INPUT drops it
+        self.assertEqual(self.hook._win_queue.qsize(), before)
+
     def test_matched_handle_cache_rebuilt_on_target_switch(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         self.assertEqual(
