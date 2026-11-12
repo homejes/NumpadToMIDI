@@ -262,6 +262,19 @@ _NUMPAD_SWALLOW_VKS = frozenset(
         VK_DELETE,  # Numpad .
     }
 )
+# v1.9.7 "bulletproof" global swallow list (target mode + Exclusive Mode):
+# the keypad's keys whose Virtual Keys a normal typing keyboard can NEVER
+# produce. A missed device-gated swallow for these leaks directly into DAW
+# shortcuts (Numpad Enter = Cubase "Play"), so while a specific USB keypad is
+# selected they are swallowed with NO origin correlation - the LL<->WM_INPUT
+# race cannot leak them. VK_RETURN itself is handled separately: only the
+# E0-extended variant is swallowed globally; the main Enter (non-extended) of
+# every keyboard stays untouched. Key-UPs are never swallowed (v1.9.5): the
+# OS delivery of a lone break is inert (DAWs trigger on key-DOWN only) and
+# the Note OFFs flow through the WM_INPUT channel.
+_TARGET_GLOBAL_SWALLOW_VKS = frozenset(
+    {VK_DIVIDE, VK_MULTIPLY, VK_SUBTRACT, VK_ADD}
+)
 # Device-gated scancode overrides for keypad keys whose scancode is missing
 # from the pure OEM table above (adding it there would map the laptop's main
 # keys everywhere and fire MIDI from them in All mode). Consulted only when
@@ -1213,6 +1226,10 @@ class KeyHook:
         # v1.9.6: background Raw Input sink state
         self._raw_sink_wndproc_ref = None
         self._raw_sink_owns_wm_input = False
+        # v1.9.7: WM_INPUT delivery diagnostics (RIM_INPUT vs RIM_INPUTSINK)
+        self._last_wm_input_code = -1
+        self._last_wm_input_ts = 0.0
+        self._raw_watchdog_last_ts = 0.0
         # 000-burst detection state (NumLock-independent triplet detector)
         self._zbuf: list[bool] = []
         self._zlast_ts: float = 0.0
@@ -1492,6 +1509,30 @@ class KeyHook:
             return False
         return bool(self._suppress)
 
+    def _ll_global_swallow(self, vk: int, extended: bool, is_down: bool) -> bool:
+        """v1.9.7 bulletproof swallow for the keypad's unambiguous keys.
+
+        While a specific USB keypad is selected (``_target_device``) and
+        Exclusive Mode is on (``_suppress``), these keys are swallowed
+        UNCONDITIONALLY - no ``WH_KEYBOARD_LL``↔``WM_INPUT`` race, no origin
+        correlation, no TTL - because a missed swallow leaks directly into
+        DAW shortcuts (Numpad Enter = Cubase "Play"). Covered keys:
+
+        * ``VK_RETURN`` with ``LLKHF_EXTENDED`` (E0 0x1C): Numpad Enter. The
+          main Enter (non-extended) of every keyboard is NEVER swallowed.
+        * ``VK_DIVIDE`` / ``VK_MULTIPLY`` / ``VK_SUBTRACT`` / ``VK_ADD``: the
+          numpad math operators, which a normal typing keyboard cannot emit.
+
+        Only the key-DOWN edge is swallowed; key-UPs always fall through
+        (v1.9.5) - a lone break is inert to the OS and DAWs, and its Note OFF
+        comes from the WM_INPUT channel.
+        """
+        if not (is_down and self._target_device and self._suppress):
+            return False
+        if vk == VK_RETURN:
+            return extended
+        return vk in _TARGET_GLOBAL_SWALLOW_VKS
+
     def _ll_handle_event(
         self, name: str, vk: int, scan: int, extended: bool, now: float, is_down: bool
     ) -> bool:
@@ -1522,6 +1563,12 @@ class KeyHook:
         """
         if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
             self._queue_from_ll(name, is_down, vk, scan)
+            return True
+        # v1.9.7 bulletproof swallow: the keypad's unambiguous keys (Numpad
+        # Enter E0, math operators) are blocked in target mode with no origin
+        # correlation, so the LL<->WM_INPUT race can never leak them into a
+        # focused DAW.
+        if self._ll_global_swallow(vk, extended, is_down):
             return True
         if not is_down:
             return False
@@ -1756,6 +1803,13 @@ class KeyHook:
         """
         try:
             if umsg == _WM_INPUT:
+                # v1.9.7 delivery diagnostic: wParam & 0xFF is
+                # GET_RAWINPUT_CODE_WPARAM - 0 (RIM_INPUT) when this process
+                # was foreground, 1 (RIM_INPUTSINK) when delivered in the
+                # background. The watchdog heartbeat reports it so background
+                # delivery is provable in the log.
+                self._last_wm_input_code = int(wparam) & 0xFF
+                self._last_wm_input_ts = time.perf_counter()
                 try:
                     self._handle_wm_input(lparam)
                 except Exception as exc:
@@ -1881,6 +1935,7 @@ class KeyHook:
                         logger.debug(
                             "Raw Input keyboard registration verified (INPUTSINK active)"
                         )
+                    self._report_wm_input_delivery()
                     return True
             logger.warning(
                 "Raw Input keyboard registration missing RIDEV_INPUTSINK "
@@ -1891,6 +1946,28 @@ class KeyHook:
         except Exception as exc:
             logger.warning("Raw Input registration verification error: %s", exc)
             return False
+
+    def _report_wm_input_delivery(self) -> None:
+        """Log whether recent WM_INPUT events arrived foreground or background.
+
+        Called from the watchdog heartbeat: proof that RIDEV_INPUTSINK is
+        actually delivering while a DAW holds the focus (the v1.9.5/v1.9.6
+        foreground-only regression made background delivery fail silently).
+        """
+        ts = self._last_wm_input_ts
+        if ts <= self._raw_watchdog_last_ts:
+            return  # no new events since the last heartbeat
+        self._raw_watchdog_last_ts = ts
+        code = self._last_wm_input_code
+        if code == 1:
+            logger.info(
+                "Raw Input delivery verified: last WM_INPUT was BACKGROUND "
+                "(RIM_INPUTSINK) - MIDI generation works while a DAW is focused"
+            )
+        elif code == 0:
+            logger.debug(
+                "Raw Input delivery: last WM_INPUT was foreground (RIM_INPUT)"
+            )
 
     def _win_message_pump(self) -> None:  # pragma: no cover - real OS hook loop
         """Dedicated high-priority Win32 message loop owning WH_KEYBOARD_LL and WM_INPUT."""
@@ -1953,6 +2030,15 @@ class KeyHook:
                             extended = bool(kb.flags & _LLKHF_EXTENDED)
                             vk_code = int(kb.vkCode)
                             scan_code = int(kb.scanCode)
+                            is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
+                            # v1.9.7 bulletproof swallow FIRST: the keypad's
+                            # unambiguous keys (Numpad Enter E0, math
+                            # operators) are blocked with no origin
+                            # correlation while a target keypad is selected,
+                            # so no LL<->WM_INPUT race can leak them into a
+                            # focused DAW.
+                            if self._ll_global_swallow(vk_code, extended, is_down):
+                                return 1
                             now = time.perf_counter()
                             # Correlate this event with Raw Input (WM_INPUT) device
                             # tracking, then apply the device-aware decision.
@@ -1962,7 +2048,6 @@ class KeyHook:
                                 vk_code, scan_code, extended, origin, origin_matched
                             )
                             if name is not None:
-                                is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
                                 # Device-aware swallow decision. WM_INPUT owns
                                 # the MIDI generation for trackable keys (exact
                                 # hDevice match); the LL channel only swallows.

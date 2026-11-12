@@ -10,8 +10,9 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - Physical **M-Tech 23-key layout**: `Home` (`VK_BROWSER_HOME` / `0xAC`), `Tab`, `Email` (`0xB4`),
   `Calc` (`0xB7`), `NumLock`, `/`, `*`, `Backspace`, `0-9`, `.`, `000`, `+`, `-`, and a
   2-row tall `Enter` key.
-- **Target USB Keypad selector (Win32 Raw Input API)**: choose `"All Connected Keypads (Default)"` or lock NumpadToMIDI to a specific external USB keypad (`HID\VID_xxxx&PID_xxxx`). On Windows, **`WM_INPUT` owns 100% of the MIDI generation** and is delivered **in the background** (while a DAW holds the focus): the events are sunk into a hidden top-level window registered with `RIDEV_INPUTSINK` (v1.9.6) — the registration is verified against the OS (`GetRegisteredRawInputDevices`) at startup and re-verified/re-registered by a watchdog timer every 30 s, and every raw event is matched by its exact `hDevice`/device path against the UI selection, so only the selected keypad produces notes — the laptop's built-in keyboard (including its embedded numpad `0`/`Insert` key and its real arrow/Home/End keys) can never trigger MIDI, and unmatched events are dropped with a debug log entry. `WH_KEYBOARD_LL` is **swallow-only**: it blocks keystrokes strictly correlated (via the Raw Input origin tracking) with the selected keypad and falls through to `CallNextHookEx` for everything else — including unattributed events (e.g. if the Raw Input sink has not reported yet), which are never blocked in either mode. When the keypad's NumLock is OFF (or desynced) its digits arrive as navigational Virtual Keys (`VK_DOWN` for `2`, `VK_HOME` for `7`, …); those variants are swallowed for the keypad and mapped back to the correct MIDI note by the constant physical scancode.
-- **Anti-stuck pad state tracking (v1.9.6)**: a pad-state tracker debounces the OS auto-repeat stream — while a pad is held, only the first key-down produces a Note ON (no repeat spam into the DAW), and key-up events (`RI_KEY_BREAK` in `WM_INPUT`, `WM_KEYUP`/`WM_SYSKEYUP` in `WH_KEYBOARD_LL`) are always processed so every Note ON is guaranteed exactly one Note OFF. Key-UP events of trackable keys are **never swallowed** by the low-level hook — a swallowed break is the one edge whose loss hangs a note and leaves a pad lit (and a leaked break is inert to the OS: DAW shortcuts trigger on key-DOWN only). Stray releases (whose key-down never registered) still dispatch their Note OFF and clear the UI pad highlight, so no pad can remain stuck lit.
+- **Target USB Keypad selector (Win32 Raw Input API)**: choose `"All Connected Keypads (Default)"` or lock NumpadToMIDI to a specific external USB keypad (`HID\VID_xxxx&PID_xxxx`). On Windows, **`WM_INPUT` owns 100% of the MIDI generation** and is delivered **in the background** (while a DAW holds the focus): the events are sunk into a hidden top-level window registered with `RIDEV_INPUTSINK` (v1.9.7) — the registration is verified against the OS (`GetRegisteredRawInputDevices`) at startup and re-verified/re-registered by a watchdog timer every 30 s, and every raw event is matched by its exact `hDevice`/device path against the UI selection, so only the selected keypad produces notes — the laptop's built-in keyboard (including its embedded numpad `0`/`Insert` key and its real arrow/Home/End keys) can never trigger MIDI, and unmatched events are dropped with a debug log entry. `WH_KEYBOARD_LL` is **swallow-only**: it blocks keystrokes strictly correlated (via the Raw Input origin tracking) with the selected keypad and falls through to `CallNextHookEx` for everything else — including unattributed events (e.g. if the Raw Input sink has not reported yet), which are never blocked in either mode. When the keypad's NumLock is OFF (or desynced) its digits arrive as navigational Virtual Keys (`VK_DOWN` for `2`, `VK_HOME` for `7`, …); those variants are swallowed for the keypad and mapped back to the correct MIDI note by the constant physical scancode.
+- **Bulletproof Numpad Enter / operator swallow (v1.9.7)**: while a specific USB keypad is selected and Exclusive Mode is enabled (default), the keypad's unambiguous keys are swallowed by `WH_KEYBOARD_LL` with **no origin correlation at all** — the `WH_KEYBOARD_LL`↔`WM_INPUT` race cannot leak them into a focused DAW: `VK_RETURN` with `LLKHF_EXTENDED` (E0, Numpad Enter — Cubase "Play") and the math operators (`VK_DIVIDE`/`VK_MULTIPLY`/`VK_SUBTRACT`/`VK_ADD`, which a typing keyboard cannot emit). The main Enter (non-extended `VK_RETURN`) of every keyboard is never touched, key-UPs are never swallowed (v1.9.5), and digits/nav keys keep the strict device-gated isolation (laptops with embedded numpads are protected). Background `WM_INPUT` delivery is provable in the log: the watchdog heartbeat reports `Raw Input delivery verified: last WM_INPUT was BACKGROUND (RIM_INPUTSINK)` whenever events arrived while a DAW held the focus. All key input is read exclusively through OS-level APIs (`WH_KEYBOARD_LL` + Raw Input `WM_INPUT`) — Qt emits no MIDI and installs no numpad shortcuts; the only Qt key handlers are `NoKeyComboBox`'s defensive `event.ignore()` rejections that keep the device dropdown from eating keystrokes while the window is focused.
+- **Anti-stuck pad state tracking (v1.9.7)**: a pad-state tracker debounces the OS auto-repeat stream — while a pad is held, only the first key-down produces a Note ON (no repeat spam into the DAW), and key-up events (`RI_KEY_BREAK` in `WM_INPUT`, `WM_KEYUP`/`WM_SYSKEYUP` in `WH_KEYBOARD_LL`) are always processed so every Note ON is guaranteed exactly one Note OFF. Key-UP events of trackable keys are **never swallowed** by the low-level hook — a swallowed break is the one edge whose loss hangs a note and leaves a pad lit (and a leaked break is inert to the OS: DAW shortcuts trigger on key-DOWN only). Stray releases (whose key-down never registered) still dispatch their Note OFF and clear the UI pad highlight, so no pad can remain stuck lit.
 - **Exclusive Mode (Block OS Keystrokes)** enabled by default: intercepts and swallows keypad
   and multimedia keys (`VK_BROWSER_HOME`, `VK_LAUNCH_MAIL`, `VK_LAUNCH_APP2`, `VK_BACK`, digits)
   in `WH_KEYBOARD_LL` (`return 1`) so Chrome, Mail, or Calculator never launch and DAW text
@@ -19,7 +20,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
   only the extended-flag (`LLKHF_EXTENDED`, E0-prefixed) variant is treated as a numpad key —
   the main Enter of any keyboard is never swallowed (plain-Return keypads still get their
   MIDI through the `WM_INPUT` channel), and key-UP events are never swallowed at all so no
-  Note OFF can be lost (v1.9.6).
+  Note OFF can be lost (v1.9.7).
 - **macOS dual-interface HID capture**: numeric keys live on the GenericDesktop
   Keyboard/Keypad interface (usage page `0x01`, usages `6`/`7`) while `Home`/`Email`/`Calc`
   live on the Consumer Control interface (page `0x0C`). Native `IOHIDManager` binds to BOTH
@@ -34,7 +35,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - macOS: native **virtual MIDI source** called `NumpadToMIDI` with native builds for both Intel (`x86_64`) and Apple Silicon (`arm64`).
 - Windows: creates a virtual MIDI port called **`NumpadToMIDI`** directly via the
   [teVirtualMIDI](https://www.tobias-erichsen.de/software/virtualmidi.html) driver
-  (automatically installed by `NumpadToMIDI-Setup-v1.9.6.exe`). If the driver is not
+  (automatically installed by `NumpadToMIDI-Setup-v1.9.7.exe`). If the driver is not
   present, falls back to any existing loopback port (e.g.
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)), then to the first
   available output, or runs silently if none exists.
@@ -66,22 +67,22 @@ Output: `dist/NumpadToMIDI-Windows.exe` (Windows) or `dist/NumpadToMIDI.app` (ma
 To build the platform installers:
 - **Windows (Inno Setup 6.3+):**
   ```powershell
-  ISCC.exe /DAppVersion=1.9.6 installer\windows_installer.iss
+  ISCC.exe /DAppVersion=1.9.7 installer\windows_installer.iss
   ```
-  Produces `dist/NumpadToMIDI-Setup-v1.9.6.exe` (bundles the app, creates Desktop and
+  Produces `dist/NumpadToMIDI-Setup-v1.9.7.exe` (bundles the app, creates Desktop and
   Start Menu shortcuts, elevates to Administrator, and silently downloads + installs
   the `teVirtualMIDI` virtual MIDI driver if missing).
 - **macOS (DMG with `/Applications` link and setup guide):**
   ```bash
-  bash installer/make_dmg.sh 1.9.6 Intel         # Intel x86_64 Macs
-  bash installer/make_dmg.sh 1.9.6 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
+  bash installer/make_dmg.sh 1.9.7 Intel         # Intel x86_64 Macs
+  bash installer/make_dmg.sh 1.9.7 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
   ```
-  Produces `dist/NumpadToMIDI-macOS-Intel-v1.9.6.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v1.9.6.dmg` (and `dist/NumpadToMIDI-macOS-v1.9.6.dmg`).
+  Produces `dist/NumpadToMIDI-macOS-Intel-v1.9.7.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v1.9.7.dmg` (and `dist/NumpadToMIDI-macOS-v1.9.7.dmg`).
 
 ## Releases / CI
 `.github/workflows/build-release.yml` builds both platforms on every `v*` tag (and manual
-`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.9.6.exe`,
-`NumpadToMIDI-macOS-Intel-v1.9.6.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v1.9.6.dmg`
+`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.9.7.exe`,
+`NumpadToMIDI-macOS-Intel-v1.9.7.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v1.9.7.dmg`
 to the GitHub Release.
 
 ## Notes & limitations

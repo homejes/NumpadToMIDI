@@ -1355,6 +1355,63 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         queued_name, is_down, _, _ = self.hook._win_queue.get()
         self.assertEqual((queued_name, is_down), ("Calc", False))
 
+    # --- v1.9.7: bulletproof global swallow (target mode) -----------------------
+
+    def test_target_mode_globally_swallows_extended_enter_without_correlation(self):
+        # The LL<->WM_INPUT race must not be able to leak Numpad Enter into a
+        # focused DAW: with a target keypad selected, the E0-extended
+        # VK_RETURN is swallowed with NO origin data at all (cold start).
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.hook._raw_last_by_key.clear()
+        self.hook._raw_recent_ts = 0.0
+        now = time.perf_counter()
+        self.assertTrue(
+            self.hook._ll_global_swallow(0x0D, True, True),
+            "E0 Numpad Enter must be swallowed globally in target mode",
+        )
+        # ...and the full LL event path agrees even with no name resolution
+        # data (correlation is cold).
+        self.assertTrue(
+            self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, True)
+        )
+        # Key-UP is still never swallowed (v1.9.5): its Note OFF comes from
+        # the WM_INPUT channel and the OS delivery of a lone break is inert.
+        self.assertFalse(
+            self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False)
+        )
+
+    def test_target_mode_main_enter_still_never_swallowed(self):
+        # The laptop's main Enter (VK_RETURN, NON-extended) must pass even in
+        # target mode with zero correlation - the extended-flag rule is
+        # absolute.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.hook._raw_last_by_key.clear()
+        self.hook._raw_recent_ts = 0.0
+        self.assertFalse(self.hook._ll_global_swallow(0x0D, False, True))
+
+    def test_target_mode_globally_swallows_math_operators(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.hook._raw_last_by_key.clear()
+        self.hook._raw_recent_ts = 0.0
+        for vk, extended in ((0x6F, True), (0x6A, False), (0x6D, False), (0x6B, False)):
+            self.assertTrue(
+                self.hook._ll_global_swallow(vk, extended, True),
+                f"operator VK 0x{vk:02X} must be swallowed globally in target mode",
+            )
+        # Exclusive Mode off: nothing is swallowed (keys pass to the OS as
+        # configured by the user).
+        self.hook.set_suppress(False)
+        try:
+            self.assertFalse(self.hook._ll_global_swallow(0x0D, True, True))
+            self.assertFalse(self.hook._ll_global_swallow(0x6F, True, True))
+        finally:
+            self.hook.set_suppress(True)
+        # All mode keeps the strict correlation gating (a laptop's embedded
+        # numpad is protected there).
+        self.hook.set_target_device("")
+        self.assertFalse(self.hook._ll_global_swallow(0x0D, True, True))
+        self.assertFalse(self.hook._ll_global_swallow(0x6F, True, True))
+
     def test_matched_handle_cache_rebuilt_on_target_switch(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         self.assertEqual(

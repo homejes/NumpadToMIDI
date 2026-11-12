@@ -1164,6 +1164,18 @@ def selftest() -> int:
                 assert up_item[1] is False and up_item[0] == "0"
                 assert hook._ll_handle_event("0", 0x60, 0x52, False, now, False) is False
                 assert hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False) is False
+                # v1.9.7 bulletproof swallow: with a target keypad selected,
+                # the E0 Numpad Enter and the math operators are swallowed
+                # with NO origin correlation (the LL<->WM_INPUT race can
+                # never leak them into a focused DAW), while the main Enter
+                # (non-extended) of any keyboard always passes.
+                hook._raw_last_by_key.clear()
+                hook._raw_recent_ts = 0.0
+                assert hook._ll_global_swallow(0x0D, True, True) is True
+                assert hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, True) is True
+                assert hook._ll_global_swallow(0x6F, True, True) is True
+                assert hook._ll_global_swallow(0x6A, False, True) is True
+                assert hook._ll_global_swallow(0x0D, False, True) is False
                 # v1.9.6 background Raw Input sink: the hidden top-level sink
                 # window must register with RIDEV_INPUTSINK and the OS must
                 # verify the registration as background-capable. Without it,
