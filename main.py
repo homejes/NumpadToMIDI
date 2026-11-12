@@ -1141,14 +1141,39 @@ def selftest() -> int:
                 # v1.9.8, no device selected: strict no-op - no MIDI, no
                 # swallow (the laptop keeps typing normally).
                 assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, False)
-                # Specific target: an unmatched laptop origin is completely
-                # ignored (MIDI off, OS keystroke passes through).
+                # Specific target: a proven laptop origin generates NO MIDI.
+                # v1.9.9: the unambiguous numpad VKs (VK_NUMPAD0 here) are
+                # additionally swallowed silently - DAW protection takes
+                # priority over the laptop's embedded-numpad keys.
                 hook.set_target_device(r"HID\VID_FAKE&PID_0001")
-                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, False)
+                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, True)
                 # And the WM_INPUT channel is equally strict with no selection:
                 before_q = hook._win_queue.qsize()
                 assert hook._process_raw_keyboard(4242, 0x60, 0x52, 0) is False
                 assert hook._win_queue.qsize() == before_q
+                # v1.9.9 aggressive swallow (race-proof): with a target keypad
+                # selected and Exclusive Mode on, the unambiguous numpad keys
+                # are swallowed with NO origin correlation - the reported
+                # v1.9.8 leak (cold Numpad Enter / '+' bleeding into the OS)
+                # cannot happen - while the laptop's main Enter (NON-extended
+                # VK_RETURN), its top-row '+' (VK_OEM_PLUS) and its digits
+                # (VK_0-9) are never touched.
+                hook._raw_last_by_key.clear()
+                hook._raw_recent_ts = 0.0
+                cold = time.perf_counter()
+                assert hook._ll_global_swallow(0x0D, True) is True   # Numpad Enter (E0)
+                assert hook._ll_global_swallow(0x6B, False) is True  # VK_ADD
+                assert hook._ll_global_swallow(0x6D, False) is True  # VK_SUBTRACT
+                assert hook._ll_global_swallow(0x6A, False) is True  # VK_MULTIPLY
+                assert hook._ll_global_swallow(0x6F, False) is True  # VK_DIVIDE
+                assert hook._ll_global_swallow(0x6E, False) is True  # VK_DECIMAL
+                assert hook._ll_global_swallow(0x60, False) is True  # VK_NUMPAD0
+                assert hook._ll_global_swallow(0x0D, False) is False  # main Enter
+                assert hook._ll_global_swallow(0xBB, False) is False  # top-row '+'
+                assert hook._ll_global_swallow(0x31, False) is False  # digit '1'
+                assert hook._ll_decide("Enter", 0x0D, 0x1C, True, cold) == (False, True)
+                assert hook._ll_decide("+", 0x6B, 0x4E, False, cold) == (False, True)
+                assert hook._ll_decide("Enter", 0x0D, 0x1C, False, cold) == (False, False)
             finally:
                 hook.set_target_device(saved_state[5])
                 hook._raw_last_by_key.clear()

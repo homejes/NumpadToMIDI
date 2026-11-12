@@ -1,7 +1,24 @@
 import time
 import unittest
 
-from key_hook import KEY_INDEX, KEY_LAYOUT, KEY_SPAN, KeyboardDevice, KeyHook, win_key_name
+from key_hook import (
+    KEY_INDEX,
+    KEY_LAYOUT,
+    KEY_SPAN,
+    KeyboardDevice,
+    KeyHook,
+    VK_ADD,
+    VK_BACK,
+    VK_DECIMAL,
+    VK_DIVIDE,
+    VK_MULTIPLY,
+    VK_NUMLOCK,
+    VK_NUMPAD0,
+    VK_RETURN,
+    VK_SUBTRACT,
+    VK_TAB,
+    win_key_name,
+)
 
 
 class Recorder:
@@ -976,13 +993,17 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, time.perf_counter())
         self.assertEqual((queue, swallow), (False, False))
 
-    def test_specific_target_laptop_zero_completely_ignored(self):
+    def test_specific_target_laptop_zero_swallowed_silently(self):
         self.flag_laptop()
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         self.hook._raw_last_by_key[(0x60, False)] = (self.LAPTOP_H, now)
+        # v1.9.9: VK_NUMPAD0 is in the aggressive swallow set - with a target
+        # selected and Exclusive Mode on it is swallowed even with a proven
+        # laptop origin (user-accepted: DAW protection takes priority), but
+        # it still generates NO MIDI (the queue stays device-gated).
         queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
-        self.assertEqual((queue, swallow), (False, False))
+        self.assertEqual((queue, swallow), (False, True))
 
     def test_specific_target_keypad_zero_is_swallowed(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
@@ -991,15 +1012,100 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
         self.assertEqual((queue, swallow), (True, True))
 
-    def test_specific_target_unknown_origin_is_strict_noop(self):
+    def test_cold_unknown_origin_numpad_keys_swallowed_silently(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         self.hook._raw_recent_ts = 0.0
         # v1.9.8 leak fix: v1.9.1 queued MIDI here ((True, False)) when no Raw
         # Input origin had arrived yet, so the laptop's built-in numpad could
-        # produce notes before its first WM_INPUT packet. Strict isolation
-        # requires a proven origin: no MIDI, no swallow.
+        # produce notes before its first WM_INPUT packet. v1.9.8 stopped the
+        # MIDI but also refused to swallow ((False, False)), which leaked
+        # rarely-pressed keys (Numpad Enter, '+') into the OS once the
+        # correlation went cold. v1.9.9: the unambiguous numpad VKs are
+        # swallowed with NO correlation (aggressive rule) while the MIDI
+        # queue stays off (device unproven; WM_INPUT owns the notes).
         queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, time.perf_counter())
+        self.assertEqual((queue, swallow), (False, True))
+        queue, swallow = self.hook._ll_decide("Enter", 0x0D, 0x1C, True, time.perf_counter())
+        self.assertEqual((queue, swallow), (False, True))
+        queue, swallow = self.hook._ll_decide("+", 0x6B, 0x4E, False, time.perf_counter())
+        self.assertEqual((queue, swallow), (False, True))
+
+    def test_cold_typing_keys_still_never_swallowed(self):
+        # The aggressive rule covers ONLY the unambiguous numpad VKs: the
+        # laptop's normal typing keys and its main Enter pass through cold.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.hook._raw_recent_ts = 0.0
+        now = time.perf_counter()
+        # Typing keys (Backspace) are not in the swallow set: the laptop's
+        # normal typing still passes through cold.
+        queue, swallow = self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now)
         self.assertEqual((queue, swallow), (False, False))
+        # Typing keys resolve to no numpad name or are not in the swallow
+        # set: the laptop's top-row '+' is VK_OEM_PLUS (0xBB), digits VK_1+.
+        self.assertFalse(self.hook._ll_global_swallow(0xBB, False))
+        self.assertFalse(self.hook._ll_global_swallow(0x31, False))
+        self.assertFalse(self.hook._ll_global_swallow(0x41, False))
+
+    # --- v1.9.9: aggressive global swallow (race-proof) -------------------------
+
+    def test_global_swallow_covers_unambiguous_numpad_vks_without_correlation(self):
+        # Cold start: no WM_INPUT data at all - the swallow must not depend
+        # on any correlation state (that dependency was the v1.9.8 leak).
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.hook._raw_last_by_key.clear()
+        self.hook._raw_recent_ts = 0.0
+        for vk in (VK_ADD, VK_SUBTRACT, VK_MULTIPLY, VK_DIVIDE, VK_DECIMAL):
+            self.assertTrue(
+                self.hook._ll_global_swallow(vk, False), f"VK 0x{vk:02X} must be swallowed"
+            )
+        self.assertTrue(self.hook._ll_global_swallow(VK_RETURN, True))  # Numpad Enter (E0)
+        for vk in range(VK_NUMPAD0, VK_NUMPAD0 + 10):
+            self.assertTrue(
+                self.hook._ll_global_swallow(vk, False), f"VK 0x{vk:02X} must be swallowed"
+            )
+
+    def test_global_swallow_never_touches_main_keyboard_keys(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        # Main Enter of every keyboard: VK_RETURN, NON-extended.
+        self.assertFalse(self.hook._ll_global_swallow(VK_RETURN, False))
+        # Top-row '+', digits, letters, Tab/Backspace/NumLock: different VKs.
+        for vk in (0xBB, 0x31, 0x41, VK_TAB, VK_BACK, VK_NUMLOCK):
+            self.assertFalse(
+                self.hook._ll_global_swallow(vk, False), f"VK 0x{vk:02X} must pass"
+            )
+
+    def test_global_swallow_requires_target_and_exclusive_mode(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.hook.set_suppress(False)
+        try:
+            # Exclusive Mode off: the user asked for keys to pass to the OS.
+            self.assertFalse(self.hook._ll_global_swallow(VK_ADD, False))
+            self.assertFalse(self.hook._ll_global_swallow(VK_RETURN, True))
+        finally:
+            self.hook.set_suppress(True)
+        # No device selected: completely inert (the laptop's embedded numpad
+        # keeps typing normally).
+        self.hook.set_target_device("")
+        self.assertFalse(self.hook._ll_global_swallow(VK_ADD, False))
+        self.assertFalse(self.hook._ll_global_swallow(VK_RETURN, True))
+
+    def test_cold_numpad_enter_and_plus_leak_is_fixed_end_to_end(self):
+        # The reported v1.9.8 bug, at decision level: cold correlation +
+        # target selected -> the OS keystroke is now swallowed while no MIDI
+        # is queued from the LL channel (WM_INPUT owns the note).
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.hook._raw_last_by_key.clear()
+        self.hook._raw_recent_ts = 0.0
+        now = time.perf_counter()
+        self.assertEqual(
+            self.hook._ll_decide("Enter", 0x0D, 0x1C, True, now), (False, True)
+        )
+        self.assertEqual(self.hook._ll_decide("+", 0x6B, 0x4E, False, now), (False, True))
+        # The laptop's main Enter remains completely untouched:
+        self.hook._raw_last_by_key[(0x0D, False)] = (self.LAPTOP_H, now)
+        self.assertEqual(
+            self.hook._ll_decide("Enter", 0x0D, 0x1C, False, now), (False, False)
+        )
 
     def test_specific_target_tab_backspace_pass_through(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
@@ -1075,9 +1181,11 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         self.hook._raw_recent_ts = now - 0.2
         origin = self.hook._ll_origin_device(0x60, False, now)
         self.assertEqual(origin, self.LAPTOP_H)
-        # Proven foreign origin under a specific target: strict no-op.
+        # Proven foreign origin under a specific target: no MIDI. v1.9.9
+        # additionally swallows the unambiguous numpad VK (VK_NUMPAD0) even
+        # with a proven laptop origin - DAW protection takes priority.
         queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, now)
-        self.assertEqual((queue, swallow), (False, False))
+        self.assertEqual((queue, swallow), (False, True))
 
     def test_recent_activity_fallback_covers_new_keys_in_drum_cadence(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")

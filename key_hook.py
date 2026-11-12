@@ -131,7 +131,11 @@ VK_DOWN = 0x28            # 40  - Down (Numpad 2 when NumLock is OFF)
 VK_INSERT = 0x2D          # 45  - Insert (Numpad 0 / '000' burst when NumLock is OFF)
 VK_DELETE = 0x2E          # 46  - Delete (Numpad '.' when NumLock is OFF)
 VK_NUMPAD0 = 0x60         # 96  - Numpad 0 (when NumLock is ON)
+VK_MULTIPLY = 0x6A        # 106 - Numpad *
+VK_ADD = 0x6B             # 107 - Numpad +
+VK_SUBTRACT = 0x6D        # 109 - Numpad -
 VK_DECIMAL = 0x6E         # 110 - Numpad '.' (when NumLock is ON)
+VK_DIVIDE = 0x6F          # 111 - Numpad /
 VK_NUMLOCK = 0x90         # 144 - NumLock
 VK_BROWSER_SEARCH = 0xAA  # 170 - Browser Search multimedia key
 VK_BROWSER_HOME = 0xAC    # 172 - Browser Home multimedia key (scancode 0xE032)
@@ -203,6 +207,28 @@ _BURST_WINDOW_FLOOR = 0.080
 _RAW_KEY_TTL = 10.0     # seconds a per-key origin memory stays valid
 _RAW_RECENT_TTL = 1.0   # seconds the active-device fallback window stays hot
 _GENERAL_KB_VKS = frozenset([*range(0x41, 0x5B), 0x20])  # A-Z + Space
+
+# v1.9.9 aggressive swallow set: the numpad's unambiguous Virtual Keys -
+# VK_NUMPAD0-9 (0x60-0x69) plus the operators VK_MULTIPLY/VK_ADD/VK_SUBTRACT/
+# VK_DIVIDE and VK_DECIMAL (VK_SEPARATOR 0x6C is not emitted by the M-Tech and
+# is excluded). Standard typing keyboards emit NONE of these for their own
+# keys (the top-row '+' is VK_OEM_PLUS 0xBB, digits are VK_0-9 0x30-0x39, the
+# main Enter is NON-extended VK_RETURN), so globally swallowing them while a
+# specific USB keypad is selected protects DAWs from the WH_KEYBOARD_LL <->
+# WM_INPUT correlation races (cold start, 10 s TTL expiry, device switch)
+# without disabling the main keyboard. VK_RETURN is handled separately in
+# _ll_global_swallow: only its LLKHF_EXTENDED (E0 0x1C) variant - the real
+# Numpad Enter - is swallowed.
+_GLOBAL_SWALLOW_VKS = frozenset(
+    (
+        *range(VK_NUMPAD0, VK_NUMPAD0 + 10),
+        VK_MULTIPLY,
+        VK_ADD,
+        VK_SUBTRACT,
+        VK_DECIMAL,
+        VK_DIVIDE,
+    )
+)
 
 # Extended scan codes:
 _WIN_OEM_SCANCODES_EXTENDED: dict[int, str] = {
@@ -1294,6 +1320,33 @@ class KeyHook:
             return self._raw_recent_hdevice
         return 0
 
+    def _ll_global_swallow(self, vk: int, extended: bool) -> bool:
+        """v1.9.9 aggressive swallow for the numpad's unambiguous keys.
+
+        While a specific USB keypad is selected and Exclusive Mode is on,
+        these keys are swallowed with NO device-origin correlation at all -
+        no per-key TTL, no cold-start window - because a missed swallow
+        leaks directly into DAW shortcuts (Numpad Enter = Cubase "Play")
+        and text fields. Covered: ``VK_NUMPAD0-9``, ``VK_MULTIPLY`` /
+        ``VK_ADD`` / ``VK_SUBTRACT`` / ``VK_DIVIDE``, ``VK_DECIMAL``, and
+        ``VK_RETURN`` with ``LLKHF_EXTENDED`` (E0 0x1C = Numpad Enter). The
+        main Enter (NON-extended ``VK_RETURN``) of every keyboard is never
+        touched, and normal typing keys (VK_0-9, VK_OEM_PLUS, A-Z) are not
+        in the set.
+
+        MIDI generation is NOT granted by this path: the queue decision
+        stays strictly device-gated (``_ll_decide`` and the WM_INPUT
+        ``hDevice`` check), so a foreign device's swallowed keys stay
+        silent. A laptop with an embedded/full numpad therefore loses those
+        specific keys while a target device is selected - accepted
+        trade-off: DAW protection takes priority.
+        """
+        if not (self._target_device and self._suppress):
+            return False
+        if vk == VK_RETURN:
+            return extended
+        return vk in _GLOBAL_SWALLOW_VKS
+
     def _ll_decide(
         self, name: str, vk: int, scan: int, extended: bool, now: float
     ) -> tuple[bool, bool]:
@@ -1350,13 +1403,19 @@ class KeyHook:
             # here so the app stayed functional, which let the laptop's
             # built-in numpad produce notes before its first WM_INPUT packet
             # arrived (the reported leak). Strict isolation: without a proven
-            # origin nothing is generated and nothing is swallowed.
-            return False, False
+            # origin nothing is generated. v1.9.9: an unambiguous numpad VK
+            # is still SWALLOWED when the aggressive rule applies - the
+            # LL<->WM_INPUT race (cold start, TTL expiry, device switch) must
+            # never leak Numpad Enter/+ into a focused DAW - while the MIDI
+            # queue stays off (unproven device; WM_INPUT owns the notes).
+            return False, self._ll_global_swallow(vk, extended)
         matched = self._origin_matches(origin)
         if not matched:
             # Proven origin on ANOTHER device (e.g. the laptop's embedded
-            # numpad): no MIDI, never swallowed.
-            return False, False
+            # numpad): no MIDI ever. v1.9.9 still swallows the unambiguous
+            # numpad VKs here (user-accepted trade-off: DAW protection takes
+            # priority over the laptop's embedded-numpad keys).
+            return False, self._ll_global_swallow(vk, extended)
         if name in ("Tab", "Backspace"):
             # v1.6 behaviour: the keypad's Tab/Backspace keys pass through
             # to the OS; their MIDI events arrive via the WM_INPUT channel.
