@@ -271,6 +271,11 @@ class Controller(QObject):
             else:
                 entry = self._active.pop(name, None)
                 if entry is None:
+                    # v1.9.5: stray release (its Note ON never registered).
+                    # Still clear the UI pad highlight so no pad can remain
+                    # stuck lit; there is no Note OFF to send (this key was
+                    # never sounded by the Controller).
+                    self.key_state.emit(name, False)
                     return
                 note, channel = entry
                 velocity = 0
@@ -1139,6 +1144,26 @@ def selftest() -> int:
                 hook._raw_recent_ts = now
                 assert hook._ll_resolve_name(0x0D, 0x1C, False, 4242, False) is None
                 assert hook._ll_should_swallow("Enter", 0x0D, 0x1C, False, now) is False
+                # v1.9.5 stuck-keys fix: WM_INPUT debounce + guaranteed Note
+                # OFF. First make queues; auto-repeat makes are consumed;
+                # breaks ALWAYS queue their Note OFF (even without a make);
+                # and the LL hook never swallows a trackable key-up.
+                hook._pad_down.clear()
+                hook._raw_last_by_key[(0x60, False)] = (4343, now)
+                hook._raw_recent_hdevice = 4343
+                hook._raw_recent_ts = now
+                q0 = hook._win_queue.qsize()
+                assert hook._process_raw_keyboard(4343, 0x60, 0x52, 0) is True
+                assert hook._win_queue.qsize() == q0 + 1
+                hook._win_queue.get()  # drain the single queued make
+                assert hook._process_raw_keyboard(4343, 0x60, 0x52, 0) is True
+                assert hook._win_queue.qsize() == q0  # repeat consumed
+                assert hook._process_raw_keyboard(4343, 0x60, 0x52, 0x01) is True
+                assert hook._win_queue.qsize() == q0 + 1  # break always queued
+                up_item = hook._win_queue.get()
+                assert up_item[1] is False and up_item[0] == "0"
+                assert hook._ll_handle_event("0", 0x60, 0x52, False, now, False) is False
+                assert hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False) is False
             finally:
                 hook.set_target_device(saved_state[5])
                 hook._raw_last_by_key.clear()

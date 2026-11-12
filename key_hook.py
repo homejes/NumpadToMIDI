@@ -1157,6 +1157,10 @@ class KeyHook:
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
+        # v1.9.5: pads currently held as seen by the MIDI sources (WM_INPUT
+        # and the LL media-key channel). Debounces OS auto-repeat and
+        # guarantees every Note ON is paired with exactly one Note OFF.
+        self._pad_down: set[str] = set()
         # 000-burst detection state (NumLock-independent triplet detector)
         self._zbuf: list[bool] = []
         self._zlast_ts: float = 0.0
@@ -1450,15 +1454,42 @@ class KeyHook:
         dedicated Home key of a normal keyboard (VK_HOME + E0, scancode 0x47)
         IS Raw Input trackable and is deliberately excluded from that branch
         so it stays device-gated like every other key.
+
+        v1.9.5 (stuck-keys fix): key-UP events of trackable keys are NEVER
+        swallowed - they always fall through to ``CallNextHookEx``. A break
+        event that is removed from the input stream (``return 1``) is the one
+        edge whose loss produces a hanging MIDI note (Note ON without Note
+        OFF) and a permanently lit pad, and a swallowed break whose make
+        reached the OS also leaves the OS key state stuck down. A leaked
+        break is harmless: the OS has no matching make (it was swallowed) or
+        already released the key, DAW shortcuts (e.g. Cubase "Play") trigger
+        on key-DOWN only, and text input produces nothing from a lone key-up.
+        Media keys keep the queue-then-swallow contract on BOTH edges: their
+        Note OFF is queued before ``return 1`` (their only MIDI source), and
+        they never emit WM_INPUT so nothing is lost from that channel.
         """
         if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
             self._queue_from_ll(name, is_down, vk, scan)
             return True
+        if not is_down:
+            return False
         return self._ll_should_swallow(name, vk, scan, extended, now)
 
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
-        """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
+        """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication.
+
+        v1.9.5 pad-state debounce: OS auto-repeat floods the LL channel with
+        WM_KEYDOWN while a pad is held; only the first make is queued for MIDI
+        (no Note ON spam). Breaks are ALWAYS queued so every Note ON gets its
+        Note OFF even when the make was debounced or lost.
+        """
         now = time.perf_counter()
+        if is_down:
+            if name in self._pad_down:
+                return  # auto-repeat: no MIDI, no UI update
+            self._pad_down.add(name)
+        else:
+            self._pad_down.discard(name)
         # 50 ms dedup window, clearing opposite edge for this key to prevent dedup cross-stroke bleed
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup
@@ -1519,6 +1550,30 @@ class KeyHook:
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup if item[0] != name or item[1] == is_down
         ]
+        # v1.9.5 pad-state debounce (stuck-keys fix): the first make of a
+        # physical press is queued for MIDI; OS auto-repeat makes are consumed
+        # here (correlation above still ran) so neither MIDI nor the UI sees
+        # Note ON spam. Breaks are ALWAYS queued - every Note ON is guaranteed
+        # exactly one Note OFF, and a break whose make was dropped (device
+        # gate flicker, name-less make, app started mid-press) still flows so
+        # no note can hang.
+        if is_down:
+            if name in self._pad_down:
+                logger.debug(
+                    "WM_INPUT auto-repeat consumed: vk=0x%02X scan=0x%02X name=%r",
+                    vk, scan, name,
+                )
+                return True
+            self._pad_down.add(name)
+        else:
+            if name not in self._pad_down:
+                # Make never arrived here; queue the break anyway so the
+                # Note OFF / UI un-light still happens.
+                logger.debug(
+                    "WM_INPUT break without make: vk=0x%02X scan=0x%02X name=%r",
+                    vk, scan, name,
+                )
+            self._pad_down.discard(name)
         self._win_queue.put_nowait((name, is_down, vk, scan))
         return True
 
@@ -1569,6 +1624,7 @@ class KeyHook:
                 self._zlast_ts = 0.0
                 self._zlast_vk = 0
                 self._triple_ups_left = 0
+                self._pad_down.clear()
                 for name in list(self._down):
                     self._emit(name, False)
             return
@@ -1603,6 +1659,7 @@ class KeyHook:
             self._zlast_ts = 0.0
             self._zlast_vk = 0
             self._triple_ups_left = 0
+            self._pad_down.clear()
             for name in list(self._down):
                 self._emit(name, False)
 
@@ -2242,8 +2299,13 @@ class KeyHook:
             self._down.add(name)
         else:
             if name not in self._down:
-                return  # stray release
-            self._down.discard(name)
+                # v1.9.5: a stray release (its make never reached us) is no
+                # longer silently dropped - the OFF is still dispatched so
+                # the UI pad un-lights and no Note ON can hang. The
+                # Controller ignores an OFF for a key it never lit.
+                logger.debug("Stray release for %r; forcing Note OFF dispatch", name)
+            else:
+                self._down.discard(name)
         try:
             self._on_key(name, down)
         except Exception:  # a UI/MIDI error must not kill the hook thread

@@ -104,13 +104,16 @@ class DebounceTests(unittest.TestCase):
         for _ in range(10):
             hook._dispatch("5", True)
         hook._dispatch("5", False)
-        hook._dispatch("5", False)  # stray release
         self.assertEqual(rec.events, [("5", True), ("5", False)])
 
-    def test_stray_release_ignored(self):
+    def test_stray_release_still_forces_note_off_dispatch(self):
+        # v1.9.5 (stuck-keys fix): a release whose make never reached the hook
+        # is no longer silently ignored - the OFF is still dispatched so the
+        # UI pad un-lights and no Note ON can hang. The Controller gracefully
+        # ignores the OFF for a key it never sounded.
         hook, rec = make()
         hook._dispatch("7", False)
-        self.assertEqual(rec.events, [])
+        self.assertEqual(rec.events, [("7", False)])
 
     def test_single_zero_press(self):
         hook, rec = make()
@@ -1252,6 +1255,105 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         self.assertEqual(self.hook._win_queue.qsize(), before + 1)
         queued_name, is_down, vk, scan = self.hook._win_queue.get()
         self.assertEqual((queued_name, is_down, vk, scan), ("Email", True, 0xB4, 0x6C))
+
+    # --- v1.9.5: pad-state debounce + guaranteed Note OFF (stuck-keys fix) ------
+
+    def test_wm_input_consumes_auto_repeat_makes(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
+        before = self.hook._win_queue.qsize()
+        # First make is queued for MIDI...
+        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0))
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        # ...every OS auto-repeat make is consumed: no Note ON spam, no UI update.
+        for _ in range(5):
+            self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0))
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+
+    def test_wm_input_break_after_repeat_makes_still_queues_off(self):
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
+        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0)
+        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0)
+        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0)
+        self.hook._win_queue.get()  # drain the single queued make
+        before = self.hook._win_queue.qsize()
+        # RI_KEY_BREAK (flags 0x01): the break ALWAYS queues its Note OFF.
+        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0x01))
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        queued_name, is_down, vk, scan = self.hook._win_queue.get()
+        self.assertEqual((queued_name, is_down, vk, scan), ("0", False, 0x60, 0x52))
+        # The pad is released: a fresh make is no longer debounced away.
+        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0))
+
+    def test_wm_input_break_without_make_still_queues_off(self):
+        # Make lost upstream (device-gate flicker / app started mid-press):
+        # the break must still produce the Note OFF / UI un-light.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        self.hook._raw_last_by_key[(0x69, False)] = (self.KEYPAD_H, now)
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
+        before = self.hook._win_queue.qsize()
+        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x69, 0x49, 0x01))
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        queued_name, is_down, vk, scan = self.hook._win_queue.get()
+        self.assertEqual((queued_name, is_down, vk, scan), ("9", False, 0x69, 0x49))
+
+    def test_ll_never_swallows_trackable_key_ups(self):
+        # v1.9.5: a swallowed break is the one edge whose loss hangs a note
+        # (Note ON without Note OFF). Trackable key-UPs always fall through;
+        # their Note OFF comes from the WM_INPUT channel instead.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        self.hook._raw_last_by_key[(0x60, False)] = (self.KEYPAD_H, now)
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
+        # Down: swallowed (matched device, Exclusive Mode on)...
+        self.assertTrue(self.hook._ll_handle_event("0", 0x60, 0x52, False, now, True))
+        # ...up: NEVER swallowed.
+        self.assertFalse(self.hook._ll_handle_event("0", 0x60, 0x52, False, now, False))
+        # The keypad's E0 numpad Enter: same rule (Cubase "Play" fires on
+        # key-DOWN only; a leaked key-up is inert to the OS and the DAW).
+        self.hook._raw_last_by_key[(0x0D, True)] = (self.KEYPAD_H, now)
+        self.assertTrue(self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, True))
+        self.assertFalse(self.hook._ll_handle_event("Enter", 0x0D, 0x1C, True, now, False))
+
+    def test_ll_media_key_up_still_queues_off_and_swallows(self):
+        # Media keys keep the queue-then-swallow contract on BOTH edges: the
+        # LL channel is their only MIDI source, so the Note OFF must be queued
+        # before the event is swallowed.
+        before = self.hook._win_queue.qsize()
+        now = time.perf_counter()
+        self.assertTrue(
+            self.hook._ll_handle_event("Email", 0xB4, 0x6C, True, now, False)
+        )
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        queued_name, is_down, vk, scan = self.hook._win_queue.get()
+        self.assertEqual((queued_name, is_down, vk, scan), ("Email", False, 0xB4, 0x6C))
+
+    def test_media_key_auto_repeat_consumed_but_up_always_queued(self):
+        now = time.perf_counter()
+        before = self.hook._win_queue.qsize()
+        # First make queues...
+        self.assertTrue(self.hook._ll_handle_event("Calc", 0xB7, 0x21, True, now, True))
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        self.hook._win_queue.get()
+        # ...auto-repeat makes are consumed (no Note ON spam)...
+        for _ in range(4):
+            self.assertTrue(self.hook._ll_handle_event("Calc", 0xB7, 0x21, True, now, True))
+        self.assertEqual(self.hook._win_queue.qsize(), before)
+        # ...and the break still queues its Note OFF.
+        self.assertTrue(self.hook._ll_handle_event("Calc", 0xB7, 0x21, True, now, False))
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        queued_name, is_down, _, _ = self.hook._win_queue.get()
+        self.assertEqual((queued_name, is_down), ("Calc", False))
 
     def test_matched_handle_cache_rebuilt_on_target_switch(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
