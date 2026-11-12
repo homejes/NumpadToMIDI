@@ -1367,91 +1367,94 @@ class KeyHook:
                 name = nav_name
         return name
 
-    def _ll_decide(
+    def _ll_should_swallow(
         self, name: str, vk: int, scan: int, extended: bool, now: float
-    ) -> tuple[bool, bool]:
-        """Decide (queue_for_midi, swallow) for a WH_KEYBOARD_LL event.
+    ) -> bool:
+        """True when WH_KEYBOARD_LL must swallow (``return 1``) this keystroke.
 
-        ``swallow`` means the hook returns 1 so the OS never sees the
-        keystroke; it is only True for keys correlated (via Raw Input origin
-        tracking) with the selected USB keypad. Keys from any other keyboard
-        fall through to ``CallNextHookEx`` untouched.
+        v1.9.4 architecture: the LL hook ONLY blocks keystrokes; WM_INPUT owns
+        100% of the MIDI generation (exact ``hDevice`` match), so a failed LL
+        device correlation can never make another keyboard trigger notes.
+        Swallowing is strictly device-gated: only keystrokes correlated (via
+        the Raw Input origin tracking) with the selected USB keypad are
+        blocked; keys from any other keyboard fall through to
+        ``CallNextHookEx`` untouched, and unattributed events (origin 0) are
+        never swallowed either.
         """
-        # Multimedia launcher keys (Browser Home/Search, Mail, Calc) never emit
-        # RIM_TYPEKEYBOARD WM_INPUT packets, so no Raw Input origin can ever be
-        # correlated for them; they keep the unconditional swallow or the
-        # M-Tech's top-row keys would launch Calculator/Mail. The dedicated
-        # Home key of a normal keyboard (VK_HOME + E0, scancode 0x47) IS Raw
-        # Input trackable and is deliberately excluded here so it is
-        # device-gated like every other key.
-        if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
-            return True, True
+        # VK_RETURN is shared between the main Enter and Numpad Enter: only
+        # the E0-extended variant (LLKHF_EXTENDED) is a numpad key. The main
+        # Enter is never swallowed; plain-Return keypads still get their MIDI
+        # via the WM_INPUT channel.
+        if vk == VK_RETURN and not extended:
+            return False
 
         origin = self._ll_origin_device(vk, extended, now)
 
+        if vk == VK_NUMLOCK or name == "NumLock" or (scan == 0x45 and not extended):
+            # Keypad NumLock stays blocked even for unattributed events:
+            # passing it through would toggle the M-Tech hardware into
+            # navigation mode. Keystrokes proven to come from a general
+            # keyboard reach the OS untouched.
+            if self._target_device:
+                if not origin:
+                    return True
+                return self._origin_matches(origin)
+            return not (origin and origin in self._general_kb_handles)
+
         if vk in _NUMPAD_SWALLOW_VKS:
-            # Comprehensive NumLock-OFF navigational swallow (arrows, Home,
-            # End, PgUp/PgDn, Insert/Delete/Clear, plus the NumLock-ON keypad
-            # VKs): the selected keypad's variants never reach the OS, while
-            # the laptop's real navigation keys pass through untouched
+            # Comprehensive keypad swallow list (digits, operators,
+            # NumLock-OFF navigational variants, Enter/Backspace/Tab): the
+            # selected keypad's variants never reach the OS, while the
+            # laptop's real navigation keys pass through untouched
             # (device-gated). Exclusive Mode (``self._suppress``) still
             # controls whether keypad keys are blocked, as in v1.6.
             if self._target_device:
                 if not origin:
-                    return True, False
-                matched = self._origin_matches(origin)
-                if not matched:
-                    return False, False
-                return True, self._suppress
-            if origin and origin not in self._general_kb_handles:
-                return True, self._suppress
-            return True, False
-
-        is_numlock = (
-            vk == VK_NUMLOCK or name == "NumLock" or (scan == 0x45 and not extended)
-        )
-        if is_numlock:
-            # Swallowing the keypad's NumLock stays mandatory regardless of
-            # Exclusive Mode (passing it through would toggle the M-Tech
-            # hardware into navigation mode), but a keystroke proven to come
-            # from a general keyboard must reach the OS untouched.
-            if self._target_device:
-                if not origin:
-                    return True, True
-                matched = self._origin_matches(origin)
-                return matched, matched
-            if origin and origin in self._general_kb_handles:
-                return False, False
-            return True, True
+                    return False
+                return self._origin_matches(origin) and bool(self._suppress)
+            return (
+                bool(origin)
+                and origin not in self._general_kb_handles
+                and bool(self._suppress)
+            )
 
         if self._target_device:
             if not origin:
-                # No Raw Input origin data yet (app just started / WM_INPUT
-                # sink failure): queue the MIDI event so the app stays
-                # functional, but leave the OS keystroke alone rather than
-                # risk eating another keyboard.
-                return True, False
-            matched = self._origin_matches(origin)
-            if not matched:
-                return False, False
-            # v1.6 passed the keypad's Tab/Backspace through to the OS; since
-            # swallowing is device-gated (v1.9.x) they are swallowed like
-            # every other keypad key (VK_BACK/VK_TAB in the swallow list), so
-            # Backspace/Tab never reach DAW shortcuts.
-            return True, self._suppress
+                # Strict device isolation: an unattributed keystroke is never
+                # blocked (it could belong to the laptop), and its MIDI comes
+                # from the exact-match WM_INPUT channel anyway.
+                return False
+            return self._origin_matches(origin) and bool(self._suppress)
 
         # "All Connected Keypads (Default)" mode:
         if not origin:
-            # No Raw Input origin data yet (app just started / first keystroke
-            # ever for this key): queue the MIDI event so the app stays
-            # functional, but leave the OS keystroke alone rather than risk
-            # eating a typing keyboard.
-            return True, False
+            return False
         if origin in self._general_kb_handles:
-            # General typing keyboard (e.g. the laptop's built-in one): play
-            # MIDI as v1.6 did, but never swallow the OS keystroke.
-            return True, False
-        return True, self._suppress
+            # General typing keyboard (e.g. the laptop's built-in one): the
+            # OS keystroke is never swallowed (WM_INPUT still plays MIDI as
+            # v1.6 did).
+            return False
+        return bool(self._suppress)
+
+    def _ll_handle_event(
+        self, name: str, vk: int, scan: int, extended: bool, now: float, is_down: bool
+    ) -> bool:
+        """Handle one WH_KEYBOARD_LL event; returns True to swallow (return 1).
+
+        WM_INPUT owns the MIDI generation for every Raw Input trackable key
+        (exact ``hDevice`` match in ``_process_raw_keyboard``); the LL channel
+        only swallows device-correlated keypad keystrokes. The sole exception
+        is the multimedia launcher keys (Browser Home/Search, Mail, Calc):
+        they are HID Consumer Control events that never emit RIM_TYPEKEYBOARD
+        WM_INPUT packets, so the LL channel is their only MIDI source. The
+        dedicated Home key of a normal keyboard (VK_HOME + E0, scancode 0x47)
+        IS Raw Input trackable and is deliberately excluded from that branch
+        so it stays device-gated like every other key.
+        """
+        if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
+            self._queue_from_ll(name, is_down, vk, scan)
+            return True
+        return self._ll_should_swallow(name, vk, scan, extended, now)
 
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
         """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
@@ -1484,6 +1487,13 @@ class KeyHook:
             item for item in self._pending_raw_dedup if now - item[2] < 0.050
         ]
         if not matched:
+            # Strict device isolation: only the exact selected device (UI
+            # dropdown) generates MIDI here; every other keyboard - e.g. the
+            # laptop's built-in one - is dropped by its Raw Input handle.
+            logger.debug(
+                "WM_INPUT dropped: hDevice=0x%X vk=0x%02X scan=0x%02X does not "
+                "match target %r", h_device, vk, scan, self._target_device,
+            )
             return False
         is_down = not bool(flags & RI_KEY_BREAK)
         name = win_key_name(vk, scan, extended, keypad_verified=bool(self._target_device))
@@ -1679,12 +1689,12 @@ class KeyHook:
                             )
                             if name is not None:
                                 is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
-                                queue_key, swallow = self._ll_decide(
-                                    name, vk_code, scan_code, extended, now
-                                )
-                                if queue_key:
-                                    self._queue_from_ll(name, is_down, vk_code, scan_code)
-                                if swallow:
+                                # Device-aware swallow decision. WM_INPUT owns
+                                # the MIDI generation for trackable keys (exact
+                                # hDevice match); the LL channel only swallows.
+                                if self._ll_handle_event(
+                                    name, vk_code, scan_code, extended, now, is_down
+                                ):
                                     return 1
                                 # Not swallowed: fall through so the OS receives the key.
                 except Exception as exc:

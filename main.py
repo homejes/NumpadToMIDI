@@ -1100,17 +1100,18 @@ def selftest() -> int:
             )
             try:
                 now = time.perf_counter()
+                hook.set_target_device("")  # deterministic All-mode baseline
                 hook._general_kb_handles.add(4242)  # fake "laptop" handle
                 hook._raw_last_by_key[(0x60, False)] = (4242, now)
                 hook._raw_recent_hdevice = 4242
                 hook._raw_recent_ts = now
-                # All mode: MIDI still fires (v1.6 parity) but the OS
+                # All mode: WM_INPUT still plays MIDI (v1.6 parity) but the OS
                 # keystroke passes through untouched.
-                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (True, False)
+                assert hook._ll_should_swallow("0", 0x60, 0x52, False, now) is False
                 # Specific target: an unmatched laptop origin is completely
-                # ignored (MIDI off, OS keystroke passes through).
+                # ignored (no MIDI, no swallow - WM_INPUT owns MIDI).
                 hook.set_target_device(r"HID\VID_FAKE&PID_0001")
-                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, False)
+                assert hook._ll_should_swallow("0", 0x60, 0x52, False, now) is False
                 # NumLock-OFF navigational variants (v1.9.2): the keypad's '2'
                 # arriving as VK_DOWN (E0) maps to "2" by physical scancode
                 # and is swallowed; an unmatched (laptop) origin passes through.
@@ -1119,24 +1120,25 @@ def selftest() -> int:
                 hook._raw_recent_hdevice = 4343
                 hook._raw_recent_ts = now
                 assert hook._ll_resolve_name(0x28, 0x50, True, 4343, True) == "2"
-                assert hook._ll_decide("2", 0x28, 0x50, True, now) == (True, True)
+                assert hook._ll_should_swallow("2", 0x28, 0x50, True, now) is True
                 hook._raw_last_by_key[(0x28, True)] = (4242, now)
                 hook._raw_recent_hdevice = 4242
                 hook._raw_recent_ts = now
                 assert hook._ll_resolve_name(0x28, 0x50, True, 4242, False) is None
-                assert hook._ll_decide("2", 0x28, 0x50, True, now) == (False, False)
-                # Numpad Enter (v1.9.3): swallowed for the keypad, while the
-                # laptop's main Enter (non-extended 0x1C) passes through.
+                assert hook._ll_should_swallow("2", 0x28, 0x50, True, now) is False
+                # Numpad Enter (v1.9.4): the E0-extended keypad Enter is
+                # swallowed, while the laptop's main Enter (non-extended
+                # VK_RETURN) is NEVER swallowed (extended-flag guard).
                 hook._raw_last_by_key[(0x0D, True)] = (4343, now)
                 hook._raw_recent_hdevice = 4343
                 hook._raw_recent_ts = now
                 assert hook._ll_resolve_name(0x0D, 0x1C, True, 4343, True) == "Enter"
-                assert hook._ll_decide("Enter", 0x0D, 0x1C, True, now) == (True, True)
+                assert hook._ll_should_swallow("Enter", 0x0D, 0x1C, True, now) is True
                 hook._raw_last_by_key[(0x0D, False)] = (4242, now)
                 hook._raw_recent_hdevice = 4242
                 hook._raw_recent_ts = now
                 assert hook._ll_resolve_name(0x0D, 0x1C, False, 4242, False) is None
-                assert hook._ll_decide("Enter", 0x0D, 0x1C, False, now) == (False, False)
+                assert hook._ll_should_swallow("Enter", 0x0D, 0x1C, False, now) is False
             finally:
                 hook.set_target_device(saved_state[5])
                 hook._raw_last_by_key.clear()
