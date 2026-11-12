@@ -1125,6 +1125,18 @@ def selftest() -> int:
                 hook._raw_recent_ts = now
                 assert hook._ll_resolve_name(0x28, 0x50, True, 4242, False) is None
                 assert hook._ll_decide("2", 0x28, 0x50, True, now) == (False, False)
+                # Numpad Enter (v1.9.3): swallowed for the keypad, while the
+                # laptop's main Enter (non-extended 0x1C) passes through.
+                hook._raw_last_by_key[(0x0D, True)] = (4343, now)
+                hook._raw_recent_hdevice = 4343
+                hook._raw_recent_ts = now
+                assert hook._ll_resolve_name(0x0D, 0x1C, True, 4343, True) == "Enter"
+                assert hook._ll_decide("Enter", 0x0D, 0x1C, True, now) == (True, True)
+                hook._raw_last_by_key[(0x0D, False)] = (4242, now)
+                hook._raw_recent_hdevice = 4242
+                hook._raw_recent_ts = now
+                assert hook._ll_resolve_name(0x0D, 0x1C, False, 4242, False) is None
+                assert hook._ll_decide("Enter", 0x0D, 0x1C, False, now) == (False, False)
             finally:
                 hook.set_target_device(saved_state[5])
                 hook._raw_last_by_key.clear()

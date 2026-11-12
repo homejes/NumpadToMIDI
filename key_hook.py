@@ -243,6 +243,11 @@ _NUMPAD_SWALLOW_VKS = frozenset(
     {
         *range(VK_NUMPAD0, VK_NUMPAD0 + 10),  # VK_NUMPAD0..9 (NumLock ON digits)
         VK_MULTIPLY, VK_ADD, VK_SUBTRACT, VK_DECIMAL, VK_DIVIDE,  # NumLock ON operators
+        # Physical keypad keys whose Virtual Keys are shared with the main
+        # keyboard (device-gated swallowing keeps the laptop's keys alive):
+        VK_RETURN,  # Numpad Enter (E0 0x1C; plain-Return keypads send 0x1C) - Cubase "Play"
+        VK_BACK,    # Numpad Backspace (scan 0x0E)
+        VK_TAB,     # Numpad Tab (scan 0x0F) - DAW transport/track shortcuts
         # NumLock OFF navigational equivalents of the same physical keys:
         VK_INSERT,  # Numpad 0
         VK_END,     # Numpad 1
@@ -257,6 +262,13 @@ _NUMPAD_SWALLOW_VKS = frozenset(
         VK_DELETE,  # Numpad .
     }
 )
+# Device-gated scancode overrides for keypad keys whose scancode is missing
+# from the pure OEM table above (adding it there would map the laptop's main
+# keys everywhere and fire MIDI from them in All mode). Consulted only when
+# the Raw Input origin is verified as the selected keypad.
+_WIN_KEYPAD_SCAN_OVERRIDES: dict[int, str] = {
+    0x1C: "Enter",  # Numpad Enter (E0 0x1C); plain-Return keypads send 0x1C non-extended
+}
 _MAPVK_VSC_TO_VK = 1
 _ALWAYS_SUPPRESS_KEYS = frozenset({"Home", "Email", "Calc"})
 
@@ -1348,7 +1360,9 @@ class KeyHook:
             keypad_verified=origin_matched and bool(self._target_device),
         )
         if vk in _NUMPAD_SWALLOW_VKS and self._ll_nav_origin_verified(origin):
-            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(scan)
+            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(
+                scan
+            ) or _WIN_KEYPAD_SCAN_OVERRIDES.get(scan)
             if nav_name:
                 name = nav_name
         return name
@@ -1420,10 +1434,10 @@ class KeyHook:
             matched = self._origin_matches(origin)
             if not matched:
                 return False, False
-            if name in ("Tab", "Backspace"):
-                # v1.6 behaviour: the keypad's Tab/Backspace keys pass through
-                # to the OS; their MIDI events arrive via the WM_INPUT channel.
-                return False, False
+            # v1.6 passed the keypad's Tab/Backspace through to the OS; since
+            # swallowing is device-gated (v1.9.x) they are swallowed like
+            # every other keypad key (VK_BACK/VK_TAB in the swallow list), so
+            # Backspace/Tab never reach DAW shortcuts.
             return True, self._suppress
 
         # "All Connected Keypads (Default)" mode:
@@ -1480,7 +1494,9 @@ class KeyHook:
             # map by the constant physical scancode so the correct MIDI note
             # fires via WM_INPUT too, regardless of the VK Windows translated.
             # Flagged general keyboards (the laptop) are never overridden.
-            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(scan)
+            nav_name = _WIN_OEM_SCANCODES_NON_EXTENDED.get(
+                scan
+            ) or _WIN_KEYPAD_SCAN_OVERRIDES.get(scan)
             if nav_name:
                 name = nav_name
         if name is None:

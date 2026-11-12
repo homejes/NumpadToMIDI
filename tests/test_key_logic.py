@@ -993,15 +993,71 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         queue, swallow = self.hook._ll_decide("0", 0x60, 0x52, False, time.perf_counter())
         self.assertEqual((queue, swallow), (True, False))
 
-    def test_specific_target_tab_backspace_pass_through(self):
+    def test_keypad_enter_backspace_tab_swallowed_laptop_versions_pass(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
-        self.hook._raw_last_by_key[(0x09, False)] = (self.KEYPAD_H, now)
-        queue, swallow = self.hook._ll_decide("Tab", 0x09, 0x0F, False, now)
-        self.assertEqual((queue, swallow), (False, False))
+        # Keypad Enter (E0 0x1C) -> MIDI "Enter", swallowed (Cubase Play fix).
+        self.hook._raw_last_by_key[(0x0D, True)] = (self.KEYPAD_H, now)
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
+        name = self.hook._ll_resolve_name(0x0D, 0x1C, True, self.KEYPAD_H, True)
+        self.assertEqual(name, "Enter")
+        self.assertEqual(self.hook._ll_decide(name, 0x0D, 0x1C, True, now), (True, True))
+        # Keypad Backspace / Tab: swallowed now (device-gated); v1.6 passed
+        # them through, which leaked into DAW shortcuts.
         self.hook._raw_last_by_key[(0x08, False)] = (self.KEYPAD_H, now)
-        queue, swallow = self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now)
-        self.assertEqual((queue, swallow), (False, False))
+        self.assertEqual(
+            self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now), (True, True)
+        )
+        self.hook._raw_last_by_key[(0x09, False)] = (self.KEYPAD_H, now)
+        self.assertEqual(
+            self.hook._ll_decide("Tab", 0x09, 0x0F, False, now), (True, True)
+        )
+        # The laptop's main Enter (non-extended 0x1C), Backspace and Tab are
+        # NOT swallowed (unmatched origin) and stay unmapped for MIDI.
+        self.hook._raw_last_by_key[(0x0D, False)] = (self.LAPTOP_H, now)
+        self.hook._raw_recent_hdevice = self.LAPTOP_H
+        self.hook._raw_recent_ts = now
+        self.assertIsNone(
+            self.hook._ll_resolve_name(0x0D, 0x1C, False, self.LAPTOP_H, False)
+        )
+        self.assertEqual(
+            self.hook._ll_decide("Enter", 0x0D, 0x1C, False, now), (False, False)
+        )
+        self.hook._raw_last_by_key[(0x08, False)] = (self.LAPTOP_H, now)
+        self.assertEqual(
+            self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now), (False, False)
+        )
+        self.hook._raw_last_by_key[(0x09, False)] = (self.LAPTOP_H, now)
+        self.assertEqual(
+            self.hook._ll_decide("Tab", 0x09, 0x0F, False, now), (False, False)
+        )
+        # All mode: the keypad's Enter is still swallowed.
+        self.hook.set_target_device("")
+        self.hook._raw_last_by_key[(0x0D, True)] = (self.KEYPAD_H, now)
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
+        self.assertEqual(
+            self.hook._ll_decide("Enter", 0x0D, 0x1C, True, now), (True, True)
+        )
+
+    def test_plain_return_keypad_enter_synthesized_and_swallowed(self):
+        # Some USB keypads send their Enter as the plain Return HID usage
+        # (non-extended 0x1C) - it must still map to "Enter" and be swallowed.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        self.hook._raw_last_by_key[(0x0D, False)] = (self.KEYPAD_H, now)
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
+        name = self.hook._ll_resolve_name(0x0D, 0x1C, False, self.KEYPAD_H, True)
+        self.assertEqual(name, "Enter")
+        self.assertEqual(self.hook._ll_decide(name, 0x0D, 0x1C, False, now), (True, True))
+        # WM_INPUT path queues it with the scancode-derived name as well.
+        before = self.hook._win_queue.qsize()
+        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, 0x0D, 0x1C, 0))
+        self.assertEqual(self.hook._win_queue.qsize(), before + 1)
+        queued_name, is_down, vk, scan = self.hook._win_queue.get()
+        self.assertEqual((queued_name, is_down, vk, scan), ("Enter", True, 0x0D, 0x1C))
 
     def test_numlock_from_laptop_passes_and_keypad_numlock_is_swallowed(self):
         self.flag_laptop()
