@@ -186,6 +186,20 @@ _WIN_SCAN_KEYPAD_ZERO = 0x52
 # hardware timing spec.
 _BURST_WINDOW_FLOOR = 0.080
 
+# --- Raw Input origin correlation (WH_KEYBOARD_LL x WM_INPUT) -------------------
+# The WH_KEYBOARD_LL callback for a keystroke always runs BEFORE the matching
+# WM_INPUT is processed on the pump thread, so the origin device of the event
+# being reported must be correlated from earlier Raw Input data:
+#   1. Per-key memory: which hDevice last produced THIS (vk, extended) key.
+#   2. Active-device fallback: the hDevice of the most recent WM_INPUT of any
+#      key (drum cadences and typing bursts keep this window hot).
+# A Raw Input handle that has ever sent a general typing key (A-Z / Space) is
+# flagged as a general keyboard so keystrokes proven to come from it (e.g. the
+# laptop's built-in keyboard) are never swallowed.
+_RAW_KEY_TTL = 10.0     # seconds a per-key origin memory stays valid
+_RAW_RECENT_TTL = 1.0   # seconds the active-device fallback window stays hot
+_GENERAL_KB_VKS = frozenset([*range(0x41, 0x5B), 0x20])  # A-Z + Space
+
 # Extended scan codes:
 _WIN_OEM_SCANCODES_EXTENDED: dict[int, str] = {
     0x35: "/",          # Numpad /
@@ -1114,6 +1128,16 @@ class KeyHook:
         self._last_raw_time: float = 0.0
         self._pending_raw_dedup: list[tuple[str, bool, float]] = []
 
+        # Raw Input origin correlation state (device-aware WH_KEYBOARD_LL
+        # suppression). Only touched from the hook pump thread - the WM_INPUT
+        # handler and the LL callback run sequentially on that one thread -
+        # and from unit tests, so no locking is required.
+        self._raw_last_by_key: dict[tuple[int, bool], tuple[int, float]] = {}
+        self._raw_recent_hdevice: int = 0
+        self._raw_recent_ts: float = 0.0
+        self._general_kb_handles: set[int] = set()
+        self._matched_handle_cache: dict[int, bool] = {}
+
         # Non-Windows fallback listener & macOS native IOHIDManager / CGEventTap state
         self._listener = None
         self._mac_thread: Optional[threading.Thread] = None
@@ -1151,6 +1175,7 @@ class KeyHook:
             self._target_device = (device_id or "").strip()
             self._rebuild_target_handles()
             self._last_raw_matched = True
+            self._rebuild_matched_handle_cache()
 
     def refresh_devices(self) -> list[KeyboardDevice]:
         """Re-enumerate connected keyboard/keypad devices via Win32 Raw Input API."""
@@ -1162,7 +1187,14 @@ class KeyHook:
                 for h in dev.handles:
                     self._device_by_handle[h] = dev
             self._rebuild_target_handles()
+            self._rebuild_matched_handle_cache()
         return list(devices)
+
+    def _rebuild_matched_handle_cache(self) -> None:
+        """Refresh the matched-state cache used by the WH_KEYBOARD_LL hot path."""
+        self._matched_handle_cache = {
+            h: self.matches_device(h) for h in list(self._device_by_handle)
+        }
 
     def _rebuild_target_handles(self) -> None:
         self._target_handles.clear()
@@ -1206,6 +1238,116 @@ class KeyHook:
                     return True
             return False
 
+    def _origin_matches(self, h_device: int) -> bool:
+        """Matched-state for a tracked Raw Input origin handle (LL hot path).
+
+        ``h_device`` normally comes from WM_INPUT tracking, whose handler keeps
+        ``_matched_handle_cache`` current; unknown handles fall back to a full
+        device match.
+        """
+        if not h_device:
+            return False
+        if not self._target_device:
+            return True
+        cached = self._matched_handle_cache.get(h_device)
+        if cached is None:
+            cached = self.matches_device(h_device)
+            self._matched_handle_cache[h_device] = cached
+        return cached
+
+    def _ll_origin_device(self, vk: int, extended: bool, now: float) -> int:
+        """Best-effort ``hDevice`` of the keystroke WH_KEYBOARD_LL is reporting.
+
+        The LL callback always fires before the matching WM_INPUT is processed,
+        so the origin is correlated from earlier Raw Input data: the per-key
+        memory wins, unless a flagged general keyboard (the user actively
+        typing) is hot in the active-device window - then that device wins, so
+        a stale per-key record cannot swallow keystrokes of a device switch.
+        Returns 0 when the origin cannot be correlated at all.
+        """
+        entry = self._raw_last_by_key.get((vk, bool(extended)))
+        if entry and (now - entry[1]) <= _RAW_KEY_TTL:
+            key_device = entry[0]
+            if (
+                self._raw_recent_ts > 0.0
+                and (now - self._raw_recent_ts) <= _RAW_RECENT_TTL
+                and key_device != self._raw_recent_hdevice
+                and self._raw_recent_hdevice in self._general_kb_handles
+            ):
+                return self._raw_recent_hdevice
+            return key_device
+        if self._raw_recent_ts > 0.0 and (now - self._raw_recent_ts) <= _RAW_RECENT_TTL:
+            return self._raw_recent_hdevice
+        return 0
+
+    def _ll_decide(
+        self, name: str, vk: int, scan: int, extended: bool, now: float
+    ) -> tuple[bool, bool]:
+        """Decide (queue_for_midi, swallow) for a WH_KEYBOARD_LL event.
+
+        ``swallow`` means the hook returns 1 so the OS never sees the
+        keystroke; it is only True for keys correlated (via Raw Input origin
+        tracking) with the selected USB keypad. Keys from any other keyboard
+        fall through to ``CallNextHookEx`` untouched.
+        """
+        # Multimedia launcher keys (Browser Home/Search, Mail, Calc) never emit
+        # RIM_TYPEKEYBOARD WM_INPUT packets, so no Raw Input origin can ever be
+        # correlated for them; they keep the unconditional swallow or the
+        # M-Tech's top-row keys would launch Calculator/Mail. The dedicated
+        # Home key of a normal keyboard (VK_HOME + E0, scancode 0x47) IS Raw
+        # Input trackable and is deliberately excluded here so it is
+        # device-gated like every other key.
+        if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
+            return True, True
+
+        origin = self._ll_origin_device(vk, extended, now)
+
+        is_numlock = (
+            vk == VK_NUMLOCK or name == "NumLock" or (scan == 0x45 and not extended)
+        )
+        if is_numlock:
+            # Swallowing the keypad's NumLock stays mandatory regardless of
+            # Exclusive Mode (passing it through would toggle the M-Tech
+            # hardware into navigation mode), but a keystroke proven to come
+            # from a general keyboard must reach the OS untouched.
+            if self._target_device:
+                if not origin:
+                    return True, True
+                matched = self._origin_matches(origin)
+                return matched, matched
+            if origin and origin in self._general_kb_handles:
+                return False, False
+            return True, True
+
+        if self._target_device:
+            if not origin:
+                # No Raw Input origin data yet (app just started / WM_INPUT
+                # sink failure): queue the MIDI event so the app stays
+                # functional, but leave the OS keystroke alone rather than
+                # risk eating another keyboard.
+                return True, False
+            matched = self._origin_matches(origin)
+            if not matched:
+                return False, False
+            if name in ("Tab", "Backspace"):
+                # v1.6 behaviour: the keypad's Tab/Backspace keys pass through
+                # to the OS; their MIDI events arrive via the WM_INPUT channel.
+                return False, False
+            return True, self._suppress
+
+        # "All Connected Keypads (Default)" mode:
+        if not origin:
+            # No Raw Input origin data yet (app just started / first keystroke
+            # ever for this key): queue the MIDI event so the app stays
+            # functional, but leave the OS keystroke alone rather than risk
+            # eating a typing keyboard.
+            return True, False
+        if origin in self._general_kb_handles:
+            # General typing keyboard (e.g. the laptop's built-in one): play
+            # MIDI as v1.6 did, but never swallow the OS keystroke.
+            return True, False
+        return True, self._suppress
+
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
         """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
         now = time.perf_counter()
@@ -1220,7 +1362,16 @@ class KeyHook:
     def _process_raw_keyboard(self, h_device: int, vk: int, scan: int, flags: int) -> bool:
         """Filter and dispatch a Win32 RAWKEYBOARD event by its ``hDevice``."""
         now = time.perf_counter()
+        h_device = int(h_device)
+        extended = bool(flags & RI_KEY_E0)
+        # --- Raw Input origin tracking (runs for EVERY device, matched or not) ---
+        self._raw_last_by_key[(vk, extended)] = (h_device, now)
+        self._raw_recent_hdevice = h_device
+        self._raw_recent_ts = now
+        if vk in _GENERAL_KB_VKS:
+            self._general_kb_handles.add(h_device)
         matched = self.matches_device(h_device)
+        self._matched_handle_cache[h_device] = matched
         self._last_raw_hdevice = h_device
         self._last_raw_matched = matched
         self._last_raw_time = now
@@ -1229,7 +1380,6 @@ class KeyHook:
         ]
         if not matched:
             return False
-        extended = bool(flags & RI_KEY_E0)
         is_down = not bool(flags & RI_KEY_BREAK)
         name = win_key_name(vk, scan, extended, keypad_verified=bool(self._target_device))
         if name is None:
@@ -1401,51 +1551,28 @@ class KeyHook:
                             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                             extended = bool(kb.flags & _LLKHF_EXTENDED)
                             vk_code = int(kb.vkCode)
+                            scan_code = int(kb.scanCode)
+                            now = time.perf_counter()
+                            # Correlate this event with Raw Input (WM_INPUT) device
+                            # tracking, then apply the device-aware decision.
+                            origin = self._ll_origin_device(vk_code, extended, now)
+                            origin_matched = self._origin_matches(origin) if origin else False
                             name = win_key_name(
                                 vk_code,
-                                int(kb.scanCode),
+                                scan_code,
                                 extended,
-                                keypad_verified=bool(self._target_device and self._last_raw_matched),
+                                keypad_verified=origin_matched and bool(self._target_device),
                             )
                             if name is not None:
                                 is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
-                                if name in _ALWAYS_SUPPRESS_KEYS:
-                                    # Multimedia launcher keys (VK_BROWSER_HOME 0xAC,
-                                    # VK_BROWSER_SEARCH 0xAA, VK_LAUNCH_MAIL 0xB4,
-                                    # VK_LAUNCH_APP1 0xB6, VK_LAUNCH_APP2 0xB7) are HID
-                                    # Consumer Control events that do not emit RIM_TYPEKEYBOARD
-                                    # WM_INPUT packets and will launch Chrome/Mail/Calc if
-                                    # either key-down or key-up reaches CallNextHookEx.
-                                    self._queue_from_ll(name, is_down, vk_code, int(kb.scanCode))
+                                queue_key, swallow = self._ll_decide(
+                                    name, vk_code, scan_code, extended, now
+                                )
+                                if queue_key:
+                                    self._queue_from_ll(name, is_down, vk_code, scan_code)
+                                if swallow:
                                     return 1
-
-                                # Immediate Suppression of VK_NUMLOCK from USB Keypad:
-                                # When an event arrives from the selected USB Keypad and vkCode == 0x90 (VK_NUMLOCK):
-                                # Instantly swallow it (return 1) in WH_KEYBOARD_LL. Never pass it to CallNextHookEx.
-                                # Do NOT let the physical button toggle the hardware into navigation mode.
-                                is_numlock = (vk_code == VK_NUMLOCK) or (name == "NumLock") or (int(kb.scanCode) == 0x45 and not extended)
-                                if is_numlock:
-                                    if not self._target_device or self._last_raw_matched:
-                                        self._queue_from_ll("NumLock", is_down, vk_code, int(kb.scanCode))
-                                        return 1
-
-                                if not self._target_device:
-                                    # "All Connected Keypads (Default)" mode:
-                                    # Dispatch immediately and suppress if Exclusive Mode is on
-                                    # (this also swallows keypad VK_INSERT when NumLock is OFF,
-                                    # so the '000' burst never toggles Insert/Overtype mode).
-                                    self._queue_from_ll(name, is_down, vk_code, int(kb.scanCode))
-                                    if self._suppress:
-                                        return 1
-                                else:
-                                    # Specific USB keypad selected:
-                                    # Suppress and dispatch in _ll_proc when matched or when it's keypad 0/Insert
-                                    # (non-extended scancode 0x52 or VK_NUMPAD0) so '000' burst is never leaked.
-                                    is_keypad_zero = (int(kb.scanCode) == 0x52 and not extended) or (vk_code == VK_NUMPAD0)
-                                    if (self._last_raw_matched or is_keypad_zero) and name not in ("Tab", "Backspace"):
-                                        self._queue_from_ll(name, is_down, vk_code, int(kb.scanCode))
-                                        if self._suppress:
-                                            return 1
+                                # Not swallowed: fall through so the OS receives the key.
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
                 return int(_user32.CallNextHookEx(self._win_hook_handle, nCode, wParam, lParam))

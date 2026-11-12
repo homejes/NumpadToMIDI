@@ -10,7 +10,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - Physical **M-Tech 23-key layout**: `Home` (`VK_BROWSER_HOME` / `0xAC`), `Tab`, `Email` (`0xB4`),
   `Calc` (`0xB7`), `NumLock`, `/`, `*`, `Backspace`, `0-9`, `.`, `000`, `+`, `-`, and a
   2-row tall `Enter` key.
-- **Target USB Keypad selector (Win32 Raw Input API)**: choose `"All Connected Keypads (Default)"` or lock NumpadToMIDI to a specific external USB keypad (`HID\VID_xxxx&PID_xxxx`) so your primary laptop/desktop keyboard is unaffected.
+- **Target USB Keypad selector (Win32 Raw Input API)**: choose `"All Connected Keypads (Default)"` or lock NumpadToMIDI to a specific external USB keypad (`HID\VID_xxxx&PID_xxxx`). Raw Input (`WM_INPUT`) device-origin correlation tags every `WH_KEYBOARD_LL` keystroke with the hardware device that produced it, so **only the selected keypad's keys are swallowed** — keys from any other keyboard (e.g. the laptop's built-in one, including its `0`/`Insert` key) pass through to the OS untouched in both modes.
 - **Exclusive Mode (Block OS Keystrokes)** enabled by default: intercepts and swallows keypad
   and multimedia keys (`VK_BROWSER_HOME`, `VK_LAUNCH_MAIL`, `VK_LAUNCH_APP2`, `VK_BACK`, digits)
   in `WH_KEYBOARD_LL` (`return 1`) so Chrome, Mail, or Calculator never launch and DAW text
@@ -29,7 +29,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - macOS: native **virtual MIDI source** called `NumpadToMIDI` with native builds for both Intel (`x86_64`) and Apple Silicon (`arm64`).
 - Windows: creates a virtual MIDI port called **`NumpadToMIDI`** directly via the
   [teVirtualMIDI](https://www.tobias-erichsen.de/software/virtualmidi.html) driver
-  (automatically installed by `NumpadToMIDI-Setup-v1.9.exe`). If the driver is not
+  (automatically installed by `NumpadToMIDI-Setup-v1.9.1.exe`). If the driver is not
   present, falls back to any existing loopback port (e.g.
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)), then to the first
   available output, or runs silently if none exists.
@@ -61,22 +61,22 @@ Output: `dist/NumpadToMIDI-Windows.exe` (Windows) or `dist/NumpadToMIDI.app` (ma
 To build the platform installers:
 - **Windows (Inno Setup 6.3+):**
   ```powershell
-  ISCC.exe /DAppVersion=1.9 installer\windows_installer.iss
+  ISCC.exe /DAppVersion=1.9.1 installer\windows_installer.iss
   ```
-  Produces `dist/NumpadToMIDI-Setup-v1.9.exe` (bundles the app, creates Desktop and
+  Produces `dist/NumpadToMIDI-Setup-v1.9.1.exe` (bundles the app, creates Desktop and
   Start Menu shortcuts, elevates to Administrator, and silently downloads + installs
   the `teVirtualMIDI` virtual MIDI driver if missing).
 - **macOS (DMG with `/Applications` link and setup guide):**
   ```bash
-  bash installer/make_dmg.sh 1.9 Intel         # Intel x86_64 Macs
-  bash installer/make_dmg.sh 1.9 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
+  bash installer/make_dmg.sh 1.9.1 Intel         # Intel x86_64 Macs
+  bash installer/make_dmg.sh 1.9.1 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
   ```
-  Produces `dist/NumpadToMIDI-macOS-Intel-v1.9.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v1.9.dmg` (and `dist/NumpadToMIDI-macOS-v1.9.dmg`).
+  Produces `dist/NumpadToMIDI-macOS-Intel-v1.9.1.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v1.9.1.dmg` (and `dist/NumpadToMIDI-macOS-v1.9.1.dmg`).
 
 ## Releases / CI
 `.github/workflows/build-release.yml` builds both platforms on every `v*` tag (and manual
-`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.9.exe`,
-`NumpadToMIDI-macOS-Intel-v1.9.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v1.9.dmg`
+`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v1.9.1.exe`,
+`NumpadToMIDI-macOS-Intel-v1.9.1.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v1.9.1.dmg`
 to the GitHub Release.
 
 ## Notes & limitations
@@ -89,7 +89,8 @@ to the GitHub Release.
   `xattr -dr com.apple.quarantine NumpadToMIDI.app`).
   `Calc`/`Email` keys are not delivered to apps by macOS; those pads work via mouse only.
 - *Exclusive Mode (Block OS Keystrokes)* prevents the numpad from typing into the focused app or
-  launching browser/mail/calculator shortcuts.
+  launching browser/mail/calculator shortcuts. Blocking is device-aware (Windows): keys from
+  your laptop's built-in keyboard — including its `0` key — always reach the OS normally.
 - Settings are stored in `%APPDATA%\NumpadToMIDI\config.json` (Windows) or
   `~/Library/Application Support/NumpadToMIDI/config.json` (macOS); `config.json` in this repo holds the defaults.
 - Diagnostic logs are written to `%TEMP%\NumpadToMIDI.log` and `%APPDATA%\NumpadToMIDI\debug.log`.

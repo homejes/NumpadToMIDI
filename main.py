@@ -1085,6 +1085,42 @@ def selftest() -> int:
             "Quit NumpadToMIDI",
         ]
         assert win.credits.text() == CREDITS_TEXT
+        if sys.platform == "win32":
+            # Raw Input origin correlation (v1.9.1): keystrokes from a general
+            # typing keyboard (the laptop's built-in one) must never be
+            # swallowed by WH_KEYBOARD_LL, in either device mode.
+            hook = ctrl.hook
+            saved_state = (
+                dict(hook._raw_last_by_key),
+                hook._raw_recent_hdevice,
+                hook._raw_recent_ts,
+                set(hook._general_kb_handles),
+                dict(hook._matched_handle_cache),
+                hook._target_device,
+            )
+            try:
+                now = time.perf_counter()
+                hook._general_kb_handles.add(4242)  # fake "laptop" handle
+                hook._raw_last_by_key[(0x60, False)] = (4242, now)
+                hook._raw_recent_hdevice = 4242
+                hook._raw_recent_ts = now
+                # All mode: MIDI still fires (v1.6 parity) but the OS
+                # keystroke passes through untouched.
+                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (True, False)
+                # Specific target: an unmatched laptop origin is completely
+                # ignored (MIDI off, OS keystroke passes through).
+                hook.set_target_device(r"HID\VID_FAKE&PID_0001")
+                assert hook._ll_decide("0", 0x60, 0x52, False, now) == (False, False)
+            finally:
+                hook.set_target_device(saved_state[5])
+                hook._raw_last_by_key.clear()
+                hook._raw_last_by_key.update(saved_state[0])
+                hook._raw_recent_hdevice = saved_state[1]
+                hook._raw_recent_ts = saved_state[2]
+                hook._general_kb_handles.clear()
+                hook._general_kb_handles.update(saved_state[3])
+                hook._matched_handle_cache.clear()
+                hook._matched_handle_cache.update(saved_state[4])
         win.hide()
         lines.append(f"SELFTEST OK ({ctrl.engine.description})")
         ctrl.shutdown()
