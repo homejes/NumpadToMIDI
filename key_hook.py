@@ -491,12 +491,12 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
     if vk == VK_HOME and extended:
         return "Home"
 
-    # 5. NumLock VK check
-    if vk == VK_NUMLOCK:
+    # 5. NumLock VK / scancode check (WH_KEYBOARD_LL sets LLKHF_EXTENDED on VK_NUMLOCK)
+    if vk == VK_NUMLOCK or (scan == 0x45 and vk in (0, 0xFF)):
         return "NumLock"
 
     # 6. VK fallbacks if scan was 0 or unmapped
-    if not extended and vk in _WIN_NUMLOCK_OFF_VK_MAP:
+    if (not extended or keypad_verified) and vk in _WIN_NUMLOCK_OFF_VK_MAP:
         return _WIN_NUMLOCK_OFF_VK_MAP[vk]
 
     return WIN_VK.get(vk)
@@ -1147,6 +1147,8 @@ class KeyHook:
         self._zlast_ts: float = 0.0
         self._last_zero_ts: float = 0.0
         self._zlast_vk: int = 0
+        self._zrepeat_down_ts: float = 0.0
+        self._zorphan_pair_ts: float = 0.0
         self._timer: Optional[threading.Timer] = None
         self._triple_timer: Optional[threading.Timer] = None
         self._triple_ups_left = 0
@@ -1166,6 +1168,7 @@ class KeyHook:
         # handler and the LL callback run sequentially on that one thread -
         # and from unit tests, so no locking is required.
         self._raw_last_by_key: dict[tuple[int, bool], tuple[int, float]] = {}
+        self._raw_last_by_scan: dict[tuple[int, bool], tuple[int, float]] = {}
         self._raw_recent_hdevice: int = 0
         self._raw_recent_ts: float = 0.0
         self._general_kb_handles: set[int] = set()
@@ -1306,17 +1309,31 @@ class KeyHook:
             self._matched_handle_cache[h_device] = cached
         return cached
 
-    def _ll_origin_device(self, vk: int, extended: bool, now: float) -> int:
+    def _ll_origin_device(
+        self, vk: int, extended: bool, now: float, scan: int = 0
+    ) -> int:
         """Best-effort ``hDevice`` of the keystroke WH_KEYBOARD_LL is reporting.
 
         The LL callback always fires before the matching WM_INPUT is processed,
         so the origin is correlated from earlier Raw Input data: the per-key
-        memory wins unless another device was active more recently (or a
-        flagged general keyboard is hot in the active-device window), so a
-        stale per-key record cannot swallow keystrokes after a device switch.
-        Returns 0 when the origin cannot be correlated at all.
+        (or per-scancode) memory wins unless another device was active more
+        recently (or a flagged general keyboard is hot in the active-device
+        window), so a stale per-key record cannot swallow keystrokes after a
+        device switch. Returns 0 when the origin cannot be correlated at all.
         """
-        entry = self._raw_last_by_key.get((vk, bool(extended)))
+        ext = bool(extended)
+        entry = self._raw_last_by_key.get((vk, ext))
+        if not (entry and (now - entry[1]) <= _RAW_KEY_TTL):
+            # Windows WH_KEYBOARD_LL sets LLKHF_EXTENDED on VK_NUMLOCK (0x90,
+            # scan 0x45) whereas WM_INPUT (RAWKEYBOARD) reports Flags=0
+            # (non-extended). Also correlate by hardware scancode when NumLock
+            # state toggles between VK_NUMPAD0..9 and VK_INSERT/nav VKs.
+            if vk == VK_NUMLOCK or scan == 0x45:
+                entry = self._raw_last_by_key.get((VK_NUMLOCK, not ext))
+            if not (entry and (now - entry[1]) <= _RAW_KEY_TTL) and scan > 0:
+                entry = self._raw_last_by_scan.get((scan, ext))
+                if not (entry and (now - entry[1]) <= _RAW_KEY_TTL) and scan == 0x45:
+                    entry = self._raw_last_by_scan.get((scan, not ext))
         if entry and (now - entry[1]) <= _RAW_KEY_TTL:
             key_device, key_ts = entry
             if (
@@ -1335,27 +1352,40 @@ class KeyHook:
             ):
                 if (now - self._raw_recent_ts) <= _RAW_RECENT_TTL:
                     return self._raw_recent_hdevice
+                if self._origin_matches(self._raw_recent_hdevice):
+                    return self._raw_recent_hdevice
                 return 0
             return key_device
-        if self._raw_recent_ts > 0.0 and (now - self._raw_recent_ts) <= _RAW_RECENT_TTL:
-            return self._raw_recent_hdevice
+        if self._raw_recent_ts > 0.0:
+            if (now - self._raw_recent_ts) <= _RAW_RECENT_TTL:
+                return self._raw_recent_hdevice
+            # Keep target keypad correlation alive while the selected USB
+            # keypad remains the most recently used keyboard on the system.
+            if self._origin_matches(self._raw_recent_hdevice):
+                return self._raw_recent_hdevice
         return 0
 
     def _ll_global_swallow(self, vk: int, extended: bool) -> bool:
-        """Return True if (vk, extended) is an unambiguous numpad key that must
-        be aggressively swallowed when originating from the selected target USB
-        keypad with Exclusive Mode enabled.
+        """Return True if (vk, extended) is a numpad key (NumLock ON or OFF)
+        that must be aggressively swallowed when originating from the selected
+        target USB keypad with Exclusive Mode enabled.
 
         Covered: ``VK_NUMPAD0-9``, ``VK_MULTIPLY``, ``VK_ADD``, ``VK_SUBTRACT``,
-        ``VK_DIVIDE``, ``VK_DECIMAL``, and ``VK_RETURN`` with ``LLKHF_EXTENDED``
-        (E0 0x1C = Numpad Enter). The main Enter (non-extended ``VK_RETURN``)
-        and normal typing keys (``VK_0-9``, ``VK_OEM_PLUS``, ``A-Z``) are never
-        in this set.
+        ``VK_DIVIDE``, ``VK_DECIMAL``, ``VK_RETURN`` with ``LLKHF_EXTENDED``
+        (E0 0x1C = Numpad Enter), and all NumLock-OFF navigational VKs
+        (``VK_INSERT``, ``VK_DELETE``, ``VK_END``, ``VK_DOWN``, ``VK_NEXT``,
+        ``VK_LEFT``, ``VK_CLEAR``, ``VK_RIGHT``, ``VK_HOME``, ``VK_UP``,
+        ``VK_PRIOR``). The main Enter (non-extended ``VK_RETURN``) and normal
+        typing keys (``VK_0-9``, ``VK_OEM_PLUS``, ``A-Z``) are never in this set.
         """
         if not (self._target_device and self._suppress):
             return False
         if vk == VK_RETURN:
             return bool(extended)
+        if vk == VK_INSERT:
+            return True
+        if vk in _WIN_NUMLOCK_OFF_VKS:
+            return not bool(extended)
         return vk in _GLOBAL_SWALLOW_VKS
 
     def _ll_decide(
@@ -1363,16 +1393,19 @@ class KeyHook:
     ) -> tuple[bool, bool]:
         """Decide (queue_for_midi, swallow) for a WH_KEYBOARD_LL event.
 
-        v2.0 strict hardware device isolation:
+        v2.0.1 strict hardware device isolation:
         - If no target USB keypad is selected, return (False, False).
         - If the key originates from ANY OTHER device (laptop keyboard, other
           USB keyboard) or its origin is unproven, return (False, False) so no
           MIDI is generated and CallNextHookEx passes the keystroke through
           untouched.
         - If the key originates from the SELECTED USB Numpad, queue MIDI and
-          aggressively swallow all numpad numbers (VK_NUMPAD0-9), math
-          operators (VK_ADD, VK_SUBTRACT, VK_MULTIPLY, VK_DIVIDE), VK_DECIMAL,
-          Numpad Enter (VK_RETURN with LLKHF_EXTENDED), and keypad keys.
+          aggressively swallow VK_NUMLOCK (preventing global OS NumLock state
+          toggles), all numpad numbers (VK_NUMPAD0-9), NumLock-OFF navigation
+          keys (VK_INSERT, VK_DELETE, VK_END, VK_DOWN, VK_NEXT, VK_LEFT,
+          VK_CLEAR, VK_RIGHT, VK_HOME, VK_UP, VK_PRIOR), math operators
+          (VK_ADD, VK_SUBTRACT, VK_MULTIPLY, VK_DIVIDE), VK_DECIMAL, and
+          Numpad Enter (VK_RETURN with LLKHF_EXTENDED).
         """
         if not self._target_device:
             # No device selected: the app is completely inert; every keyboard
@@ -1394,16 +1427,18 @@ class KeyHook:
         if name in _ALWAYS_SUPPRESS_KEYS and not (vk == VK_HOME and extended):
             return True, True
 
-        origin = self._ll_origin_device(vk, extended, now)
+        origin = self._ll_origin_device(vk, extended, now, scan)
 
         is_numlock = (
-            vk == VK_NUMLOCK or name == "NumLock" or (scan == 0x45 and not extended)
+            vk == VK_NUMLOCK
+            or name == "NumLock"
+            or (scan == 0x45 and vk in (0, 0xFF, VK_NUMLOCK))
         )
         if is_numlock:
-            # Swallowing the keypad's NumLock stays mandatory (passing it
-            # through would toggle the M-Tech hardware into navigation mode),
-            # but only with a PROVEN keypad origin: an unknown origin or a
-            # foreign keyboard must never eat the laptop's NumLock toggle.
+            # Swallowing the selected target keypad's NumLock is mandatory to
+            # prevent Windows from toggling the global NumLock state (which
+            # affects the laptop keyboard and toggles the keypad hardware into
+            # navigation mode), while foreign/unknown origins are never eaten.
             if not origin:
                 return False, False
             matched = self._origin_matches(origin)
@@ -1446,6 +1481,13 @@ class KeyHook:
         extended = bool(flags & RI_KEY_E0)
         # --- Raw Input origin tracking (runs for EVERY device, matched or not) ---
         self._raw_last_by_key[(vk, extended)] = (h_device, now)
+        if vk == VK_NUMLOCK or scan == 0x45:
+            # WH_KEYBOARD_LL reports VK_NUMLOCK with LLKHF_EXTENDED=1 while
+            # WM_INPUT reports Flags=0; record both so per-key lookup always hits.
+            self._raw_last_by_key[(VK_NUMLOCK, True)] = (h_device, now)
+            self._raw_last_by_key[(VK_NUMLOCK, False)] = (h_device, now)
+        if scan > 0:
+            self._raw_last_by_scan[(scan, extended)] = (h_device, now)
         self._raw_recent_hdevice = h_device
         self._raw_recent_ts = now
         if vk in _GENERAL_KB_VKS:
@@ -1521,6 +1563,8 @@ class KeyHook:
                 self._zbuf.clear()
                 self._zlast_ts = 0.0
                 self._zlast_vk = 0
+                self._zrepeat_down_ts = 0.0
+                self._zorphan_pair_ts = 0.0
                 self._triple_ups_left = 0
                 for name in list(self._down):
                     self._emit(name, False)
@@ -1555,6 +1599,8 @@ class KeyHook:
             self._zbuf.clear()
             self._zlast_ts = 0.0
             self._zlast_vk = 0
+            self._zrepeat_down_ts = 0.0
+            self._zorphan_pair_ts = 0.0
             self._triple_ups_left = 0
             for name in list(self._down):
                 self._emit(name, False)
@@ -1635,8 +1681,16 @@ class KeyHook:
                             now = time.perf_counter()
                             # Correlate this event with Raw Input (WM_INPUT) device
                             # tracking, then apply the device-aware decision.
-                            origin = self._ll_origin_device(vk_code, extended, now)
+                            origin = self._ll_origin_device(vk_code, extended, now, scan_code)
                             origin_matched = self._origin_matches(origin) if origin else False
+                            # Explicitly intercept VK_NUMLOCK (0x90 / scan 0x45) from
+                            # the selected Target USB Keypad and return 1 immediately
+                            # to prevent Windows from toggling the global NumLock state.
+                            if (
+                                vk_code == VK_NUMLOCK
+                                or (scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK))
+                            ) and origin_matched and self._target_device:
+                                return 1
                             name = win_key_name(
                                 vk_code,
                                 scan_code,
@@ -2189,14 +2243,18 @@ class KeyHook:
     # ------------------------------------------------------------- debounce core
     def _dispatch(self, name: str, down: bool, vk: int = 0, scan: int = 0) -> None:
         with self._lock:
-            if name == "0" and self.detect_triple_zero:
-                # Both VK_NUMPAD0 (NumLock ON) and keypad VK_INSERT (NumLock OFF) arrive
-                # here as "0", so mixed or NumLock-OFF bursts share one triplet detector.
-                # ``scan`` is the hardware OEM scancode (0x52 = physical keypad 0), used
-                # for scancode-first burst tracking and diagnostics.
+            is_zero_key = (
+                scan == _WIN_SCAN_KEYPAD_ZERO
+                or vk in (VK_NUMPAD0, VK_INSERT)
+                or name == "0"
+            )
+            if is_zero_key and self.detect_triple_zero:
+                # Track physical '0' bursts by Scancode 0x52 (_WIN_SCAN_KEYPAD_ZERO)
+                # AND by both VK_NUMPAD0 (0x60, NumLock ON) and VK_INSERT (0x2D,
+                # NumLock OFF) so '000' detection works seamlessly in any NumLock state.
                 self._zero_event(down, vk, scan)
             else:
-                self._emit(name, down)
+                self._emit("0" if is_zero_key else name, down)
 
     def _emit(self, name: str, down: bool) -> None:
         """Held-set debounce: exactly one down and one up per press."""
@@ -2263,10 +2321,35 @@ class KeyHook:
         # --- 3. No burst in progress
         if not self._zbuf:
             if "0" in self._down:
-                self._emit("0", down)  # auto-repeat is ignored, release passes
-                return
-            if not down:
+                if down and delta_ms > 1000.0:
+                    # Orphaned "0" from a prior missed KEYUP (>1s without auto-repeat):
+                    # release the stale note and start fresh so it never eats the 1st
+                    # stroke of a new '000' burst.
+                    self._emit("0", False)
+                else:
+                    if down:
+                        self._zrepeat_down_ts = now
+                    else:
+                        if (
+                            self._zrepeat_down_ts > 0.0
+                            and (now - self._zrepeat_down_ts) <= eff_window
+                        ):
+                            self._zorphan_pair_ts = now
+                        self._zrepeat_down_ts = 0.0
+                    self._emit("0", down)  # auto-repeat is ignored, release passes
+                    return
+            elif not down:
                 return  # stray release
+            elif (
+                self._zorphan_pair_ts > 0.0
+                and (now - self._zorphan_pair_ts) <= eff_window
+            ):
+                # Recover the 1st stroke of a '000' burst whose KEYDOWN/KEYUP pair
+                # had just cleared a stuck "0" in self._down moments earlier.
+                self._zbuf.extend((True, False))
+                self._zorphan_pair_ts = 0.0
+            else:
+                self._zorphan_pair_ts = 0.0
 
         # --- 4. Buffer the current event and evaluate triplet burst
         self._zbuf.append(down)

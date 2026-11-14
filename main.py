@@ -1196,6 +1196,11 @@ def selftest() -> int:
                 assert hook._ll_decide("-", 0x6D, 0x4A, False, cold) == (True, True)
                 assert hook._ll_decide("*", 0x6A, 0x37, False, cold) == (True, True)
                 assert hook._ll_decide("/", 0x6F, 0x35, True, cold) == (True, True)
+                assert hook._ll_decide("NumLock", 0x90, 0x45, True, cold) == (True, True)
+                assert hook._ll_decide("NumLock", 0x90, 0x45, False, cold) == (True, True)
+                assert hook._ll_decide("0", 0x2D, 0x52, False, cold) == (True, True)  # VK_INSERT
+                assert hook._ll_decide(".", 0x2E, 0x53, False, cold) == (True, True)  # VK_DELETE
+                assert hook._ll_decide("1", 0x23, 0x4F, False, cold) == (True, True)  # VK_END
                 assert hook._ll_decide("Enter", 0x0D, 0x1C, False, cold) == (False, False)
             finally:
                 hook.set_target_device(saved_state[5])

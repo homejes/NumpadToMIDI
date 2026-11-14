@@ -1247,6 +1247,145 @@ class WindowsRawInputOriginTests(unittest.TestCase):
             self.hook._matched_handle_cache.get(self.KEYPAD_H), False
         )
 
+    def test_target_numlock_swallowed_for_both_extended_and_non_extended_flags(self):
+        """Windows WH_KEYBOARD_LL sets LLKHF_EXTENDED on VK_NUMLOCK (0x90, scan 0x45)
+        while WM_INPUT reports Flags=0; target keypad NumLock must be swallowed in both
+        cases (even >1s after the last keypad press) while still triggering MIDI via WM_INPUT.
+        """
+        from key_hook import RI_KEY_BREAK
+
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        # Simulate prior activity on the target USB keypad 5 seconds ago (> _RAW_RECENT_TTL)
+        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x61, 0x4F, 0)
+        self.hook._process_raw_keyboard(self.KEYPAD_H, 0x61, 0x4F, RI_KEY_BREAK)
+        self.hook._raw_recent_ts = now - 5.0
+        while not self.hook._win_queue.empty():
+            self.hook._win_queue.get_nowait()
+
+        # WH_KEYBOARD_LL receives VK_NUMLOCK (0x90, scan 0x45) with extended=True (or False):
+        for ext in (True, False):
+            name = win_key_name(VK_NUMLOCK, 0x45, ext, keypad_verified=True)
+            self.assertEqual(name, "NumLock")
+            queue, swallow = self.hook._ll_decide(name, VK_NUMLOCK, 0x45, ext, now)
+            self.assertEqual(
+                (queue, swallow),
+                (True, True),
+                f"Target keypad VK_NUMLOCK (extended={ext}) must be swallowed (return 1)",
+            )
+
+        # WM_INPUT still triggers the MIDI note for NumLock from the target keypad:
+        self.assertTrue(self.hook._process_raw_keyboard(self.KEYPAD_H, VK_NUMLOCK, 0x45, 0))
+        self.assertTrue(
+            self.hook._process_raw_keyboard(self.KEYPAD_H, VK_NUMLOCK, 0x45, RI_KEY_BREAK)
+        )
+        while not self.hook._win_queue.empty():
+            item = self.hook._win_queue.get_nowait()
+            if item:
+                self.hook._dispatch(*item)
+        self.assertEqual(self.rec.events, [("NumLock", True), ("NumLock", False)])
+
+        # Laptop NumLock (both extended=True and extended=False) is NEVER swallowed:
+        self.hook._process_raw_keyboard(self.LAPTOP_H, VK_NUMLOCK, 0x45, 0)
+        now2 = time.perf_counter()
+        for ext in (True, False):
+            self.assertEqual(
+                self.hook._ll_decide("NumLock", VK_NUMLOCK, 0x45, ext, now2),
+                (False, False),
+            )
+
+    def test_all_numlock_off_navigational_keys_mapped_and_swallowed_on_target(self):
+        """All NumLock-OFF navigational keys (VK_END, VK_DOWN, VK_NEXT, VK_LEFT,
+        VK_CLEAR, VK_RIGHT, VK_HOME, VK_UP, VK_PRIOR, VK_DELETE, VK_INSERT) from
+        the Target USB Numpad map to their numeric MIDI pads and are swallowed in
+        WH_KEYBOARD_LL, while passing through untouched for the laptop keyboard.
+        """
+        from key_hook import (
+            VK_CLEAR,
+            VK_DELETE,
+            VK_DOWN,
+            VK_END,
+            VK_HOME,
+            VK_INSERT,
+            VK_LEFT,
+            VK_NEXT,
+            VK_PRIOR,
+            VK_RIGHT,
+            VK_UP,
+        )
+
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        now = time.perf_counter()
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now - 3.0  # >1s idle, target keypad still active device
+
+        nav_cases = [
+            (VK_INSERT, 0x52, "0"),
+            (VK_DELETE, 0x53, "."),
+            (VK_END, 0x4F, "1"),
+            (VK_DOWN, 0x50, "2"),
+            (VK_NEXT, 0x51, "3"),
+            (VK_LEFT, 0x4B, "4"),
+            (VK_CLEAR, 0x4C, "5"),
+            (VK_RIGHT, 0x4D, "6"),
+            (VK_HOME, 0x47, "7"),
+            (VK_UP, 0x48, "8"),
+            (VK_PRIOR, 0x49, "9"),
+        ]
+        for vk, scan, expected_pad in nav_cases:
+            with self.subTest(vk=hex(vk), scan=hex(scan), expected_pad=expected_pad):
+                mapped = win_key_name(vk, scan, False, keypad_verified=True)
+                self.assertEqual(mapped, expected_pad)
+                self.assertTrue(self.hook._ll_global_swallow(vk, False))
+                queue, swallow = self.hook._ll_decide(mapped, vk, scan, False, now)
+                self.assertEqual((queue, swallow), (True, True))
+
+        # Foreign device (laptop keyboard) pressing any of these keys is NEVER swallowed:
+        self.hook._raw_recent_hdevice = self.LAPTOP_H
+        self.hook._raw_recent_ts = now
+        for vk, scan, expected_pad in nav_cases:
+            queue, swallow = self.hook._ll_decide(expected_pad, vk, scan, False, now)
+            self.assertEqual((queue, swallow), (False, False))
+
+    def test_numlock_off_000_burst_swallowed_and_orphaned_zero_recovered(self):
+        """3 rapid VK_INSERT / scancode 0x52 strokes in NumLock-OFF state are
+        swallowed in WH_KEYBOARD_LL and trigger '000' even if a prior '0' press
+        was left stuck in self._down.
+        """
+        from unittest.mock import patch
+        from key_hook import VK_INSERT
+
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        clock = [1000.0]
+        with patch("key_hook.time.perf_counter", side_effect=lambda: clock[0]):
+            # Previously played in NumLock-ON (0x60, scan 0x52) on the target keypad:
+            self.hook._process_raw_keyboard(self.KEYPAD_H, 0x60, 0x52, 0)
+            while not self.hook._win_queue.empty():
+                self.hook._win_queue.get_nowait()
+
+            # Simulate an orphaned "0" stuck in self._down from 3 seconds earlier:
+            self.hook._down.add("0")
+            self.hook._last_zero_ts = clock[0]
+            clock[0] += 3.127
+
+            # Now in NumLock-OFF state, 3 rapid VK_INSERT (0x2D, scan 0x52) strokes arrive:
+            for _ in range(3):
+                self.assertEqual(
+                    self.hook._ll_decide("0", VK_INSERT, 0x52, False, clock[0]),
+                    (True, True),
+                )
+                self.hook._dispatch("", True, VK_INSERT, 0x52)
+                clock[0] += 0.008
+                self.assertEqual(
+                    self.hook._ll_decide("0", VK_INSERT, 0x52, False, clock[0]),
+                    (True, True),
+                )
+                self.hook._dispatch("", False, VK_INSERT, 0x52)
+                clock[0] += 0.008
+
+        self.assertIn(("000", True), self.rec.events)
+        self.assertIn(("000", False), self.rec.events)
+
 
 if __name__ == "__main__":
     unittest.main()
