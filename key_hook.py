@@ -67,6 +67,19 @@ else:
 ALL_DEVICES_ID = ""
 ALL_DEVICES_LABEL = "All Connected Keypads (Default)"
 
+# v2.0.3: Module-level thread-safe flag indicating whether a Target USB Keypad
+# is currently selected and active in the UI. Checked directly inside the
+# low-level WH_KEYBOARD_LL hook callback (_ll_proc) so VK_NUMLOCK (0x90) is
+# unconditionally swallowed (return 1) without relying on instance attribute
+# lookups across thread contexts.
+GLOBAL_TARGET_DEVICE_ACTIVE: bool = False
+
+
+def set_global_target_device_active(active: bool) -> None:
+    """Update the module-level thread-safe target-device active flag."""
+    global GLOBAL_TARGET_DEVICE_ACTIVE
+    GLOBAL_TARGET_DEVICE_ACTIVE = bool(active)
+
 
 class KeyboardDevice:
     """Metadata for a connected keyboard/keypad discovered via Win32 Raw Input."""
@@ -465,6 +478,11 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
         except Exception:
             pass
 
+    # 0. Physical '0' / '000' burst key (scancode 0x52, VK_NUMPAD0 0x60, or
+    # VK_INSERT 0x2D with or without LLKHF_EXTENDED) always maps to "0".
+    if vk in (VK_NUMPAD0, VK_INSERT) or scan == _WIN_SCAN_KEYPAD_ZERO:
+        return "0"
+
     # 1. Check non-extended OEM scancodes directly (digits 0-9, dot, operators, NumLock, Backspace, Tab)
     if not extended and scan in _WIN_OEM_SCANCODES_NON_EXTENDED:
         return _WIN_OEM_SCANCODES_NON_EXTENDED[scan]
@@ -473,9 +491,7 @@ def win_key_name(vk: int, scan: int, extended: bool, keypad_verified: bool = Fal
     if extended and scan in _WIN_OEM_SCANCODES_EXTENDED:
         return _WIN_OEM_SCANCODES_EXTENDED[scan]
 
-    # 3. Special handling for 0/Insert and ./Del when scancode is 0x52 / 0x53 or vk matches
-    if scan == 0x52 or vk == VK_INSERT:
-        return "0"
+    # 3. Special handling for ./Del when scancode is 0x53 or vk matches
     if scan == 0x53 or vk == VK_DELETE:
         return "." if (not extended or keypad_verified) else None
 
@@ -1194,6 +1210,7 @@ class KeyHook:
         self._win_proc_ref = None  # prevent GC of ctypes callback
         self._win_queue: queue.SimpleQueue[Optional[tuple]] = queue.SimpleQueue()
         self._win_ready = threading.Event()
+        set_global_target_device_active(bool(self._target_device))
         self.refresh_devices()
 
     # ------------------------------------------------------------------ control
@@ -1223,6 +1240,7 @@ class KeyHook:
             cleaned = ""
         with self._lock:
             self._target_device = cleaned
+            set_global_target_device_active(bool(cleaned))
             self._rebuild_target_handles()
             self._last_raw_matched = bool(cleaned)
             self._rebuild_matched_handle_cache()
@@ -1325,14 +1343,27 @@ class KeyHook:
         entry = self._raw_last_by_key.get((vk, ext))
         if not (entry and (now - entry[1]) <= _RAW_KEY_TTL):
             # Windows WH_KEYBOARD_LL sets LLKHF_EXTENDED on VK_NUMLOCK (0x90,
-            # scan 0x45) whereas WM_INPUT (RAWKEYBOARD) reports Flags=0
-            # (non-extended). Also correlate by hardware scancode when NumLock
-            # state toggles between VK_NUMPAD0..9 and VK_INSERT/nav VKs.
+            # scan 0x45) and on VK_INSERT (0x2D, scan 0x52) whereas WM_INPUT
+            # (RAWKEYBOARD) may report Flags=0 (non-extended) or VK_NUMPAD0.
+            # Also correlate by hardware scancode when NumLock state toggles
+            # between VK_NUMPAD0..9 and VK_INSERT/nav VKs.
             if vk == VK_NUMLOCK or scan == 0x45:
                 entry = self._raw_last_by_key.get((VK_NUMLOCK, not ext))
+            elif vk in (VK_NUMPAD0, VK_INSERT) or scan == _WIN_SCAN_KEYPAD_ZERO:
+                for z_vk in (vk, VK_INSERT, VK_NUMPAD0):
+                    for z_ext in (ext, not ext):
+                        cand = self._raw_last_by_key.get((z_vk, z_ext))
+                        if cand and (now - cand[1]) <= _RAW_KEY_TTL:
+                            entry = cand
+                            break
+                    if entry and (now - entry[1]) <= _RAW_KEY_TTL:
+                        break
             if not (entry and (now - entry[1]) <= _RAW_KEY_TTL) and scan > 0:
                 entry = self._raw_last_by_scan.get((scan, ext))
-                if not (entry and (now - entry[1]) <= _RAW_KEY_TTL) and scan == 0x45:
+                if not (entry and (now - entry[1]) <= _RAW_KEY_TTL) and scan in (
+                    0x45,
+                    _WIN_SCAN_KEYPAD_ZERO,
+                ):
                     entry = self._raw_last_by_scan.get((scan, not ext))
         if entry and (now - entry[1]) <= _RAW_KEY_TTL:
             key_device, key_ts = entry
@@ -1378,11 +1409,11 @@ class KeyHook:
         ``VK_PRIOR``). The main Enter (non-extended ``VK_RETURN``) and normal
         typing keys (``VK_0-9``, ``VK_OEM_PLUS``, ``A-Z``) are never in this set.
         """
-        if not (self._target_device and self._suppress):
+        if not ((self._target_device or GLOBAL_TARGET_DEVICE_ACTIVE) and self._suppress):
             return False
         if vk == VK_RETURN:
             return bool(extended)
-        if vk == VK_INSERT:
+        if vk in (VK_INSERT, VK_NUMPAD0):
             return True
         if vk in _WIN_NUMLOCK_OFF_VKS:
             return not bool(extended)
@@ -1393,7 +1424,7 @@ class KeyHook:
     ) -> tuple[bool, bool]:
         """Decide (queue_for_midi, swallow) for a WH_KEYBOARD_LL event.
 
-        v2.0.1 strict hardware device isolation:
+        v2.0.3 strict hardware device isolation:
         - If no target USB keypad is selected, return (False, False).
         - If the key originates from ANY OTHER device (laptop keyboard, other
           USB keyboard) or its origin is unproven, return (False, False) so no
@@ -1407,7 +1438,7 @@ class KeyHook:
           (VK_ADD, VK_SUBTRACT, VK_MULTIPLY, VK_DIVIDE), VK_DECIMAL, and
           Numpad Enter (VK_RETURN with LLKHF_EXTENDED).
         """
-        if not self._target_device:
+        if not (self._target_device or GLOBAL_TARGET_DEVICE_ACTIVE):
             # No device selected: the app is completely inert; every keyboard
             # keeps typing normally.
             return False, False
@@ -1483,6 +1514,15 @@ class KeyHook:
             # WM_INPUT reports Flags=0; record both so per-key lookup always hits.
             self._raw_last_by_key[(VK_NUMLOCK, True)] = (h_device, now)
             self._raw_last_by_key[(VK_NUMLOCK, False)] = (h_device, now)
+        if vk in (VK_NUMPAD0, VK_INSERT) or scan == _WIN_SCAN_KEYPAD_ZERO:
+            # VK_INSERT (0x2D) is an Extended Key (LLKHF_EXTENDED) in WH_KEYBOARD_LL
+            # when NumLock is OFF, while WM_INPUT may report Flags=0 or VK_NUMPAD0;
+            # record both VKs and both extended states so origin lookup always hits.
+            for z_vk in (VK_NUMPAD0, VK_INSERT):
+                self._raw_last_by_key[(z_vk, True)] = (h_device, now)
+                self._raw_last_by_key[(z_vk, False)] = (h_device, now)
+            self._raw_last_by_scan[(_WIN_SCAN_KEYPAD_ZERO, True)] = (h_device, now)
+            self._raw_last_by_scan[(_WIN_SCAN_KEYPAD_ZERO, False)] = (h_device, now)
         if scan > 0:
             self._raw_last_by_scan[(scan, extended)] = (h_device, now)
         self._raw_recent_hdevice = h_device
@@ -1677,10 +1717,11 @@ class KeyHook:
                             scan_code = int(kb.scanCode)
                             now = time.perf_counter()
                             # Aggressively swallow VK_NUMLOCK (0x90 / scan 0x45) globally
-                            # whenever a Target USB Numpad is active in the UI so the
-                            # WH_KEYBOARD_LL vs WM_INPUT race condition can never let
-                            # VK_NUMLOCK reach the OS and toggle the global NumLock state.
-                            if self._target_device:
+                            # via the module-level GLOBAL_TARGET_DEVICE_ACTIVE flag so
+                            # cross-thread state checks never fail and the WH_KEYBOARD_LL
+                            # vs WM_INPUT race condition can never let VK_NUMLOCK reach
+                            # the OS and toggle the global NumLock state.
+                            if GLOBAL_TARGET_DEVICE_ACTIVE:
                                 if vk_code == VK_NUMLOCK or (
                                     scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK)
                                 ):
@@ -1693,7 +1734,8 @@ class KeyHook:
                                 vk_code,
                                 scan_code,
                                 extended,
-                                keypad_verified=origin_matched and bool(self._target_device),
+                                keypad_verified=origin_matched
+                                and bool(self._target_device or GLOBAL_TARGET_DEVICE_ACTIVE),
                             )
                             if name is not None:
                                 is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
@@ -2284,9 +2326,6 @@ class KeyHook:
         )
 
         eff_window = max(self.burst_window, _BURST_WINDOW_FLOOR)
-        # Slower firmware debounce/scan cadence observed on NumLock-OFF VK_INSERT bursts
-        if vk in (VK_INSERT, 114) or self._zlast_vk in (VK_INSERT, 114):
-            eff_window = max(eff_window, 0.120)
         if vk:
             self._zlast_vk = vk
 
@@ -2327,9 +2366,9 @@ class KeyHook:
                 if down and (is_exempt_zero_scan or delta_ms > 1000.0):
                     # Exempt Scancode 0x52 (82) / VK_NUMPAD0 / VK_INSERT (and
                     # orphaned >1s holds) from the debouncer block so consecutive
-                    # KeyDown events always enter self._zbuf.
-                    if delta_ms > 1000.0:
-                        self._emit("0", False)
+                    # KeyDown events always enter self._zbuf and single presses
+                    # still fall back cleanly to Note 36 ("0").
+                    self._emit("0", False)
                 else:
                     if down:
                         self._zrepeat_down_ts = now

@@ -1418,6 +1418,97 @@ class WindowsRawInputOriginTests(unittest.TestCase):
                 self.assertIn(("000", True), rec.events)
                 hook.stop()
 
+    def test_global_target_device_active_and_vk_insert_extended_burst_and_single_fallback(self):
+        """Verify:
+        1. GLOBAL_TARGET_DEVICE_ACTIVE is set True when a target USB keypad is
+           selected and False when disconnected/cleared, and governs VK_NUMLOCK
+           swallowing even without relying on self._target_device.
+        2. VK_INSERT (0x2D) with LLKHF_EXTENDED (extended=True) and extended=False
+           is swallowed in WH_KEYBOARD_LL for the target keypad, exempted from
+           _down, interchangeable with VK_NUMPAD0 (0x60) in the '000' burst
+           buffer (Note 37), and falls back to single '0' (Note 36) after
+           timeout.
+        """
+        import key_hook
+        from key_hook import RI_KEY_BREAK, RI_KEY_E0, VK_INSERT, set_global_target_device_active
+
+        self.hook.set_target_device("")
+        self.assertFalse(key_hook.GLOBAL_TARGET_DEVICE_ACTIVE)
+
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        self.assertTrue(key_hook.GLOBAL_TARGET_DEVICE_ACTIVE)
+
+        # Even if self._target_device were cleared/unavailable across threads,
+        # GLOBAL_TARGET_DEVICE_ACTIVE = True still guarantees VK_NUMLOCK (0x90)
+        # is swallowed:
+        saved_target = self.hook._target_device
+        try:
+            self.hook._target_device = ""
+            set_global_target_device_active(True)
+            now = time.perf_counter()
+            self.assertEqual(
+                self.hook._ll_decide("NumLock", VK_NUMLOCK, 0x45, True, now),
+                (True, True),
+            )
+            self.assertEqual(
+                self.hook._ll_decide("NumLock", VK_NUMLOCK, 0x45, False, now),
+                (True, True),
+            )
+        finally:
+            self.hook._target_device = saved_target
+            set_global_target_device_active(bool(saved_target))
+
+        # Both extended=True (LLKHF_EXTENDED) and extended=False VK_INSERT (0x2D)
+        # from the target USB keypad are swallowed in WH_KEYBOARD_LL:
+        now = time.perf_counter()
+        self.hook._process_raw_keyboard(self.KEYPAD_H, VK_INSERT, 0x52, 0)
+        self.hook._process_raw_keyboard(self.KEYPAD_H, VK_INSERT, 0x52, RI_KEY_BREAK)
+        while not self.hook._win_queue.empty():
+            self.hook._win_queue.get_nowait()
+
+        for ext in (True, False):
+            self.assertTrue(self.hook._ll_global_swallow(VK_INSERT, ext))
+            self.assertEqual(
+                self.hook._ll_decide("0", VK_INSERT, 0x52, ext, now),
+                (True, True),
+            )
+
+        # Mixed burst of VK_INSERT (0x2D, extended=True) and VK_NUMPAD0 (0x60)
+        # within ~100ms triggers '000' (Note 37) and clears _zbuf:
+        hook_mix, rec_mix = make(burst_window_ms=80)
+        hook_mix._down.add("0")  # Exempted even if "0" was in _down
+        for vk in (VK_INSERT, VK_NUMPAD0, VK_INSERT):
+            hook_mix._dispatch("0", True, vk, 0x52)
+            hook_mix._dispatch("0", False, vk, 0x52)
+        self.assertEqual(hook_mix._zbuf, [])
+        self.assertIn(("000", True), rec_mix.events)
+        self.assertIn(("000", False), rec_mix.events)
+        hook_mix.stop()
+
+        # Single VK_INSERT (0x2D, with RI_KEY_E0 / extended=True) press falls
+        # back to Note 36 ("0") after burst timeout even if "0" was in _down:
+        hook_single, rec_single = make(burst_window_ms=30)
+        hook_single._devices = self.hook._devices
+        hook_single._device_by_handle = self.hook._device_by_handle
+        hook_single.set_target_device(r"HID\VID_04D9&PID_1203")
+        hook_single._down.add("0")
+        self.assertTrue(
+            hook_single._process_raw_keyboard(self.KEYPAD_H, VK_INSERT, 0x52, RI_KEY_E0)
+        )
+        item_down = hook_single._win_queue.get_nowait()
+        hook_single._dispatch(*item_down)
+        time.sleep(0.12)
+        self.assertTrue(
+            hook_single._process_raw_keyboard(
+                self.KEYPAD_H, VK_INSERT, 0x52, RI_KEY_E0 | RI_KEY_BREAK
+            )
+        )
+        item_up = hook_single._win_queue.get_nowait()
+        hook_single._dispatch(*item_up)
+        self.assertIn(("0", True), rec_single.events)
+        self.assertEqual(rec_single.events[-1], ("0", False))
+        hook_single.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

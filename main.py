@@ -89,7 +89,7 @@ from PyQt6.QtWidgets import (
 
 from key_hook import (
     ALL_DEVICES_LABEL, KEY_DISPLAY, KEY_INDEX, KEY_LAYOUT, KEY_NAMES,
-    KEY_SPAN, KeyHook, check_macos_permissions,
+    KEY_SPAN, KeyHook, check_macos_permissions, set_global_target_device_active,
 )
 from midi_engine import MidiEngine, note_name
 from version import VERSION
@@ -340,6 +340,7 @@ class Controller(QObject):
         self.panic()
         self.config["target_device"] = target
         self.hook.set_target_device(target)
+        set_global_target_device_active(bool(target))
         self.config.save()
         if target:
             self.log.emit(f"{self._ts()}  Target USB keypad: {target}")
@@ -370,6 +371,7 @@ class Controller(QObject):
         self.log.emit(f"{self._ts()}  PANIC - all notes off")
 
     def shutdown(self) -> None:
+        set_global_target_device_active(False)
         self.hook.stop()
         self.panic()
         self.config.save()
@@ -923,7 +925,10 @@ class MainWindow(QMainWindow):
         # v2.0: the dropdown only ever contains specific enumerated devices;
         # a None itemData (should not happen) maps to "no device selected".
         dev_id = str(self.device.itemData(index) or "")
+        label = str(self.device.itemText(index) or "")
         self.ctrl.set_target_device(dev_id)
+        if label.endswith(" (disconnected)"):
+            set_global_target_device_active(False)
         self.device.clearFocus()
 
     def _refresh_devices(self) -> None:
@@ -942,6 +947,7 @@ class MainWindow(QMainWindow):
         self.device.clear()
         self.device.setPlaceholderText("Select Target USB Keypad...")
         selected_idx = -1
+        connected = False
         for idx, dev in enumerate(devices):
             self.device.addItem(dev.label, dev.device_id)
             if target and (
@@ -950,11 +956,15 @@ class MainWindow(QMainWindow):
                 or target.upper() == dev.label.upper()
             ):
                 selected_idx = idx
+                connected = True
         if target and selected_idx == -1:
             # The selected device is currently disconnected: keep it visible
             # and targeted so it works again the moment it is reconnected.
             self.device.addItem(f"{target} (disconnected)", target)
             selected_idx = self.device.count() - 1
+            set_global_target_device_active(False)
+        else:
+            set_global_target_device_active(bool(target and connected))
         self.device.setCurrentIndex(selected_idx)
         # With no selection (selected_idx == -1) the combo stays unselected:
         # the user MUST pick a specific device before anything generates MIDI (v2.0).
@@ -1198,6 +1208,9 @@ def selftest() -> int:
                 assert hook._ll_decide("/", 0x6F, 0x35, True, cold) == (True, True)
                 assert hook._ll_decide("NumLock", 0x90, 0x45, True, cold) == (True, True)
                 assert hook._ll_decide("NumLock", 0x90, 0x45, False, cold) == (True, True)
+                assert hook._ll_global_swallow(0x2D, True) is True   # VK_INSERT (extended)
+                assert hook._ll_global_swallow(0x2D, False) is True  # VK_INSERT (non-extended)
+                assert hook._ll_decide("0", 0x2D, 0x52, True, cold) == (True, True)   # VK_INSERT + LLKHF_EXTENDED
                 assert hook._ll_decide("0", 0x2D, 0x52, False, cold) == (True, True)  # VK_INSERT
                 assert hook._ll_decide(".", 0x2E, 0x53, False, cold) == (True, True)  # VK_DELETE
                 assert hook._ll_decide("1", 0x23, 0x4F, False, cold) == (True, True)  # VK_END
