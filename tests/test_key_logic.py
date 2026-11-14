@@ -1116,12 +1116,24 @@ class WindowsRawInputOriginTests(unittest.TestCase):
     def test_specific_target_tab_backspace_swallowed(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
+        self.hook._raw_recent_hdevice = self.KEYPAD_H
+        self.hook._raw_recent_ts = now
         self.hook._raw_last_by_key[(0x09, False)] = (self.KEYPAD_H, now)
         queue, swallow = self.hook._ll_decide("Tab", 0x09, 0x0F, False, now)
         self.assertEqual((queue, swallow), (True, True))
         self.hook._raw_last_by_key[(0x08, False)] = (self.KEYPAD_H, now)
         queue, swallow = self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now)
         self.assertEqual((queue, swallow), (True, True))
+        # Laptop / other keyboard Tab & Backspace MUST pass through untouched:
+        self.flag_laptop()
+        self.hook._raw_last_by_key[(0x09, False)] = (self.LAPTOP_H, now)
+        self.assertEqual(
+            self.hook._ll_decide("Tab", 0x09, 0x0F, False, now), (False, False)
+        )
+        self.hook._raw_last_by_key[(0x08, False)] = (self.LAPTOP_H, now)
+        self.assertEqual(
+            self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now), (False, False)
+        )
 
     def test_numlock_from_laptop_passes_and_keypad_numlock_is_swallowed(self):
         self.flag_laptop()
