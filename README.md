@@ -10,7 +10,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - Physical **M-Tech 23-key layout**: `Home` (`VK_BROWSER_HOME` / `0xAC`), `Tab`, `Email` (`0xB4`),
   `Calc` (`0xB7`), `NumLock`, `/`, `*`, `Backspace`, `0-9`, `.`, `000`, `+`, `-`, and a
   2-row tall `Enter` key.
-- **Target USB Keypad selector with strict hardware isolation (v2.0.3, Win32 Raw Input API & macOS IOHIDManager)**: the dropdown lists ONLY specific, enumerated hardware devices (`HID\VID_xxxx&PID_xxxx`) — the former `"All Connected Keypads"` option is removed, and the user MUST explicitly select one specific hardware device from the dropdown before anything generates MIDI or swallows keystrokes (with no selection the app does nothing). Raw Input (`WM_INPUT`) hardware-ID tracking synchronizes `hDevice` with `WH_KEYBOARD_LL`: keys originating from the selected USB keypad generate their MIDI `Note ON/OFF` and are aggressively swallowed (`return 1`) in Exclusive Mode (`VK_NUMLOCK`, `VK_NUMPAD0-9`, all NumLock-OFF navigation keys `VK_INSERT`/`VK_DELETE`/`VK_END`/`VK_DOWN`/`VK_NEXT`/`VK_LEFT`/`VK_CLEAR`/`VK_RIGHT`/`VK_HOME`/`VK_UP`/`VK_PRIOR`, `VK_ADD`, `VK_SUBTRACT`, `VK_MULTIPLY`, `VK_DIVIDE`, `VK_DECIMAL`, and Numpad `Enter` `VK_RETURN` with `LLKHF_EXTENDED`); keys originating from ANY other device (such as the laptop's built-in keyboard/numpad or another USB keyboard) **never** generate MIDI and are **never** swallowed (`CallNextHookEx`).
+- **Target USB Keypad selector with strict hardware isolation (v2.0.4, Win32 Raw Input API & macOS IOHIDManager)**: the dropdown lists ONLY specific, enumerated hardware devices (`HID\VID_xxxx&PID_xxxx`) — the former `"All Connected Keypads"` option is removed, and the user MUST explicitly select one specific hardware device from the dropdown before anything generates MIDI or swallows keystrokes (with no selection the app does nothing). Raw Input (`WM_INPUT`) hardware-ID tracking synchronizes `hDevice` with `WH_KEYBOARD_LL`: keys originating from the selected USB keypad generate their MIDI `Note ON/OFF` and are aggressively swallowed (`return 1`) in Exclusive Mode (`VK_NUMLOCK`, `VK_NUMPAD0-9`, all NumLock-OFF navigation keys `VK_INSERT`/`VK_DELETE`/`VK_END`/`VK_DOWN`/`VK_NEXT`/`VK_LEFT`/`VK_CLEAR`/`VK_RIGHT`/`VK_HOME`/`VK_UP`/`VK_PRIOR`, `VK_ADD`, `VK_SUBTRACT`, `VK_MULTIPLY`, `VK_DIVIDE`, `VK_DECIMAL`, and Numpad `Enter` `VK_RETURN` with `LLKHF_EXTENDED`); keys originating from ANY other device (such as the laptop's built-in keyboard/numpad or another USB keyboard) **never** generate MIDI and are **never** swallowed (`CallNextHookEx`).
 - **Exclusive Mode (Block OS Keystrokes)** enabled by default: intercepts and swallows keypad
   and multimedia keys (`VK_NUMLOCK`, `VK_BROWSER_HOME`, `VK_LAUNCH_MAIL`, `VK_LAUNCH_APP2`, digits, NumLock-OFF navigation keys, operators,
   and Numpad Enter) from the selected USB keypad in `WH_KEYBOARD_LL` (`return 1`) so global OS NumLock state is never toggled, Chrome,
@@ -30,7 +30,7 @@ notes climb left→right, bottom→top (23 keys → notes 36–58).
 - macOS: native **virtual MIDI source** called `NumpadToMIDI` with native builds for both Intel (`x86_64`) and Apple Silicon (`arm64`).
 - Windows: creates a virtual MIDI port called **`NumpadToMIDI`** directly via the
   [teVirtualMIDI](https://www.tobias-erichsen.de/software/virtualmidi.html) driver
-  (automatically installed by `NumpadToMIDI-Setup-v2.0.3.exe`). If the driver is not
+  (automatically installed by `NumpadToMIDI-Setup-v2.0.4.exe`). If the driver is not
   present, falls back to any existing loopback port (e.g.
   [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)), then to the first
   available output, or runs silently if none exists.
@@ -62,22 +62,22 @@ Output: `dist/NumpadToMIDI-Windows.exe` (Windows) or `dist/NumpadToMIDI.app` (ma
 To build the platform installers:
 - **Windows (Inno Setup 6.3+):**
   ```powershell
-  ISCC.exe /DAppVersion=2.0.3 installer\windows_installer.iss
+  ISCC.exe /DAppVersion=2.0.4 installer\windows_installer.iss
   ```
-  Produces `dist/NumpadToMIDI-Setup-v2.0.3.exe` (bundles the app, creates Desktop and
+  Produces `dist/NumpadToMIDI-Setup-v2.0.4.exe` (bundles the app, creates Desktop and
   Start Menu shortcuts, elevates to Administrator, and silently downloads + installs
   the `teVirtualMIDI` virtual MIDI driver if missing).
 - **macOS (DMG with `/Applications` link and setup guide):**
   ```bash
-  bash installer/make_dmg.sh 2.0.3 Intel         # Intel x86_64 Macs
-  bash installer/make_dmg.sh 2.0.3 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
+  bash installer/make_dmg.sh 2.0.4 Intel         # Intel x86_64 Macs
+  bash installer/make_dmg.sh 2.0.4 AppleSilicon   # Apple Silicon (M1/M2/M3/M4) Macs
   ```
-  Produces `dist/NumpadToMIDI-macOS-Intel-v2.0.3.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v2.0.3.dmg` (and `dist/NumpadToMIDI-macOS-v2.0.3.dmg`).
+  Produces `dist/NumpadToMIDI-macOS-Intel-v2.0.4.dmg` and `dist/NumpadToMIDI-macOS-AppleSilicon-v2.0.4.dmg` (and `dist/NumpadToMIDI-macOS-v2.0.4.dmg`).
 
 ## Releases / CI
 `.github/workflows/build-release.yml` builds both platforms on every `v*` tag (and manual
-`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v2.0.3.exe`,
-`NumpadToMIDI-macOS-Intel-v2.0.3.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v2.0.3.dmg`
+`workflow_dispatch`) and attaches `NumpadToMIDI-Setup-v2.0.4.exe`,
+`NumpadToMIDI-macOS-Intel-v2.0.4.dmg`, and `NumpadToMIDI-macOS-AppleSilicon-v2.0.4.dmg`
 to the GitHub Release.
 
 ## Notes & limitations

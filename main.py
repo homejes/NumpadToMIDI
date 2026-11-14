@@ -76,7 +76,7 @@ sys.excepthook = _excepthook
 threading.excepthook = _threading_excepthook
 
 from PyQt6.QtCore import (
-    QAbstractNativeEventFilter, QObject, QSize, QTimer, Qt, QVariantAnimation, pyqtSignal,
+    QAbstractNativeEventFilter, QEvent, QObject, QSize, QTimer, Qt, QVariantAnimation, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction, QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap,
@@ -361,6 +361,7 @@ class Controller(QObject):
         self.log.emit(f"{self._ts()}  MIDI {'muted' if muted else 'unmuted'}")
 
     def panic(self) -> None:
+        self.hook.release_held_keys()
         with self._lock:
             held = list(self._active.items())
             self._active.clear()
@@ -610,6 +611,9 @@ class MainWindow(QMainWindow):
         ctrl.key_state.connect(self._on_key_state)
         ctrl.mute_changed.connect(self._on_mute_changed)
         ctrl.log.connect(self._append_log)
+        app = QApplication.instance()
+        if app is not None and hasattr(app, "applicationStateChanged"):
+            app.applicationStateChanged.connect(self._on_app_state_changed)
         self._refresh_notes()
         self._refresh_status()
         self._refresh_devices()
@@ -859,6 +863,7 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._on_focus_lost()
         if not self._quitting and QSystemTrayIcon.isSystemTrayAvailable() and self.tray.isVisible():
             event.ignore()
             self.hide()
@@ -870,6 +875,32 @@ class MainWindow(QMainWindow):
             )
             return
         event.accept()
+
+    def _on_focus_lost(self) -> None:
+        """Fail-safe when window loses focus (Deactivate / Blur / FocusLost):
+        release any held keys, send MIDI NOTE OFF for all active pads, and reset
+        all GUI pad highlights to default while keeping the background hook alive.
+        """
+        self.ctrl.panic()
+        for pad in self._pads.values():
+            pad.light(False)
+
+    def _on_app_state_changed(self, state: Qt.ApplicationState) -> None:
+        if state != Qt.ApplicationState.ApplicationActive:
+            self._on_focus_lost()
+
+    def changeEvent(self, event: QEvent) -> None:
+        if event is not None and event.type() in (
+            QEvent.Type.ActivationChange,
+            QEvent.Type.WindowDeactivate,
+        ):
+            if not self.isActiveWindow():
+                self._on_focus_lost()
+        super().changeEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        self._on_focus_lost()
+        super().focusOutEvent(event)
 
     def _open_mac_settings(self) -> None:
         if sys.platform == "darwin":
@@ -1133,7 +1164,7 @@ def selftest() -> int:
         ctrl.handle_key(".", True)
         ctrl.handle_key(".", False)
         assert ctrl.config["burst_window_ms"] >= 50
-        assert win.suppress.isChecked() is True
+        assert win.suppress.isChecked() is bool(ctrl.config["suppress_keys"])
         assert str(ctrl.config.path).endswith("config.json")
         if sys.platform == "win32":
             assert APP_NAME in str(ctrl.config.path)
@@ -1169,6 +1200,7 @@ def selftest() -> int:
                 # Specific target selected: a proven laptop origin (4242) must
                 # generate NO MIDI and must NOT be swallowed.
                 hook.set_target_device(r"HID\VID_FAKE&PID_0001")
+                hook.set_suppress(True)
                 hook._target_handles.add(9999)
                 hook._matched_handle_cache[4242] = False
                 hook._matched_handle_cache[9999] = True
@@ -1215,7 +1247,19 @@ def selftest() -> int:
                 assert hook._ll_decide(".", 0x2E, 0x53, False, cold) == (True, True)  # VK_DELETE
                 assert hook._ll_decide("1", 0x23, 0x4F, False, cold) == (True, True)  # VK_END
                 assert hook._ll_decide("Enter", 0x0D, 0x1C, False, cold) == (False, False)
+                assert hook._raw_sink_owns_wm_input is True
+                assert hook._verify_raw_input_registration() is True
+                assert hook._win_raw_hwnd is not None
+                # Verify focus-lost fail-safe clears held keys & pad UI without stopping hook:
+                hook._dispatch("5", True)
+                assert "5" in hook._down
+                assert "5" in ctrl._active
+                win._on_focus_lost()
+                assert "5" not in hook._down
+                assert "5" not in ctrl._active
+                assert hook._running is True
             finally:
+                hook.set_suppress(bool(ctrl.config["suppress_keys"]))
                 hook.set_target_device(saved_state[5])
                 hook._target_handles.clear()
                 hook._target_handles.update(saved_state[6])

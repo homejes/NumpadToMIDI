@@ -1509,6 +1509,46 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         self.assertEqual(rec_single.events[-1], ("0", False))
         hook_single.stop()
 
+    def test_focus_lost_failsafe_releases_stuck_keys_and_preserves_background_hook(self):
+        """Verify that losing window focus (Deactivate / Blur / FocusLost)
+        triggers the fail-safe Panic, sending NOTE OFF for all held pads,
+        clearing both Controller._active and KeyHook._down, and resetting GUI
+        pad highlights while keeping the background hook active.
+        """
+        from PyQt6.QtWidgets import QApplication
+        from main import Config, Controller, MainWindow, MidiEngine
+
+        app = QApplication.instance() or QApplication([])
+        cfg = Config()
+        engine = MidiEngine()
+        ctrl = Controller(cfg, engine)
+        win = MainWindow(ctrl)
+        try:
+            ctrl.hook._dispatch("5", True)
+            ctrl.hook._dispatch("8", True)
+            self.assertIn("5", ctrl.hook._down)
+            self.assertIn("8", ctrl.hook._down)
+            self.assertIn("5", ctrl._active)
+            self.assertIn("8", ctrl._active)
+            self.assertGreater(win._pads["5"]._glow, 0.0)
+            self.assertGreater(win._pads["8"]._glow, 0.0)
+
+            # Simulate window losing focus (e.g. user clicks into Ableton Live):
+            win._on_focus_lost()
+
+            self.assertEqual(len(ctrl.hook._down), 0)
+            self.assertEqual(len(ctrl._active), 0)
+            # Subsequent presses in the background must respond immediately
+            # (never blocked as stuck/auto-repeat):
+            ctrl.hook._dispatch("5", True)
+            self.assertIn("5", ctrl.hook._down)
+            self.assertIn("5", ctrl._active)
+            ctrl.hook._dispatch("5", False)
+            self.assertNotIn("5", ctrl.hook._down)
+            self.assertNotIn("5", ctrl._active)
+        finally:
+            ctrl.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

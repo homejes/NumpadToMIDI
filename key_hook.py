@@ -541,6 +541,13 @@ RIM_TYPEKEYBOARD = 1
 RIDI_DEVICENAME = 0x20000007
 RID_INPUT = 0x10000003
 _WM_INPUT = 0x00FF
+_WM_TIMER = 0x0113
+_PM_REMOVE = 0x0001
+_WS_POPUP = 0x80000000  # hidden top-level sink window (no WS_VISIBLE)
+_RAW_SINK_CLASS = "NumpadToMIDIRawSink"
+_RAW_SINK_TIMER_ID = 1
+_RAW_SINK_WATCHDOG_MS = 30000
+_ERROR_CLASS_ALREADY_EXISTS = 1410
 RI_KEY_BREAK = 0x0001
 RI_KEY_E0 = 0x0002
 RI_KEY_E1 = 0x0004
@@ -622,6 +629,24 @@ if IS_WIN:
         LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
     )
 
+    WNDPROC = ctypes.WINFUNCTYPE(
+        LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    )
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", ctypes.c_void_p),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
     _user32 = ctypes.windll.user32
     _kernel32 = ctypes.windll.kernel32
 
@@ -638,6 +663,10 @@ if IS_WIN:
     _user32.GetMessageW.restype = wintypes.BOOL
     _user32.GetMessageW.argtypes = [
         ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT
+    ]
+    _user32.PeekMessageW.restype = wintypes.BOOL
+    _user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT
     ]
     _user32.TranslateMessage.restype = wintypes.BOOL
     _user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
@@ -674,10 +703,29 @@ if IS_WIN:
     ]
     _user32.MapVirtualKeyW.restype = wintypes.UINT
     _user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    _user32.RegisterClassW.restype = wintypes.ATOM
+    _user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    _user32.DefWindowProcW.restype = LRESULT
+    _user32.DefWindowProcW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    ]
+    _user32.SetTimer.restype = ctypes.c_size_t
+    _user32.SetTimer.argtypes = [
+        wintypes.HWND, ctypes.c_size_t, wintypes.UINT, wintypes.LPVOID
+    ]
+    _user32.KillTimer.restype = wintypes.BOOL
+    _user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+    _user32.GetRegisteredRawInputDevices.restype = wintypes.UINT
+    _user32.GetRegisteredRawInputDevices.argtypes = [
+        ctypes.POINTER(RAWINPUTDEVICE), ctypes.POINTER(wintypes.UINT), wintypes.UINT
+    ]
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     _kernel32.GetCurrentThread.restype = wintypes.HANDLE
     _kernel32.SetThreadPriority.restype = wintypes.BOOL
     _kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+    _kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+    _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    _kernel32.GetLastError.restype = wintypes.DWORD
 
 
 def _lookup_pnp_friendly_name(pnp_id: str, hw_id: str) -> str:
@@ -1158,6 +1206,7 @@ class KeyHook:
 
         self._lock = threading.RLock()
         self._down: set[str] = set()
+        self._down_ts: dict[str, float] = {}
         # 000-burst detection state (NumLock-independent triplet detector)
         self._zbuf: list[bool] = []
         self._zlast_ts: float = 0.0
@@ -1208,6 +1257,8 @@ class KeyHook:
         self._win_hook_handle = None
         self._win_raw_hwnd = None
         self._win_proc_ref = None  # prevent GC of ctypes callback
+        self._raw_sink_wndproc_ref = None
+        self._raw_sink_owns_wm_input = False
         self._win_queue: queue.SimpleQueue[Optional[tuple]] = queue.SimpleQueue()
         self._win_ready = threading.Event()
         set_global_target_device_active(bool(self._target_device))
@@ -1385,7 +1436,7 @@ class KeyHook:
                     return self._raw_recent_hdevice
                 if self._origin_matches(self._raw_recent_hdevice):
                     return self._raw_recent_hdevice
-                return 0
+                return key_device
             return key_device
         if self._raw_recent_ts > 0.0:
             if (now - self._raw_recent_ts) <= _RAW_RECENT_TTL:
@@ -1494,12 +1545,21 @@ class KeyHook:
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
         """Queue an event intercepted in WH_KEYBOARD_LL and record it to prevent WM_INPUT duplication."""
         now = time.perf_counter()
+        self._pending_raw_dedup = [
+            item for item in self._pending_raw_dedup if now - item[2] < 0.050
+        ]
+        for idx, item in enumerate(self._pending_raw_dedup):
+            q_name, q_down = item[0], item[1]
+            q_src = item[3] if len(item) > 3 else "ll"
+            if q_name == name and q_down == is_down and q_src == "raw":
+                del self._pending_raw_dedup[idx]
+                return
         # 50 ms dedup window, clearing opposite edge for this key to prevent dedup cross-stroke bleed
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup
             if (now - item[2] < 0.050 and item[0] != name)
         ]
-        self._pending_raw_dedup.append((name, is_down, now))
+        self._pending_raw_dedup.append((name, is_down, now, "ll"))
         self._win_queue.put_nowait((name, is_down, vk, scan))
 
     def _process_raw_keyboard(self, h_device: int, vk: int, scan: int, flags: int) -> bool:
@@ -1543,16 +1603,35 @@ class KeyHook:
         name = win_key_name(vk, scan, extended, keypad_verified=bool(self._target_device))
         if name is None:
             return False
-        for idx, (q_name, q_down, _) in enumerate(self._pending_raw_dedup):
-            if q_name == name and q_down == is_down:
+        for idx, item in enumerate(self._pending_raw_dedup):
+            q_name, q_down = item[0], item[1]
+            q_src = item[3] if len(item) > 3 else "ll"
+            if q_name == name and q_down == is_down and q_src == "ll":
                 del self._pending_raw_dedup[idx]
                 return True
         # Purge any opposite-edge dedup record for this key
         self._pending_raw_dedup = [
             item for item in self._pending_raw_dedup if item[0] != name or item[1] == is_down
         ]
+        self._pending_raw_dedup.append((name, is_down, now, "raw"))
         self._win_queue.put_nowait((name, is_down, vk, scan))
         return True
+
+    def release_held_keys(self) -> None:
+        """Fail-safe: cancel pending burst timers and emit Note OFF for all
+        held keys without stopping the background hook thread."""
+        with self._lock:
+            self._cancel_timer()
+            self._cancel_triple_timer()
+            self._zbuf.clear()
+            self._zlast_ts = 0.0
+            self._zlast_vk = 0
+            self._zrepeat_down_ts = 0.0
+            self._zorphan_pair_ts = 0.0
+            self._triple_ups_left = 0
+            self._pending_raw_dedup.clear()
+            for name in list(self._down):
+                self._emit(name, False)
 
     def start(self) -> None:
         if self._running:
@@ -1670,6 +1749,121 @@ class KeyHook:
         except Exception as exc:
             logger.debug("WM_INPUT parse error: %s", exc)
 
+    def _raw_sink_wndproc(self, hwnd: int, umsg: int, wparam: int, lparam: int) -> int:
+        """WndProc of the hidden top-level Raw Input sink window.
+
+        Processes WM_INPUT in both foreground and background (RIDEV_INPUTSINK)
+        and forwards to DefWindowProcW so the OS cleans up raw input state.
+        """
+        try:
+            if umsg == _WM_INPUT:
+                try:
+                    self._handle_wm_input(int(lparam))
+                except Exception as exc:
+                    logger.debug("WM_INPUT handler error: %s", exc)
+            elif umsg == _WM_TIMER and wparam == _RAW_SINK_TIMER_ID:
+                self._verify_raw_input_registration()
+                return 0
+        except Exception as exc:
+            logger.debug("Raw Input sink wndproc error: %s", exc)
+        return int(_user32.DefWindowProcW(hwnd, umsg, wparam, lparam))
+
+    def _create_raw_sink_window(self) -> bool:
+        """Create a hidden top-level window (_WS_POPUP without WS_VISIBLE) with
+        its own WNDCLASSW/WNDPROC so RIDEV_INPUTSINK receives WM_INPUT reliably
+        even when NumpadToMIDI is in the background (e.g. Ableton Live focused).
+        """
+        if self._raw_sink_wndproc_ref is None:
+            self._raw_sink_wndproc_ref = WNDPROC(self._raw_sink_wndproc)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._raw_sink_wndproc_ref
+        wc.hInstance = _kernel32.GetModuleHandleW(None)
+        wc.lpszClassName = _RAW_SINK_CLASS
+        if not _user32.RegisterClassW(ctypes.byref(wc)):
+            err = int(_kernel32.GetLastError())
+            if err != _ERROR_CLASS_ALREADY_EXISTS:
+                logger.error(
+                    "RegisterClassW(%s) failed (GetLastError=%s)", _RAW_SINK_CLASS, err
+                )
+                self._raw_sink_wndproc_ref = None
+                return False
+        hwnd = _user32.CreateWindowExW(
+            0,
+            _RAW_SINK_CLASS,
+            "NumpadToMIDI Raw Input Sink",
+            _WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            wc.hInstance,
+            None,
+        )
+        if not hwnd:
+            logger.error(
+                "Raw Input sink CreateWindowExW failed (GetLastError=%s)",
+                _kernel32.GetLastError(),
+            )
+            return False
+        self._win_raw_hwnd = hwnd
+        return True
+
+    def _register_raw_input_sink(self) -> bool:
+        """Register the hidden top-level window with RIDEV_INPUTSINK for background WM_INPUT."""
+        if not self._win_raw_hwnd:
+            if not self._create_raw_sink_window():
+                return False
+        rid = RAWINPUTDEVICE(
+            HID_USAGE_PAGE_GENERIC,
+            HID_USAGE_GENERIC_KEYBOARD,
+            RIDEV_INPUTSINK,
+            self._win_raw_hwnd,
+        )
+        if not _user32.RegisterRawInputDevices(
+            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
+        ):
+            logger.error(
+                "RegisterRawInputDevices(RIDEV_INPUTSINK) failed (GetLastError=%s)",
+                _kernel32.GetLastError(),
+            )
+            return False
+        if not self._verify_raw_input_registration(log_healthy=True):
+            return False
+        logger.info(
+            "Registered Win32 Raw Input keyboard sink (hwnd=%s, RIDEV_INPUTSINK verified)",
+            self._win_raw_hwnd,
+        )
+        return True
+
+    def _verify_raw_input_registration(self, log_healthy: bool = False) -> bool:
+        """Verify that RIDEV_INPUTSINK remains active on the OS registration."""
+        try:
+            if not self._win_raw_hwnd:
+                return False
+            buf = (RAWINPUTDEVICE * 8)()
+            count = wintypes.UINT(8)
+            res = _user32.GetRegisteredRawInputDevices(
+                buf, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICE)
+            )
+            if res == 0xFFFFFFFF:
+                return False
+            for i in range(min(count.value, 8)):
+                d = buf[i]
+                if (
+                    d.usUsagePage == HID_USAGE_PAGE_GENERIC
+                    and d.usUsage == HID_USAGE_GENERIC_KEYBOARD
+                    and (d.dwFlags & RIDEV_INPUTSINK)
+                ):
+                    if log_healthy:
+                        logger.debug("Raw Input keyboard registration verified (RIDEV_INPUTSINK)")
+                    return True
+            return self._register_raw_input_sink()
+        except Exception as exc:
+            logger.debug("Raw Input verification error: %s", exc)
+            return False
+
     def _win_message_pump(self) -> None:  # pragma: no cover - real OS hook loop
         """Dedicated high-priority Win32 message loop owning WH_KEYBOARD_LL and WM_INPUT."""
         try:
@@ -1684,25 +1878,31 @@ class KeyHook:
             _user32.PostThreadMessageW(self._win_thread_id, 0, 0, 0)
             _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
 
-            # Register hidden message-only window for Raw Input (WM_INPUT)
+            # Register hidden top-level Raw Input sink window (RIDEV_INPUTSINK)
+            self._raw_sink_owns_wm_input = False
             try:
-                self._win_raw_hwnd = _user32.CreateWindowExW(
-                    0, "Static", "NumpadToMIDIRawInputSink", 0,
-                    0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
-                )
-                if self._win_raw_hwnd:
-                    rid = RAWINPUTDEVICE(
-                        HID_USAGE_PAGE_GENERIC,
-                        HID_USAGE_GENERIC_KEYBOARD,
-                        RIDEV_INPUTSINK,
+                if self._register_raw_input_sink():
+                    self._raw_sink_owns_wm_input = True
+                    _user32.SetTimer(
                         self._win_raw_hwnd,
+                        _RAW_SINK_TIMER_ID,
+                        _RAW_SINK_WATCHDOG_MS,
+                        None,
                     )
-                    if _user32.RegisterRawInputDevices(
-                        ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
-                    ):
-                        logger.info(
-                            "Registered Win32 Raw Input keyboard sink (hwnd=%s)",
+                else:
+                    self._win_raw_hwnd = _user32.CreateWindowExW(
+                        0, "Static", "NumpadToMIDIRawInputSink", 0,
+                        0, 0, 0, 0, _HWND_MESSAGE, None, None, None,
+                    )
+                    if self._win_raw_hwnd:
+                        rid = RAWINPUTDEVICE(
+                            HID_USAGE_PAGE_GENERIC,
+                            HID_USAGE_GENERIC_KEYBOARD,
+                            RIDEV_INPUTSINK,
                             self._win_raw_hwnd,
+                        )
+                        _user32.RegisterRawInputDevices(
+                            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
                         )
             except Exception as exc:
                 logger.warning("Could not register Raw Input sink: %s", exc)
@@ -1711,11 +1911,34 @@ class KeyHook:
                 try:
                     if nCode == _HC_ACTION and lParam:
                         if wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN, _WM_KEYUP, _WM_SYSKEYUP):
+                            # Drain any pending WM_INPUT packets already queued for our
+                            # sink window so hDevice origin is up-to-date before _ll_decide:
+                            if self._win_raw_hwnd:
+                                raw_msg = wintypes.MSG()
+                                while _user32.PeekMessageW(
+                                    ctypes.byref(raw_msg),
+                                    self._win_raw_hwnd,
+                                    _WM_INPUT,
+                                    _WM_INPUT,
+                                    _PM_REMOVE,
+                                ):
+                                    self._handle_wm_input(int(raw_msg.lParam))
+                                    _user32.DefWindowProcW(
+                                        raw_msg.hwnd,
+                                        raw_msg.message,
+                                        raw_msg.wParam,
+                                        raw_msg.lParam,
+                                    )
                             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                             extended = bool(kb.flags & _LLKHF_EXTENDED)
                             vk_code = int(kb.vkCode)
                             scan_code = int(kb.scanCode)
+                            is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
                             now = time.perf_counter()
+                            # Correlate this event with Raw Input (WM_INPUT) device
+                            # tracking, then apply the device-aware decision.
+                            origin = self._ll_origin_device(vk_code, extended, now, scan_code)
+                            origin_matched = self._origin_matches(origin) if origin else False
                             # Aggressively swallow VK_NUMLOCK (0x90 / scan 0x45) globally
                             # via the module-level GLOBAL_TARGET_DEVICE_ACTIVE flag so
                             # cross-thread state checks never fail and the WH_KEYBOARD_LL
@@ -1725,11 +1948,9 @@ class KeyHook:
                                 if vk_code == VK_NUMLOCK or (
                                     scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK)
                                 ):
+                                    if origin_matched or not origin:
+                                        self._queue_from_ll("NumLock", is_down, vk_code, scan_code)
                                     return 1  # SWALLOW immediately. Do not let it reach the OS.
-                            # Correlate this event with Raw Input (WM_INPUT) device
-                            # tracking, then apply the device-aware decision.
-                            origin = self._ll_origin_device(vk_code, extended, now, scan_code)
-                            origin_matched = self._origin_matches(origin) if origin else False
                             name = win_key_name(
                                 vk_code,
                                 scan_code,
@@ -1738,26 +1959,41 @@ class KeyHook:
                                 and bool(self._target_device or GLOBAL_TARGET_DEVICE_ACTIVE),
                             )
                             if name is not None:
-                                is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
                                 queue_key, swallow = self._ll_decide(
                                     name, vk_code, scan_code, extended, now
                                 )
-                                # Only queue from WH_KEYBOARD_LL for Consumer Control
-                                # media keys (which do not emit RIM_TYPEKEYBOARD
-                                # WM_INPUT packets) or if the Raw Input sink window
-                                # failed to initialize; all standard keyboard/numpad
-                                # keys generate MIDI exclusively via WM_INPUT where
-                                # the kernel's exact hdr.hDevice is verified.
-                                if queue_key and (
-                                    not self._win_raw_hwnd
-                                    or (
-                                        name in _ALWAYS_SUPPRESS_KEYS
-                                        and not (vk_code == VK_HOME and extended)
-                                    )
-                                ):
+                                # Fail-safe anti-stuck guarantee: if a key is currently
+                                # held down in _down (or in an active '000' burst), NEVER
+                                # drop its KeyUp release even if focus changed or another
+                                # keyboard was touched while the pad was held.
+                                if not is_down and not queue_key:
+                                    if name in self._down or (
+                                        name == "0"
+                                        and (self._zbuf or self._triple_ups_left > 0)
+                                    ):
+                                        queue_key = True
+                                if origin_matched and origin:
+                                    # Keep per-key and recent target timestamps fresh
+                                    # while swallowing in the background so continuous
+                                    # playing never hits a 10s TTL cliff.
+                                    self._raw_last_by_key[(vk_code, extended)] = (origin, now)
+                                    if scan_code > 0:
+                                        self._raw_last_by_scan[(scan_code, extended)] = (origin, now)
+                                    if self._raw_recent_hdevice == origin:
+                                        self._raw_recent_ts = now
+                                if queue_key:
                                     self._queue_from_ll(name, is_down, vk_code, scan_code)
                                 if swallow:
-                                    return 1
+                                    # Always swallow KeyDown for matched numpad keys (and
+                                    # both edges of media launcher keys) so DAWs never
+                                    # receive unwanted keystrokes, while allowing standard
+                                    # KeyUp breaks through so the OS and WM_INPUT never
+                                    # hang a key state in the background.
+                                    if is_down or (
+                                        name in _ALWAYS_SUPPRESS_KEYS
+                                        and not (vk_code == VK_HOME and extended)
+                                    ):
+                                        return 1
                                 # Not swallowed: fall through so the OS receives the key.
                 except Exception as exc:
                     logger.error("Exception in WH_KEYBOARD_LL callback: %s", exc)
@@ -1778,7 +2014,7 @@ class KeyHook:
                 ret = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret <= 0:  # 0 == WM_QUIT, -1 == error
                     break
-                if msg.message == _WM_INPUT:
+                if not self._raw_sink_owns_wm_input and msg.message == _WM_INPUT:
                     self._handle_wm_input(int(msg.lParam))
                 _user32.TranslateMessage(ctypes.byref(msg))
                 _user32.DispatchMessageW(ctypes.byref(msg))
@@ -1794,10 +2030,15 @@ class KeyHook:
                 self._win_hook_handle = None
             if self._win_raw_hwnd:
                 try:
+                    _user32.KillTimer(self._win_raw_hwnd, _RAW_SINK_TIMER_ID)
+                except Exception:
+                    pass
+                try:
                     _user32.DestroyWindow(self._win_raw_hwnd)
                 except Exception:
                     pass
                 self._win_raw_hwnd = None
+            self._raw_sink_owns_wm_input = False
             self._win_thread_id = 0
             self._win_proc_ref = None
 
@@ -2297,15 +2538,32 @@ class KeyHook:
                 self._emit("0" if is_zero_key else name, down)
 
     def _emit(self, name: str, down: bool) -> None:
-        """Held-set debounce: exactly one down and one up per press."""
+        """Held-set debounce: exactly one down and one up per press.
+
+        Includes a 1.5s self-healing anti-stuck guard: OS auto-repeat events
+        arrive every ~30-500ms while a key is physically held; if a new KeyDown
+        arrives >1.5s after the last KeyDown on a key still in ``_down``, its
+        previous KeyUp was lost, so we automatically emit Note OFF first.
+        """
+        now = time.perf_counter()
         if down:
             if name in self._down:
-                return  # auto-repeat / duplicate
+                last_ts = self._down_ts.get(name, now)
+                self._down_ts[name] = now
+                if (now - last_ts) <= 1.5:
+                    return  # auto-repeat / duplicate
+                self._down.discard(name)
+                try:
+                    self._on_key(name, False)
+                except Exception:
+                    pass
             self._down.add(name)
+            self._down_ts[name] = now
         else:
             if name not in self._down:
                 return  # stray release
             self._down.discard(name)
+            self._down_ts.pop(name, None)
         try:
             self._on_key(name, down)
         except Exception:  # a UI/MIDI error must not kill the hook thread
