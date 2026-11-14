@@ -1081,9 +1081,12 @@ def list_keyboard_devices() -> list[KeyboardDevice]:
         pass
 
     devices_by_id: dict[str, KeyboardDevice] = {}
-    total = max(len(raw_handles), len(enum_pnp_ids))
+    ordered_handles = (
+        raw_handles if handle_paths else list(reversed(raw_handles))
+    )
+    total = max(len(ordered_handles), len(enum_pnp_ids))
     for idx in range(total):
-        h = raw_handles[idx] if idx < len(raw_handles) else 0
+        h = ordered_handles[idx] if idx < len(ordered_handles) else 0
         path = handle_paths.get(h, "")
         if path:
             cleaned = path.lstrip("\\?").lstrip("#")
@@ -1202,15 +1205,23 @@ class KeyHook:
     def set_target_device(self, device_id: str) -> None:
         """Select one specific USB keypad hardware ID (strict device isolation).
 
-        v1.9.8: an empty string means "no device selected" - the hook is then
+        v2.0: an empty string means "no device selected" - the hook is then
         a strict no-op (no MIDI, no swallowing) until the user picks a
         specific device. The former "All Connected Keypads" mode no longer
         exists.
         """
+        cleaned = (device_id or "").strip()
+        if cleaned.lower() in (
+            ALL_DEVICES_LABEL.lower(),
+            "all keyboards / keypads",
+            "all connected keypads",
+            "all",
+        ):
+            cleaned = ""
         with self._lock:
-            self._target_device = (device_id or "").strip()
+            self._target_device = cleaned
             self._rebuild_target_handles()
-            self._last_raw_matched = True
+            self._last_raw_matched = bool(cleaned)
             self._rebuild_matched_handle_cache()
 
     def refresh_devices(self) -> list[KeyboardDevice]:
@@ -1300,51 +1311,51 @@ class KeyHook:
 
         The LL callback always fires before the matching WM_INPUT is processed,
         so the origin is correlated from earlier Raw Input data: the per-key
-        memory wins, unless a flagged general keyboard (the user actively
-        typing) is hot in the active-device window - then that device wins, so
-        a stale per-key record cannot swallow keystrokes of a device switch.
+        memory wins unless another device was active more recently (or a
+        flagged general keyboard is hot in the active-device window), so a
+        stale per-key record cannot swallow keystrokes after a device switch.
         Returns 0 when the origin cannot be correlated at all.
         """
         entry = self._raw_last_by_key.get((vk, bool(extended)))
         if entry and (now - entry[1]) <= _RAW_KEY_TTL:
-            key_device = entry[0]
+            key_device, key_ts = entry
             if (
                 self._raw_recent_ts > 0.0
-                and (now - self._raw_recent_ts) <= _RAW_RECENT_TTL
                 and key_device != self._raw_recent_hdevice
-                and self._raw_recent_hdevice in self._general_kb_handles
+                and (
+                    self._raw_recent_ts >= key_ts
+                    or (
+                        (now - self._raw_recent_ts) <= _RAW_RECENT_TTL
+                        and (
+                            self._raw_recent_hdevice in self._general_kb_handles
+                            or not self._origin_matches(self._raw_recent_hdevice)
+                        )
+                    )
+                )
             ):
-                return self._raw_recent_hdevice
+                if (now - self._raw_recent_ts) <= _RAW_RECENT_TTL:
+                    return self._raw_recent_hdevice
+                return 0
             return key_device
         if self._raw_recent_ts > 0.0 and (now - self._raw_recent_ts) <= _RAW_RECENT_TTL:
             return self._raw_recent_hdevice
         return 0
 
     def _ll_global_swallow(self, vk: int, extended: bool) -> bool:
-        """v1.9.9 aggressive swallow for the numpad's unambiguous keys.
+        """Return True if (vk, extended) is an unambiguous numpad key that must
+        be aggressively swallowed when originating from the selected target USB
+        keypad with Exclusive Mode enabled.
 
-        While a specific USB keypad is selected and Exclusive Mode is on,
-        these keys are swallowed with NO device-origin correlation at all -
-        no per-key TTL, no cold-start window - because a missed swallow
-        leaks directly into DAW shortcuts (Numpad Enter = Cubase "Play")
-        and text fields. Covered: ``VK_NUMPAD0-9``, ``VK_MULTIPLY`` /
-        ``VK_ADD`` / ``VK_SUBTRACT`` / ``VK_DIVIDE``, ``VK_DECIMAL``, and
-        ``VK_RETURN`` with ``LLKHF_EXTENDED`` (E0 0x1C = Numpad Enter). The
-        main Enter (NON-extended ``VK_RETURN``) of every keyboard is never
-        touched, and normal typing keys (VK_0-9, VK_OEM_PLUS, A-Z) are not
-        in the set.
-
-        MIDI generation is NOT granted by this path: the queue decision
-        stays strictly device-gated (``_ll_decide`` and the WM_INPUT
-        ``hDevice`` check), so a foreign device's swallowed keys stay
-        silent. A laptop with an embedded/full numpad therefore loses those
-        specific keys while a target device is selected - accepted
-        trade-off: DAW protection takes priority.
+        Covered: ``VK_NUMPAD0-9``, ``VK_MULTIPLY``, ``VK_ADD``, ``VK_SUBTRACT``,
+        ``VK_DIVIDE``, ``VK_DECIMAL``, and ``VK_RETURN`` with ``LLKHF_EXTENDED``
+        (E0 0x1C = Numpad Enter). The main Enter (non-extended ``VK_RETURN``)
+        and normal typing keys (``VK_0-9``, ``VK_OEM_PLUS``, ``A-Z``) are never
+        in this set.
         """
         if not (self._target_device and self._suppress):
             return False
         if vk == VK_RETURN:
-            return extended
+            return bool(extended)
         return vk in _GLOBAL_SWALLOW_VKS
 
     def _ll_decide(
@@ -1352,22 +1363,24 @@ class KeyHook:
     ) -> tuple[bool, bool]:
         """Decide (queue_for_midi, swallow) for a WH_KEYBOARD_LL event.
 
-        v1.9.8 strict hardware device isolation: MIDI and swallowing are
-        granted ONLY when the event's Raw Input origin strictly matches the
-        selected USB keypad. Events proven to come from any other device -
-        and events whose origin cannot be proven (unknown handle, cold start,
-        correlation expired) - are ignored completely: no MIDI is generated
-        and the OS keystroke passes through untouched, so the laptop's
-        built-in keyboard (including its embedded numpad) can never trigger
-        MIDI or be swallowed.
-
-        The former "All Connected Keypads" mode was removed: an empty
-        ``_target_device`` (fresh config, or a legacy "All" value mapped to
-        "" by main.py) is a strict no-op for every key.
+        v2.0 strict hardware device isolation:
+        - If no target USB keypad is selected, return (False, False).
+        - If the key originates from ANY OTHER device (laptop keyboard, other
+          USB keyboard) or its origin is unproven, return (False, False) so no
+          MIDI is generated and CallNextHookEx passes the keystroke through
+          untouched.
+        - If the key originates from the SELECTED USB Numpad, queue MIDI and
+          aggressively swallow all numpad numbers (VK_NUMPAD0-9), math
+          operators (VK_ADD, VK_SUBTRACT, VK_MULTIPLY, VK_DIVIDE), VK_DECIMAL,
+          Numpad Enter (VK_RETURN with LLKHF_EXTENDED), and keypad keys.
         """
         if not self._target_device:
             # No device selected: the app is completely inert; every keyboard
             # keeps typing normally.
+            return False, False
+
+        if vk == VK_RETURN and not extended:
+            # Main Enter (non-extended VK_RETURN) is never a numpad key.
             return False, False
 
         # Multimedia launcher keys (Browser Home/Search, Mail, Calc) never emit
@@ -1389,33 +1402,26 @@ class KeyHook:
         if is_numlock:
             # Swallowing the keypad's NumLock stays mandatory (passing it
             # through would toggle the M-Tech hardware into navigation mode),
-            # but only with a PROVEN keypad origin: an unknown origin (app
-            # just started / WM_INPUT sink failure / TTL expired) must never
-            # eat the laptop's NumLock toggle.
+            # but only with a PROVEN keypad origin: an unknown origin or a
+            # foreign keyboard must never eat the laptop's NumLock toggle.
             if not origin:
                 return False, False
             matched = self._origin_matches(origin)
             return matched, matched
 
         if not origin:
-            # No Raw Input origin data yet (app just started / WM_INPUT sink
-            # failure / correlation TTL expired). v1.9.1 queued the MIDI event
-            # here so the app stayed functional, which let the laptop's
-            # built-in numpad produce notes before its first WM_INPUT packet
-            # arrived (the reported leak). Strict isolation: without a proven
-            # origin nothing is generated. v1.9.9: an unambiguous numpad VK
-            # is still SWALLOWED when the aggressive rule applies - the
-            # LL<->WM_INPUT race (cold start, TTL expiry, device switch) must
-            # never leak Numpad Enter/+ into a focused DAW - while the MIDI
-            # queue stays off (unproven device; WM_INPUT owns the notes).
-            return False, self._ll_global_swallow(vk, extended)
+            # Unproven hardware origin: do not generate MIDI and do not swallow.
+            return False, False
+
         matched = self._origin_matches(origin)
         if not matched:
-            # Proven origin on ANOTHER device (e.g. the laptop's embedded
-            # numpad): no MIDI ever. v1.9.9 still swallows the unambiguous
-            # numpad VKs here (user-accepted trade-off: DAW protection takes
-            # priority over the laptop's embedded-numpad keys).
-            return False, self._ll_global_swallow(vk, extended)
+            # Proven origin on ANY OTHER device (laptop built-in keyboard/numpad
+            # or another USB keyboard): do NOT generate MIDI and do NOT swallow.
+            return False, False
+
+        # Proven origin on the SELECTED USB Numpad:
+        if self._ll_global_swallow(vk, extended):
+            return True, True
         if name in ("Tab", "Backspace"):
             # v1.6 behaviour: the keypad's Tab/Backspace keys pass through
             # to the OS; their MIDI events arrive via the WM_INPUT channel.
@@ -1642,7 +1648,19 @@ class KeyHook:
                                 queue_key, swallow = self._ll_decide(
                                     name, vk_code, scan_code, extended, now
                                 )
-                                if queue_key:
+                                # Only queue from WH_KEYBOARD_LL for Consumer Control
+                                # media keys (which do not emit RIM_TYPEKEYBOARD
+                                # WM_INPUT packets) or if the Raw Input sink window
+                                # failed to initialize; all standard keyboard/numpad
+                                # keys generate MIDI exclusively via WM_INPUT where
+                                # the kernel's exact hdr.hDevice is verified.
+                                if queue_key and (
+                                    not self._win_raw_hwnd
+                                    or (
+                                        name in _ALWAYS_SUPPRESS_KEYS
+                                        and not (vk_code == VK_HOME and extended)
+                                    )
+                                ):
                                     self._queue_from_ll(name, is_down, vk_code, scan_code)
                                 if swallow:
                                     return 1
@@ -1932,6 +1950,11 @@ class KeyHook:
             def _is_target_device(sender) -> bool:
                 if not sender:
                     return False
+                target = self._target_device.upper().replace("/", "\\")
+                if not target:
+                    # v2.0 strict device isolation: with no device selected, do
+                    # not match any HID device.
+                    return False
                 vid_val = c_int32(0)
                 pid_val = c_int32(0)
                 if k_vid:
@@ -1945,12 +1968,6 @@ class KeyHook:
 
                 vid = vid_val.value
                 pid = pid_val.value
-                if vid == 0x05AC and not self._target_device:
-                    return False
-
-                target = self._target_device.upper().replace("/", "\\")
-                if not target:
-                    return True
                 hw_id = f"HID\\VID_{vid:04X}&PID_{pid:04X}"
                 if target == hw_id or target in hw_id or hw_id in target:
                     return True
@@ -2081,12 +2098,7 @@ class KeyHook:
             cg.CGEventGetIntegerValueField.argtypes = [c_void_p, c_uint32]
             cg.CGEventGetIntegerValueField.restype = c_longlong
 
-            tap_codes = set(_MAC_TAP_NUMPAD_CODES)
-            with self._lock:
-                targeted = bool(self._target_device)
-            if targeted:
-                tap_codes |= _MAC_TAP_NAV_CODES
-            tap_codes = frozenset(tap_codes)
+            tap_codes = frozenset(_MAC_TAP_NUMPAD_CODES | _MAC_TAP_NAV_CODES)
 
             def _tap_callback(proxy, ev_type, event_ref, refcon) -> int:
                 try:
@@ -2095,10 +2107,12 @@ class KeyHook:
                         if ev_type in (254, 255):  # disabled by user input / timeout
                             cg.CGEventTapEnable(tap, True)
                             return event_ref
+                        if not (self._target_device and self._suppress):
+                            return event_ref
                         keycode = int(
                             cg.CGEventGetIntegerValueField(event_ref, _MAC_FIELD_KEYCODE)
                         )
-                        if keycode in tap_codes and self._suppress:
+                        if keycode in tap_codes:
                             return 0  # NULL CGEventRef -> the OS event is swallowed
                     return event_ref
                 except Exception as exc:
