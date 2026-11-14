@@ -1933,22 +1933,29 @@ class KeyHook:
                             scan_code = int(kb.scanCode)
                             is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
                             now = time.perf_counter()
-                            # Aggressively swallow VK_NUMLOCK (0x90 / scan 0x45) globally
-                            # via GLOBAL_TARGET_DEVICE_ACTIVE so it never leaks to the OS.
-                            # WH_KEYBOARD_LL NEVER generates MIDI for NumLock (MIDI Note 51
-                            # is strictly generated in WM_INPUT after verifying hDevice).
-                            # VK_TAB and VK_BACK are NOT swallowed globally here: they are
-                            # device-gated via _ll_decide so Backspace/Tab on other
-                            # keyboards keep working normally.
-                            if GLOBAL_TARGET_DEVICE_ACTIVE:
-                                if vk_code == VK_NUMLOCK or (
-                                    scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK)
-                                ):
-                                    return 1  # SWALLOW immediately. Do not let it reach the OS.
+                            is_numlock = vk_code == VK_NUMLOCK or (
+                                scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK)
+                            )
                             # Correlate this event with Raw Input (WM_INPUT) device
                             # tracking, then apply the device-aware decision.
                             origin = self._ll_origin_device(vk_code, extended, now, scan_code)
                             origin_matched = self._origin_matches(origin) if origin else False
+                            # Aggressively swallow VK_NUMLOCK (0x90 / scan 0x45) globally
+                            # via GLOBAL_TARGET_DEVICE_ACTIVE so it never leaks to the OS.
+                            # Only queue MIDI Note 51 from WH_KEYBOARD_LL when origin_matched
+                            # is True (selected USB keypad), or releasing a held NumLock,
+                            # so laptop NumLock never triggers MIDI while USB keypad NumLock
+                            # still works reliably in the background.
+                            if GLOBAL_TARGET_DEVICE_ACTIVE and is_numlock:
+                                if origin_matched or (not is_down and "NumLock" in self._down):
+                                    if origin_matched and origin:
+                                        self._raw_last_by_key[(vk_code, extended)] = (origin, now)
+                                        if scan_code > 0:
+                                            self._raw_last_by_scan[(scan_code, extended)] = (origin, now)
+                                        if self._raw_recent_hdevice == origin:
+                                            self._raw_recent_ts = now
+                                    self._queue_from_ll("NumLock", is_down, vk_code, scan_code)
+                                return 1  # SWALLOW immediately. Do not let it reach the OS.
                             name = win_key_name(
                                 vk_code,
                                 scan_code,
