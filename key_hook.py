@@ -1435,14 +1435,11 @@ class KeyHook:
             or (scan == 0x45 and vk in (0, 0xFF, VK_NUMLOCK))
         )
         if is_numlock:
-            # Swallowing the selected target keypad's NumLock is mandatory to
-            # prevent Windows from toggling the global NumLock state (which
-            # affects the laptop keyboard and toggles the keypad hardware into
-            # navigation mode), while foreign/unknown origins are never eaten.
-            if not origin:
-                return False, False
-            matched = self._origin_matches(origin)
-            return matched, matched
+            # Aggressively swallow VK_NUMLOCK (0x90) globally whenever a Target
+            # USB Numpad is active in the UI so the WH_KEYBOARD_LL vs WM_INPUT
+            # race condition can never let VK_NUMLOCK leak to the OS and toggle
+            # the global NumLock state.
+            return True, True
 
         if not origin:
             # Unproven hardware origin: do not generate MIDI and do not swallow.
@@ -1679,18 +1676,19 @@ class KeyHook:
                             vk_code = int(kb.vkCode)
                             scan_code = int(kb.scanCode)
                             now = time.perf_counter()
+                            # Aggressively swallow VK_NUMLOCK (0x90 / scan 0x45) globally
+                            # whenever a Target USB Numpad is active in the UI so the
+                            # WH_KEYBOARD_LL vs WM_INPUT race condition can never let
+                            # VK_NUMLOCK reach the OS and toggle the global NumLock state.
+                            if self._target_device:
+                                if vk_code == VK_NUMLOCK or (
+                                    scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK)
+                                ):
+                                    return 1  # SWALLOW immediately. Do not let it reach the OS.
                             # Correlate this event with Raw Input (WM_INPUT) device
                             # tracking, then apply the device-aware decision.
                             origin = self._ll_origin_device(vk_code, extended, now, scan_code)
                             origin_matched = self._origin_matches(origin) if origin else False
-                            # Explicitly intercept VK_NUMLOCK (0x90 / scan 0x45) from
-                            # the selected Target USB Keypad and return 1 immediately
-                            # to prevent Windows from toggling the global NumLock state.
-                            if (
-                                vk_code == VK_NUMLOCK
-                                or (scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK))
-                            ) and origin_matched and self._target_device:
-                                return 1
                             name = win_key_name(
                                 vk_code,
                                 scan_code,
@@ -2295,13 +2293,12 @@ class KeyHook:
         # --- 1. Finishing a recognised '000' press (waiting for its releases)
         if self._triple_ups_left > 0:
             if down:
-                if (now - self._triple_started) > eff_window:
-                    # Previous '000' burst has finished; emit Note Off and start fresh
-                    self._cancel_triple_timer()
-                    self._triple_ups_left = 0
-                    self._emit("000", False)
-                else:
-                    return
+                # All 3 KeyDown strokes of the previous '000' burst have already
+                # arrived; emit Note Off for the finished burst and allow the new
+                # KeyDown to pass straight into the burst detector.
+                self._cancel_triple_timer()
+                self._triple_ups_left = 0
+                self._emit("000", False)
             else:
                 self._triple_ups_left = max(0, self._triple_ups_left - 1)
                 if self._triple_ups_left == 0:
@@ -2318,14 +2315,21 @@ class KeyHook:
             for pending_down in pending:
                 self._emit("0", pending_down)
 
-        # --- 3. No burst in progress
+        # --- 3. No burst in progress (exempt Scancode 0x52 / VK_NUMPAD0 / VK_INSERT
+        # from the held-key debouncer block so consecutive KeyDown strokes always
+        # pass through into the burst detector logic)
+        is_exempt_zero_scan = (
+            scan == _WIN_SCAN_KEYPAD_ZERO
+            or vk in (VK_NUMPAD0, VK_INSERT)
+        )
         if not self._zbuf:
             if "0" in self._down:
-                if down and delta_ms > 1000.0:
-                    # Orphaned "0" from a prior missed KEYUP (>1s without auto-repeat):
-                    # release the stale note and start fresh so it never eats the 1st
-                    # stroke of a new '000' burst.
-                    self._emit("0", False)
+                if down and (is_exempt_zero_scan or delta_ms > 1000.0):
+                    # Exempt Scancode 0x52 (82) / VK_NUMPAD0 / VK_INSERT (and
+                    # orphaned >1s holds) from the debouncer block so consecutive
+                    # KeyDown events always enter self._zbuf.
+                    if delta_ms > 1000.0:
+                        self._emit("0", False)
                 else:
                     if down:
                         self._zrepeat_down_ts = now
@@ -2361,6 +2365,10 @@ class KeyHook:
             ups = len(self._zbuf) - downs
             self._zbuf.clear()
             self._zlast_ts = 0.0
+            if "0" in self._down:
+                self._emit("0", False)
+            if "000" in self._down:
+                self._emit("000", False)
             logger.info(
                 "Keypad 0 triplet detected [%s] -> firing '000' Note On (MIDI Note 37)",
                 source,

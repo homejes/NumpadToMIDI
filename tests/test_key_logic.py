@@ -1119,30 +1119,36 @@ class WindowsRawInputOriginTests(unittest.TestCase):
 
     def test_numlock_from_laptop_passes_and_keypad_numlock_is_swallowed(self):
         self.flag_laptop()
-        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
+        # With no target device selected, VK_NUMLOCK is not swallowed:
         now = time.perf_counter()
+        self.assertEqual(
+            self.hook._ll_decide("NumLock", 0x90, 0x45, False, now), (False, False)
+        )
+        # Once a Target USB Numpad is active in the UI, VK_NUMLOCK (0x90) is
+        # aggressively swallowed in WH_KEYBOARD_LL (even before WM_INPUT updates
+        # hDevice) so it can never leak to the OS, while WM_INPUT only queues
+        # MIDI Note 51 when hDevice matches the selected Target USB Keypad.
+        self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         self.hook._raw_last_by_key[(0x90, False)] = (self.LAPTOP_H, now)
         queue, swallow = self.hook._ll_decide("NumLock", 0x90, 0x45, False, now)
-        self.assertEqual((queue, swallow), (False, False))
-        # Keypad NumLock is still swallowed (hardware navigation mode). The
-        # keypad is the actively played device here (its WM_INPUT just arrived),
-        # so it - not the freshly typed laptop - is the recent-hot device.
+        self.assertEqual((queue, swallow), (True, True))
+        self.assertFalse(self.hook._process_raw_keyboard(self.LAPTOP_H, 0x90, 0x45, 0))
         self.hook._raw_last_by_key[(0x90, False)] = (self.KEYPAD_H, now)
         self.hook._raw_recent_hdevice = self.KEYPAD_H
         self.hook._raw_recent_ts = now
         queue, swallow = self.hook._ll_decide("NumLock", 0x90, 0x45, False, now)
         self.assertEqual((queue, swallow), (True, True))
 
-    def test_specific_target_unknown_origin_numlock_is_not_swallowed(self):
-        # v1.9.8: v1.9.1 swallowed NumLock with no origin data in target mode
-        # ((True, True) on a cold start), which ate the LAPTOP's NumLock
-        # toggle. Strict isolation requires a proven keypad origin.
+    def test_specific_target_unknown_origin_numlock_is_swallowed_immediately(self):
+        # v2.0.2 race condition fix: WH_KEYBOARD_LL receives VK_NUMLOCK (0x90)
+        # before WM_INPUT updates hDevice. When a Target USB Numpad is active in
+        # the UI, VK_NUMLOCK is swallowed immediately even with unknown origin.
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         self.hook._raw_recent_ts = 0.0
         queue, swallow = self.hook._ll_decide(
             "NumLock", 0x90, 0x45, False, time.perf_counter()
         )
-        self.assertEqual((queue, swallow), (False, False))
+        self.assertEqual((queue, swallow), (True, True))
 
     def test_laptop_home_key_is_device_gated_media_home_is_not(self):
         self.flag_laptop()
@@ -1285,13 +1291,15 @@ class WindowsRawInputOriginTests(unittest.TestCase):
                 self.hook._dispatch(*item)
         self.assertEqual(self.rec.events, [("NumLock", True), ("NumLock", False)])
 
-        # Laptop NumLock (both extended=True and extended=False) is NEVER swallowed:
-        self.hook._process_raw_keyboard(self.LAPTOP_H, VK_NUMLOCK, 0x45, 0)
+        # While a Target USB Numpad is active in the UI, VK_NUMLOCK (0x90) is
+        # aggressively swallowed in WH_KEYBOARD_LL (no race condition), while
+        # WM_INPUT rejects laptop NumLock so it never triggers MIDI Note 51:
+        self.assertFalse(self.hook._process_raw_keyboard(self.LAPTOP_H, VK_NUMLOCK, 0x45, 0))
         now2 = time.perf_counter()
         for ext in (True, False):
             self.assertEqual(
                 self.hook._ll_decide("NumLock", VK_NUMLOCK, 0x45, ext, now2),
-                (False, False),
+                (True, True),
             )
 
     def test_all_numlock_off_navigational_keys_mapped_and_swallowed_on_target(self):
@@ -1385,6 +1393,30 @@ class WindowsRawInputOriginTests(unittest.TestCase):
 
         self.assertIn(("000", True), self.rec.events)
         self.assertIn(("000", False), self.rec.events)
+
+    def test_scancode_0x52_debouncer_exemption_consecutive_keydowns(self):
+        """Scancode 0x52 (82) is exempted from the standard held-key debouncer
+        block: 3 consecutive KeyDown events for Scancode 0x52 within ~100ms
+        pass through into the burst detector, trigger '000' (MIDI Note 37),
+        and reset the burst counter whether seen as VK_NUMPAD0 or VK_INSERT.
+        """
+        from unittest.mock import patch
+        from key_hook import VK_INSERT
+
+        clock = [2000.0]
+        with patch("key_hook.time.perf_counter", side_effect=lambda: clock[0]):
+            for vk in (VK_NUMPAD0, VK_INSERT):
+                hook, rec = make(burst_window_ms=100)
+                # Even if "0" is already in the active debouncer set (_down),
+                # 3 consecutive KeyDown strokes of Scancode 0x52 (82) within
+                # ~100ms must pass through, fire '000', and reset _zbuf:
+                hook._down.add("0")
+                for _ in range(3):
+                    hook._dispatch("0", True, vk, 0x52)
+                    clock[0] += 0.015
+                self.assertEqual(hook._zbuf, [])
+                self.assertIn(("000", True), rec.events)
+                hook.stop()
 
 
 if __name__ == "__main__":
