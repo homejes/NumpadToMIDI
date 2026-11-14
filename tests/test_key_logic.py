@@ -1054,10 +1054,16 @@ class WindowsRawInputOriginTests(unittest.TestCase):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         # Main Enter of every keyboard: VK_RETURN, NON-extended.
         self.assertFalse(self.hook._ll_global_swallow(VK_RETURN, False))
-        # Top-row '+', digits, letters, Tab/Backspace/NumLock: different VKs.
-        for vk in (0xBB, 0x31, 0x41, VK_TAB, VK_BACK, VK_NUMLOCK):
+        # Top-row '+', digits, letters, NumLock: different VKs.
+        for vk in (0xBB, 0x31, 0x41, VK_NUMLOCK):
             self.assertFalse(
                 self.hook._ll_global_swallow(vk, False), f"VK 0x{vk:02X} must pass"
+            )
+        # VK_TAB (0x09) and VK_BACK (0x08) are aggressively swallowed while a
+        # target USB keypad is active:
+        for vk in (VK_TAB, VK_BACK):
+            self.assertTrue(
+                self.hook._ll_global_swallow(vk, False), f"VK 0x{vk:02X} must be swallowed"
             )
 
     def test_global_swallow_requires_target_and_exclusive_mode(self):
@@ -1107,15 +1113,15 @@ class WindowsRawInputOriginTests(unittest.TestCase):
             self.hook._ll_decide("+", 0x6B, 0x4E, False, now + 0.1), (False, False)
         )
 
-    def test_specific_target_tab_backspace_pass_through(self):
+    def test_specific_target_tab_backspace_swallowed(self):
         self.hook.set_target_device(r"HID\VID_04D9&PID_1203")
         now = time.perf_counter()
         self.hook._raw_last_by_key[(0x09, False)] = (self.KEYPAD_H, now)
         queue, swallow = self.hook._ll_decide("Tab", 0x09, 0x0F, False, now)
-        self.assertEqual((queue, swallow), (False, False))
+        self.assertEqual((queue, swallow), (True, True))
         self.hook._raw_last_by_key[(0x08, False)] = (self.KEYPAD_H, now)
         queue, swallow = self.hook._ll_decide("Backspace", 0x08, 0x0E, False, now)
-        self.assertEqual((queue, swallow), (False, False))
+        self.assertEqual((queue, swallow), (True, True))
 
     def test_numlock_from_laptop_passes_and_keypad_numlock_is_swallowed(self):
         self.flag_laptop()

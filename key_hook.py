@@ -240,6 +240,8 @@ _GLOBAL_SWALLOW_VKS = frozenset(
         VK_SUBTRACT,
         VK_DECIMAL,
         VK_DIVIDE,
+        VK_TAB,
+        VK_BACK,
     )
 )
 
@@ -1536,10 +1538,6 @@ class KeyHook:
         # Proven origin on the SELECTED USB Numpad:
         if self._ll_global_swallow(vk, extended):
             return True, True
-        if name in ("Tab", "Backspace"):
-            # v1.6 behaviour: the keypad's Tab/Backspace keys pass through
-            # to the OS; their MIDI events arrive via the WM_INPUT channel.
-            return False, False
         return True, self._suppress
 
     def _queue_from_ll(self, name: str, is_down: bool, vk: int = 0, scan: int = 0) -> None:
@@ -1935,22 +1933,23 @@ class KeyHook:
                             scan_code = int(kb.scanCode)
                             is_down = wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
                             now = time.perf_counter()
-                            # Correlate this event with Raw Input (WM_INPUT) device
-                            # tracking, then apply the device-aware decision.
-                            origin = self._ll_origin_device(vk_code, extended, now, scan_code)
-                            origin_matched = self._origin_matches(origin) if origin else False
-                            # Aggressively swallow VK_NUMLOCK (0x90 / scan 0x45) globally
-                            # via the module-level GLOBAL_TARGET_DEVICE_ACTIVE flag so
-                            # cross-thread state checks never fail and the WH_KEYBOARD_LL
-                            # vs WM_INPUT race condition can never let VK_NUMLOCK reach
-                            # the OS and toggle the global NumLock state.
+                            # Aggressively swallow VK_NUMLOCK (0x90 / scan 0x45),
+                            # VK_TAB (0x09), and VK_BACK (0x08) globally via
+                            # GLOBAL_TARGET_DEVICE_ACTIVE so they never leak to
+                            # the OS/DAW. WH_KEYBOARD_LL NEVER generates MIDI
+                            # for these keys: MIDI is strictly generated in
+                            # WM_INPUT after verifying hDevice.
                             if GLOBAL_TARGET_DEVICE_ACTIVE:
                                 if vk_code == VK_NUMLOCK or (
                                     scan_code == 0x45 and vk_code in (0, 0xFF, VK_NUMLOCK)
                                 ):
-                                    if origin_matched or not origin:
-                                        self._queue_from_ll("NumLock", is_down, vk_code, scan_code)
                                     return 1  # SWALLOW immediately. Do not let it reach the OS.
+                                if vk_code in (VK_TAB, VK_BACK):
+                                    return 1  # SWALLOW Tab/Backspace immediately.
+                            # Correlate this event with Raw Input (WM_INPUT) device
+                            # tracking, then apply the device-aware decision.
+                            origin = self._ll_origin_device(vk_code, extended, now, scan_code)
+                            origin_matched = self._origin_matches(origin) if origin else False
                             name = win_key_name(
                                 vk_code,
                                 scan_code,
@@ -1962,16 +1961,6 @@ class KeyHook:
                                 queue_key, swallow = self._ll_decide(
                                     name, vk_code, scan_code, extended, now
                                 )
-                                # Fail-safe anti-stuck guarantee: if a key is currently
-                                # held down in _down (or in an active '000' burst), NEVER
-                                # drop its KeyUp release even if focus changed or another
-                                # keyboard was touched while the pad was held.
-                                if not is_down and not queue_key:
-                                    if name in self._down or (
-                                        name == "0"
-                                        and (self._zbuf or self._triple_ups_left > 0)
-                                    ):
-                                        queue_key = True
                                 if origin_matched and origin:
                                     # Keep per-key and recent target timestamps fresh
                                     # while swallowing in the background so continuous
@@ -1981,7 +1970,18 @@ class KeyHook:
                                         self._raw_last_by_scan[(scan_code, extended)] = (origin, now)
                                     if self._raw_recent_hdevice == origin:
                                         self._raw_recent_ts = now
-                                if queue_key:
+                                # Architecture rule: WH_KEYBOARD_LL ONLY swallows keys;
+                                # WM_INPUT owns 100% of MIDI generation (strict hDevice
+                                # isolation). Only Consumer Control media keys (which
+                                # never emit RIM_TYPEKEYBOARD WM_INPUT packets) or a
+                                # missing Raw Input sink fall back to _queue_from_ll.
+                                if queue_key and (
+                                    not self._win_raw_hwnd
+                                    or (
+                                        name in _ALWAYS_SUPPRESS_KEYS
+                                        and not (vk_code == VK_HOME and extended)
+                                    )
+                                ):
                                     self._queue_from_ll(name, is_down, vk_code, scan_code)
                                 if swallow:
                                     # Always swallow KeyDown for matched numpad keys (and

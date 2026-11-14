@@ -3,11 +3,11 @@
 # built-in macOS tools (codesign + hdiutil), so it runs unchanged on CI runners.
 #
 # usage: installer/make_dmg.sh [version] [arch]
-#   e.g. installer/make_dmg.sh 2.0.4 Intel
-#   e.g. installer/make_dmg.sh 2.0.4 AppleSilicon
+#   e.g. installer/make_dmg.sh 2.0.5 Intel
+#   e.g. installer/make_dmg.sh 2.0.5 AppleSilicon
 set -euo pipefail
 
-VERSION="${1:-2.0.4}"
+VERSION="${1:-2.0.5}"
 ARCH="${2:-}"
 APP_NAME="NumpadToMIDI"
 APP_PATH="dist/${APP_NAME}.app"

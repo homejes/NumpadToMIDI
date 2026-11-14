@@ -1,7 +1,7 @@
 ; NumpadToMIDI - Windows all-in-one installer (Inno Setup 6.3+)
 ;
 ; Build (from the repository root, after `pyinstaller build.spec`):
-;   ISCC.exe /DAppVersion=2.0.4 installer\windows_installer.iss
+;   ISCC.exe /DAppVersion=2.0.5 installer\windows_installer.iss
 ; Output: dist\NumpadToMIDI-Setup-v<AppVersion>.exe
 ;
 ; The installer
@@ -13,7 +13,7 @@
 ;     the installer (see installer\driver_notice.txt).
 
 #ifndef AppVersion
-  #define AppVersion "2.0.4"
+  #define AppVersion "2.0.5"
 #endif
 #define AppName      "NumpadToMIDI"
 #define AppExeName   "NumpadToMIDI.exe"
